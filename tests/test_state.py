@@ -33,7 +33,7 @@ def test_registration_state_round_trip(tmp_path: Path) -> None:
     payload = json.loads((config.state_dir / "targets/target/plugins.json").read_text(encoding="utf-8"))
     assert payload["schema_version"] == 2
     assert payload["identity"]["product"] == "codex"
-    assert payload["marketplace_source"].endswith("/state/marketplace")
+    assert Path(payload["marketplace_source"]) == config.state_dir / "marketplace"
 
 
 def test_skill_state_round_trip_uses_stable_source_ids(tmp_path: Path) -> None:

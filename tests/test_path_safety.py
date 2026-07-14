@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key, paths_overlap
 
 
@@ -39,6 +41,15 @@ def test_windows_path_comparison_normalizes_case_and_separators() -> None:
     assert path_comparison_key(left, windows=False) != path_comparison_key(right, windows=False)
 
 
+def test_windows_path_comparison_strips_extended_device_prefix(tmp_path: Path) -> None:
+    """Windows substitution paths compare equal to their ordinary spelling."""
+
+    ordinary = tmp_path / "Skill"
+    extended = Path("\\\\?\\" + str(ordinary).replace("/", "\\"))
+
+    assert path_comparison_key(extended, windows=True) == path_comparison_key(ordinary, windows=True)
+
+
 def test_paths_overlap_is_bidirectional_and_segment_aware() -> None:
     """Parents overlap descendants, while path-prefix siblings remain separate."""
 
@@ -58,3 +69,16 @@ def test_paths_overlap_uses_windows_case_semantics() -> None:
 
     assert paths_overlap(parent, child, windows=True)
     assert not paths_overlap(parent, child, windows=False)
+
+
+def test_paths_overlap_rejects_symlink_loop_in_existing_ancestor(tmp_path: Path) -> None:
+    """A loop cannot be mistaken for an ordinary missing path suffix."""
+
+    loop = tmp_path / "loop"
+    try:
+        loop.symlink_to(loop, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable in this environment: {exc}")
+
+    with pytest.raises((OSError, RuntimeError)):
+        paths_overlap(loop / "state", tmp_path / "catalog", windows=False)

@@ -11,9 +11,12 @@ import pytest
 from agent_config_bridge.filesystem import (
     MANAGED_MARKER,
     FilesystemError,
+    apply_remove,
     read_managed_marker,
     tree_digest,
 )
+from agent_config_bridge.models import LinkMode
+from tests.conftest import require_directory_symlink_support
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are unavailable on this platform")
@@ -82,3 +85,31 @@ def test_read_managed_marker_rejects_symlink(tmp_path: Path) -> None:
         pytest.skip(f"file symlinks are unavailable in this test environment: {exc}")
 
     assert read_managed_marker(destination) is None
+
+
+def test_apply_remove_accepts_windows_extended_symlink_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows readlink substitution prefixes do not create false drift."""
+
+    require_directory_symlink_support(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "skill"
+    destination.symlink_to(source, target_is_directory=True)
+    extended = "\\\\?\\" + str(source.resolve()).replace("/", "\\")
+    monkeypatch.setattr(os, "readlink", lambda _path: extended)
+
+    apply_remove(
+        destination,
+        mode=LinkMode.SYMLINK,
+        source_id="skills/hello",
+        expected_link_target=source,
+        installed_digest=None,
+        state_dir=tmp_path / "state",
+        target_name="target",
+        windows_path_semantics=True,
+    )
+
+    assert not destination.is_symlink()

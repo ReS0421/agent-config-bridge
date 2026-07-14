@@ -7,8 +7,9 @@ from pathlib import Path
 
 from agent_config_bridge.catalog import CatalogInventory, discover_catalog
 from agent_config_bridge.filesystem import apply_copy, apply_link, apply_remove, tree_digest
-from agent_config_bridge.models import BridgeConfig
+from agent_config_bridge.models import BridgeConfig, Platform
 from agent_config_bridge.planner import Action, Disposition, Operation, SyncPlan, build_plan
+from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.renderer import RenderedMarketplace, render_marketplace
 from agent_config_bridge.state import find_orphaned_target_states, write_skill_state
 
@@ -64,6 +65,8 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
     applied: list[Action] = []
     backups: list[Path] = []
     marketplace: RenderedMarketplace | None = None
+    targets_by_name = {target.name: target for target in config.targets if target.enabled}
+    host_platform = current_platform()
     for action in plan.actions:
         if action.disposition is Disposition.NOOP:
             if action.operation is Operation.RENDER:
@@ -95,6 +98,9 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
         elif action.operation is Operation.REMOVE:
             if action.link_mode is None or action.source_id is None:
                 raise ApplyError(f"remove action is missing ownership data: {action.target}:{action.name}")
+            target = targets_by_name.get(action.target)
+            if target is None:
+                raise ApplyError(f"remove action has no enabled target: {action.target}:{action.name}")
             backup = apply_remove(
                 action.destination,
                 mode=action.link_mode,
@@ -103,6 +109,7 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                 installed_digest=action.source_digest,
                 state_dir=config.state_dir,
                 target_name=action.target,
+                windows_path_semantics=(host_platform is Platform.WINDOWS or target.platform is Platform.WINDOWS),
             )
             if backup is not None:
                 backups.append(backup)

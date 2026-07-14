@@ -85,6 +85,7 @@ def test_load_config_expands_environment_and_user_paths(
     monkeypatch.setenv("BRIDGE_HOME", str(home))
     monkeypatch.setenv("BRIDGE_CONFIG", str(tmp_path / "bridge.toml"))
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     config_path = tmp_path / "bridge.toml"
     config_path.write_text(
         """\

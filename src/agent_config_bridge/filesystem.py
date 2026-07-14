@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.models import LinkMode
-from agent_config_bridge.path_safety import is_directory_reparse_point
+from agent_config_bridge.path_safety import (
+    is_directory_reparse_point,
+    path_comparison_key,
+    read_symlink_target,
+)
 
 __all__ = [
     "MANAGED_MARKER",
@@ -213,6 +217,7 @@ def apply_remove(
     installed_digest: str | None,
     state_dir: Path,
     target_name: str,
+    windows_path_semantics: bool,
 ) -> Path | None:
     """Remove only a still-matching bridge-managed Skill.
 
@@ -222,8 +227,19 @@ def apply_remove(
     if mode is LinkMode.SYMLINK:
         if not destination.is_symlink() or expected_link_target is None:
             raise FilesystemError(f"managed Skill link changed after planning: {destination}")
-        actual_target = Path(os.path.abspath(destination.parent / os.readlink(destination)))
-        if actual_target != expected_link_target:
+        try:
+            actual_target = read_symlink_target(destination)
+            expected_target = expected_link_target
+            target_matches = path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            ) == path_comparison_key(
+                expected_target,
+                windows=windows_path_semantics,
+            )
+        except (OSError, RuntimeError):
+            target_matches = False
+        if not target_matches:
             raise FilesystemError(f"managed Skill link target changed after planning: {destination}")
         destination.unlink()
         return None

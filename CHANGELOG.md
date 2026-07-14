@@ -52,3 +52,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   current published snapshot require strictly higher precedence.
 - Exclude raw filesystem mode bits from portable content identity and document
   that executable permissions are not preserved across targets.
+- Normalize Windows extended-path symlink identities and fail closed when
+  physical overlap checks encounter looped, broken, or unreadable ancestors.

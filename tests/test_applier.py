@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -213,6 +214,25 @@ def test_deselection_uses_recorded_mode_after_link_mode_changes(tmp_path: Path) 
     assert plan.actions[0].disposition is Disposition.REMOVE
     apply_plan(cleanup, discover_catalog(cleanup), plan)
     assert not destination.exists()
+
+
+def test_deselection_removes_managed_dangling_symlink(tmp_path: Path) -> None:
+    """A deleted canonical Skill does not strand its recorded discovery link."""
+
+    require_directory_symlink_support(tmp_path)
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, mode=LinkMode.SYMLINK)
+    inventory = discover_catalog(config)
+    apply_plan(config, inventory, build_plan(config, inventory))
+    destination = tmp_path / "home/.agents/skills/hello"
+    shutil.rmtree(catalog / "skills/hello")
+
+    empty_inventory = discover_catalog(config)
+    plan = build_plan(config, empty_inventory)
+
+    assert plan.actions[0].disposition is Disposition.REMOVE
+    apply_plan(config, empty_inventory, plan)
+    assert not destination.is_symlink()
 
 
 def test_apply_backs_up_deselected_managed_copy(tmp_path: Path) -> None:

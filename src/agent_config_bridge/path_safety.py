@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import stat
 from pathlib import Path
 
-__all__ = ["is_directory_reparse_point", "path_comparison_key", "paths_overlap"]
+__all__ = ["is_directory_reparse_point", "path_comparison_key", "paths_overlap", "read_symlink_target"]
 
 
 def is_directory_reparse_point(path: Path) -> bool:
@@ -29,11 +30,25 @@ def path_comparison_key(path: Path, *, windows: bool) -> str:
     still recognized as the same location.
     """
 
-    try:
-        physical = path.resolve(strict=False)
-    except (OSError, RuntimeError):
+    _, has_windows_prefix = _strip_windows_extended_prefix(os.fspath(path))
+    if has_windows_prefix:
         physical = path
+    else:
+        try:
+            physical = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            physical = path
     return _normalized_path_key(physical, windows=windows)
+
+
+def read_symlink_target(path: Path) -> Path:
+    """Return a symlink's lexical target as an absolute path when necessary."""
+
+    raw_target = os.readlink(path)
+    target = Path(raw_target)
+    if target.is_absolute() or ntpath.isabs(raw_target):
+        return target
+    return Path(os.path.abspath(path.parent / target))
 
 
 def paths_overlap(left: Path, right: Path, *, windows: bool) -> bool:
@@ -44,8 +59,8 @@ def paths_overlap(left: Path, right: Path, *, windows: bool) -> bool:
     unresolved spellings.
     """
 
-    left_key = _normalized_path_key(left.resolve(strict=False), windows=windows)
-    right_key = _normalized_path_key(right.resolve(strict=False), windows=windows)
+    left_key = _normalized_path_key(_resolve_with_missing_suffix(left), windows=windows)
+    right_key = _normalized_path_key(_resolve_with_missing_suffix(right), windows=windows)
     if left_key == right_key:
         return True
 
@@ -56,7 +71,46 @@ def paths_overlap(left: Path, right: Path, *, windows: bool) -> bool:
 
 
 def _normalized_path_key(path: Path, *, windows: bool) -> str:
-    normalized = os.path.normpath(os.fspath(path))
+    raw_path, had_windows_prefix = _strip_windows_extended_prefix(os.fspath(path))
     if windows:
-        return normalized.replace("\\", "/").casefold()
-    return normalized
+        return ntpath.normpath(raw_path).replace("\\", "/").casefold()
+    if had_windows_prefix:
+        return ntpath.normpath(raw_path)
+    return os.path.normpath(raw_path)
+
+
+def _resolve_with_missing_suffix(path: Path) -> Path:
+    """Strictly resolve the deepest lexically existing ancestor of ``path``."""
+
+    candidate = Path(os.path.abspath(path))
+    missing: list[str] = []
+    while True:
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            missing.append(candidate.name)
+            candidate = parent
+        else:
+            break
+
+    resolved = candidate.resolve(strict=True)
+    for name in reversed(missing):
+        resolved /= name
+    return resolved
+
+
+def _strip_windows_extended_prefix(value: str) -> tuple[str, bool]:
+    """Remove Windows kernel namespace prefixes returned by ``os.readlink``."""
+
+    normalized = value.replace("/", "\\")
+    folded = normalized.casefold()
+    for prefix in ("\\\\?\\unc\\", "\\??\\unc\\"):
+        if folded.startswith(prefix):
+            return "\\\\" + normalized[len(prefix) :], True
+    for prefix in ("\\\\?\\", "\\??\\"):
+        if folded.startswith(prefix):
+            return normalized[len(prefix) :], True
+    return value, False

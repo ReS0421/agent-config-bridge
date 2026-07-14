@@ -12,6 +12,7 @@ from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.filesystem import apply_copy, tree_digest
 from agent_config_bridge.models import Component, LinkMode, Platform, Product
 from agent_config_bridge.planner import Disposition, Operation, build_plan
+from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.state import BridgeStateError, write_registered_plugins, write_skill_state
 from tests.conftest import make_catalog, make_config, symlink_directory_or_skip
 
@@ -133,7 +134,7 @@ def test_plan_includes_render_and_registration_hints(tmp_path: Path) -> None:
         hooks=("audit-event",),
     )
     components = frozenset({Component.PLUGINS, Component.HOOKS})
-    config = make_config(tmp_path, catalog, components=components)
+    config = make_config(tmp_path, catalog, platform=current_platform(), components=components)
 
     plan = build_plan(config, discover_catalog(config))
 
@@ -154,7 +155,7 @@ def test_plan_removes_plugins_deselected_after_bridge_registration(tmp_path: Pat
         hooks=("audit-event",),
     )
     components = frozenset({Component.PLUGINS, Component.HOOKS})
-    config = make_config(tmp_path, catalog, components=components)
+    config = make_config(tmp_path, catalog, platform=current_platform(), components=components)
     inventory = discover_catalog(config)
     write_registered_plugins(
         config,
@@ -180,7 +181,7 @@ def test_plan_reinstalls_plugins_when_marketplace_source_moves(tmp_path: Path) -
 
     catalog = make_catalog(tmp_path / "catalog", plugins=("shared-plugin",))
     components = frozenset({Component.PLUGINS})
-    config = make_config(tmp_path, catalog, components=components)
+    config = make_config(tmp_path, catalog, platform=current_platform(), components=components)
     write_registered_plugins(config, config.targets[0], ("shared-plugin",))
     moved_state = tmp_path / "moved-state"
     shutil.copytree(config.state_dir, moved_state)
@@ -202,7 +203,13 @@ def test_plan_reinstalls_claude_plugins_when_marketplace_source_moves(tmp_path: 
 
     catalog = make_catalog(tmp_path / "catalog", plugins=("shared-plugin",))
     components = frozenset({Component.PLUGINS})
-    config = make_config(tmp_path, catalog, product=Product.CLAUDE_CODE, components=components)
+    config = make_config(
+        tmp_path,
+        catalog,
+        product=Product.CLAUDE_CODE,
+        platform=current_platform(),
+        components=components,
+    )
     write_registered_plugins(config, config.targets[0], ("shared-plugin",))
     moved_state = tmp_path / "moved-state"
     shutil.copytree(config.state_dir, moved_state)

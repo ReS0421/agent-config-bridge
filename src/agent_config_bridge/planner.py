@@ -11,7 +11,7 @@ from pathlib import Path
 from agent_config_bridge.catalog import Artifact, CatalogInventory
 from agent_config_bridge.filesystem import read_managed_marker, tree_digest
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, Surface, TargetConfig
-from agent_config_bridge.path_safety import path_comparison_key, paths_overlap
+from agent_config_bridge.path_safety import path_comparison_key, paths_overlap, read_symlink_target
 from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.renderer import (
     marketplace_build_path,
@@ -157,6 +157,7 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
         )
 
     for target in enabled_targets:
+        windows_path_semantics = host_platform is Platform.WINDOWS or target.platform is Platform.WINDOWS
         selected_skill_names: set[str] = set()
         previous_skills = previous_skills_by_target[target.name]
         previous_skills_by_name = {entry.name: entry for entry in previous_skills}
@@ -172,12 +173,21 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
                         target,
                         mode,
                         previous_skills_by_name.get(skill.name),
+                        windows_path_semantics=windows_path_semantics,
                     )
                 )
 
         for previous_skill in previous_skills:
             if previous_skill.name not in selected_skill_names:
-                actions.append(_plan_skill_removal(previous_skill, _skill_destination(target), target, inventory))
+                actions.append(
+                    _plan_skill_removal(
+                        previous_skill,
+                        _skill_destination(target),
+                        target,
+                        inventory,
+                        windows_path_semantics=windows_path_semantics,
+                    )
+                )
 
         if Component.HOOKS in target.components:
             reviews.extend(_hook_reviews(target, inventory))
@@ -313,9 +323,17 @@ def _plan_skill(
     target: TargetConfig,
     mode: LinkMode,
     previous: SkillStateEntry | None,
+    *,
+    windows_path_semantics: bool,
 ) -> Action:
     if mode is LinkMode.SYMLINK:
-        return _plan_link(skill, destination, target, previous)
+        return _plan_link(
+            skill,
+            destination,
+            target,
+            previous,
+            windows_path_semantics=windows_path_semantics,
+        )
     if any(path.is_symlink() for path in skill.path.rglob("*")):
         return _conflict_action(
             operation=Operation.COPY,
@@ -333,6 +351,8 @@ def _plan_link(
     destination: Path,
     target: TargetConfig,
     previous: SkillStateEntry | None,
+    *,
+    windows_path_semantics: bool,
 ) -> Action:
     if destination.is_symlink():
         if previous is None or previous.mode is not LinkMode.SYMLINK:
@@ -347,10 +367,10 @@ def _plan_link(
             actual_target = destination.resolve(strict=True)
             same_target = path_comparison_key(
                 actual_target,
-                windows=target.platform is Platform.WINDOWS,
+                windows=windows_path_semantics,
             ) == path_comparison_key(
                 skill.path.resolve(strict=True),
-                windows=target.platform is Platform.WINDOWS,
+                windows=windows_path_semantics,
             )
         except (OSError, RuntimeError):
             actual_target = None
@@ -361,11 +381,11 @@ def _plan_link(
             and recorded_target is not None
             and path_comparison_key(
                 actual_target,
-                windows=target.platform is Platform.WINDOWS,
+                windows=windows_path_semantics,
             )
             == path_comparison_key(
                 recorded_target,
-                windows=target.platform is Platform.WINDOWS,
+                windows=windows_path_semantics,
             )
         )
         if same_target and recorded_target_matches:
@@ -640,6 +660,8 @@ def _plan_skill_removal(
     destination_root: Path,
     target: TargetConfig,
     inventory: CatalogInventory,
+    *,
+    windows_path_semantics: bool,
 ) -> Action:
     destination = destination_root / previous.name
     source = (
@@ -671,9 +693,19 @@ def _plan_skill_removal(
                 disposition=Disposition.CONFLICT,
                 detail="previously managed Skill link was replaced by other content",
             )
-        actual_target = Path(os.path.abspath(destination.parent / os.readlink(destination)))
-        expected_target = Path(previous.link_target)
-        if actual_target != expected_target:
+        try:
+            actual_target = read_symlink_target(destination)
+            expected_target = Path(previous.link_target)
+            target_matches = path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            ) == path_comparison_key(
+                expected_target,
+                windows=windows_path_semantics,
+            )
+        except (OSError, RuntimeError):
+            target_matches = False
+        if not target_matches:
             return replace(
                 base,
                 disposition=Disposition.CONFLICT,
