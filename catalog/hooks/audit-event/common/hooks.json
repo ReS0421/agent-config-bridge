@@ -1,0 +1,27 @@
+{
+  "description": "Log only common lifecycle event names to stderr; never inspect or persist hook payloads.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/scripts/audit-event/audit_event.py\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/scripts/audit-event/audit_event.py\" Stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

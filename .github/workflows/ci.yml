@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install project dependencies
+        run: uv sync --locked --extra dev --python ${{ matrix.python-version }}
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest --cov=agent_config_bridge --cov-report=term-missing
+
+      - name: Build distribution
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: uv build
+
+      - name: Validate distribution metadata
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: uvx --from twine twine check dist/*
+
+      - name: Smoke test wheel entrypoint
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        shell: bash
+        run: |
+          smoke_dir="$(mktemp -d)"
+          trap 'rm -rf "$smoke_dir"' EXIT
+          uv venv --python 3.12 "$smoke_dir/venv"
+          uv pip install --python "$smoke_dir/venv/bin/python" dist/*.whl
+          cd "$smoke_dir"
+          "$smoke_dir/venv/bin/agentbridge" --help

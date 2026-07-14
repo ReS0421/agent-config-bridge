@@ -1,0 +1,31 @@
+# Paths are resolved relative to this file. Generated output belongs in
+# ../.agentbridge; the canonical source remains in ../catalog.
+schema_version = 1
+
+[bridge]
+catalog = "../catalog"
+state_dir = "../.agentbridge"
+link_mode = "auto"
+components = ["skills", "plugins", "hooks"]
+
+# This target inherits all three bridge-level components. The same user home is
+# used by Codex CLI and Desktop; Agent Config Bridge installs each artifact once.
+# Set config_home explicitly when a launcher injects a non-default CODEX_HOME.
+[[targets]]
+name = "local-codex"
+product = "codex"
+platform = "auto"
+user_home = "~"
+surfaces = ["cli", "desktop"]
+enabled = true
+
+# A target-level component list is an explicit override. This target shares
+# skills and hooks with Claude Code CLI and Desktop, but not plugins.
+[[targets]]
+name = "local-claude-code"
+product = "claude-code"
+platform = "auto"
+user_home = "~"
+components = ["skills", "hooks"]
+surfaces = ["cli", "desktop"]
+enabled = true

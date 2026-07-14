@@ -1,0 +1,284 @@
+# Agent Config Bridge
+
+One canonical catalog for Skills, Plugins, and Hooks across:
+
+- Codex CLI and Codex Desktop
+- Claude Code CLI and Claude Code Desktop
+- native Windows, Linux, and WSL-accessible homes
+
+Agent Config Bridge does not pretend the products use identical formats. Skills can usually be shared directly. Plugins and hooks are rendered into product-specific manifests and marketplace packages from one version-controlled source.
+
+> **Status: alpha.** The safety model and core workflow are implemented, but product schemas continue to evolve. Always review `agentbridge plan` before applying or registering anything.
+
+## Why this exists
+
+Codex and Claude Code increasingly share the Agent Skills layout and similar plugin/hook concepts, but their discovery roots, manifests, marketplace files, caches, trust flows, and lifecycle events differ. Environment-specific homes such as `CODEX_HOME` make a directory-only symlink strategy brittle.
+
+Agent Config Bridge separates three concerns:
+
+1. **Canonical source** — one Git repository containing reviewed Skills, Plugin overlays, and Hook bundles.
+2. **Rendering** — separate Codex and Claude Code packages in immutable,
+   content-addressed builds, published through one stable local marketplace path.
+3. **Installation** — conflict-aware links or managed copies for standalone
+   Skills, plus explicit product CLI registration for Plugins and Hooks.
+
+It never shares auth tokens, session databases, caches, logs, trust stores, or an entire product configuration home.
+
+## Current capabilities
+
+- Strict TOML configuration with global and per-target component selection
+- Read-only `validate`, `plan`, and `doctor` commands
+- Linux symlinks and a safe Windows copy fallback (`link_mode = "auto"`)
+- Ownership records for standalone Skills and bridge-registered Plugins/Hooks,
+  bound to their product, platform, and managed roots
+- Drift detection, deselection reconciliation, and retained backups for managed
+  Skill copy updates/removals
+- Canonical Codex Skill destination: `~/.agents/skills`
+- Claude Code Skill destination: `~/.claude/skills`
+- Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`
+- Product-specific local marketplace catalogs backed by immutable builds and
+  published at `<state_dir>/marketplace`
+- Shared hook bundles packaged as a synthetic plugin instead of overwriting user settings
+- Explicit `register` command that refreshes and reconciles bridge-managed
+  marketplace installations
+- POSIX and copyable PowerShell command previews according to target platform
+- Catalog validation for every nested Windows path component, with only
+  contained file symlinks accepted
+
+## Install for development
+
+```bash
+git clone https://github.com/ReS0421/agent-config-bridge.git
+cd agent-config-bridge
+uv sync --extra dev
+uv run agentbridge --help
+```
+
+The runtime uses only the Python 3.11+ standard library. `uv` is used for reproducible development, but the package can also be installed with `pipx` or `pip`.
+
+## Quick start
+
+Create a new bridge catalog:
+
+```bash
+agentbridge init
+```
+
+Add canonical artifacts below `catalog/`, then inspect everything before writing:
+
+```bash
+agentbridge validate
+agentbridge doctor
+agentbridge plan
+```
+
+Apply standalone Skill links/copies and publish the local marketplace:
+
+```bash
+agentbridge apply --yes
+```
+
+`apply` records the standalone Skills it manages and prints the product commands
+needed to activate rendered Plugins and Hooks. Registration is deliberately
+separate:
+
+```bash
+agentbridge register --target local-codex --yes
+agentbridge register --target local-claude-code --yes
+```
+
+Omit `--target` to reconcile every enabled target for the current operating
+system; targets for another OS are left for registration on that OS.
+
+Run registration from the target operating system. A WSL process may render a
+Windows target, but `plan` omits registration commands when the current host and
+target platforms differ so Linux paths are never presented as copyable native
+Windows commands.
+The catalog stays canonical; host-specific TOML files may use different native
+paths while pointing at that same catalog. Keep `state_dir` host-local at a
+stable path—do not share one operational state directory between native Windows,
+WSL, and Linux processes.
+
+Use `agentbridge register`, rather than running the printed product commands by
+hand, when you want later deselection to be reconciled automatically. Manual
+commands bypass the bridge ownership record.
+
+## Configuration
+
+```toml
+schema_version = 1
+
+[bridge]
+catalog = "./catalog"
+state_dir = "./.agentbridge"
+link_mode = "auto" # auto | symlink | copy
+components = ["skills", "plugins", "hooks"]
+
+[[targets]]
+name = "local-codex"
+product = "codex"
+platform = "auto" # auto | linux | windows
+user_home = "~"
+surfaces = ["cli", "desktop"]
+enabled = true
+
+[[targets]]
+name = "local-claude-code"
+product = "claude-code"
+platform = "auto"
+user_home = "~"
+components = ["skills", "hooks"] # optional target override
+surfaces = ["cli", "desktop"]
+enabled = true
+```
+
+`config_home` is optional and defaults to `<user_home>/.codex` or
+`<user_home>/.claude`. Keep it explicit for nonstandard runtimes. For Claude
+Code, standalone Skills are projected to `<config_home>/skills`, so a custom
+`CLAUDE_CONFIG_DIR` layout is honored. Relative catalog and state paths resolve
+from the TOML file. The loader rejects physical equal/nested overlap among the
+catalog, generated state, enabled product homes, and Skill discovery roots.
+Product homes and discovery roots must also remain disjoint across enabled
+targets; Claude Code's own `<config_home>/skills` relationship is the intended
+exception. Isolated sibling directories under one `user_home` remain valid.
+
+See [examples/bridge.toml](examples/bridge.toml) for a working selective-sharing example.
+
+## Canonical catalog layout
+
+```text
+catalog/
+├── skills/
+│   └── hello/
+│       └── SKILL.md
+├── plugins/
+│   └── hello-shared/
+│       ├── common/                 # shared skills, scripts, assets
+│       ├── codex/                  # Codex overlay
+│       │   └── .codex-plugin/plugin.json
+│       └── claude-code/            # Claude Code overlay
+│           └── .claude-plugin/plugin.json
+└── hooks/
+    ├── .version                 # version of the generated hook plugin
+    └── audit-event/
+        ├── common/
+        │   ├── hooks.json          # common event/handler subset
+        │   └── scripts/
+        ├── codex/                  # optional additions
+        └── claude-code/             # optional additions
+```
+
+`common/` is copied into each package, followed by only that product's overlay.
+Overlay files must be identical or non-overlapping; conflicting target files
+fail rendering. Hook event arrays from `common/` and the selected product
+overlay are additive. The bridge does not translate hook semantics between
+products, so catalog authors must put only truly portable declarations in
+`common/hooks.json`.
+
+Rendered packages are separated by product under the immutable path
+`<state_dir>/builds/<digest>/plugins/{codex,claude-code}/`. An
+integrity-checked copy is published at the stable `<state_dir>/marketplace` path
+registered with product CLIs, and each product marketplace lists only the
+components selected for that product. Do not edit either generated location.
+
+Plugin manifests must use strict SemVer and the Codex and Claude Code versions
+for a canonical plugin must match. If any rendered plugin content changes, bump
+that version in both manifests. Hook catalogs with content require a strict
+SemVer in `catalog/hooks/.version`; bump it whenever the generated hook package
+changes. When a package exists in both the current published snapshot and its
+replacement, its new SemVer precedence must be strictly higher if the rendered
+content changed. This is a cache-safety check against the current snapshot, not
+a permanent release history.
+
+Raw filesystem permission bits are not part of catalog, copy, overlay, or
+marketplace identity. The bridge therefore does not promise that an executable
+bit authored on one filesystem survives another OS or checkout. Prefer an
+explicit interpreter in Hook/MCP commands (for example, `python script.py`) and
+product manifest metadata instead of relying on ambient file mode.
+
+## Safety model
+
+- `plan` and `doctor` never write.
+- Existing unmanaged destinations are conflicts, even when their content happens to match.
+- A previously recorded Skill symlink is removed on deselection only while it
+  still points to the recorded canonical source; links are never repointed or
+  adopted automatically.
+- A target with non-empty Skill ownership state reserves its physical Skill
+  root even while `components = []`; another target may claim that root only
+  after the old target completes an empty reconciliation.
+- Copy mode updates only when the ownership marker matches and the installed digest has not drifted.
+- Updated or deselected, unchanged managed copies are retained under the
+  configured state directory.
+- Marketplace builds are immutable and addressed by source digest; the stable
+  published snapshot is integrity-checked before reuse or replacement.
+- Plugin/hook registration requires separate confirmation.
+- `register` removes only Plugins/Hooks recorded by an earlier bridge
+  registration. Before any product registration commands it verifies that the product's
+  bridge-named marketplace is absent, still at the recorded source, or already
+  at the desired source after a partial retry; unrelated sources are refused.
+- Product runtime state and secrets are out of scope by design.
+
+Target `name` is the ownership-state identity. Before renaming or deleting a
+target—or changing its product/home identity—keep the old identity, set
+`components = []`, run both `apply` and `register` to reconcile its managed
+Skills/Plugins/Hooks, and only then change or remove the target. Otherwise the
+old `state_dir/targets/<name>` record becomes orphaned and diagnostics report
+that it cannot be reconciled automatically. `apply` and `register` then stop until
+the old target identity is restored and reconciled; the bridge never adopts or
+deletes orphan state by guesswork.
+
+The same staged rule applies when replacing a target that refers to the same or
+a nested physical Skill discovery root through normal spelling, a symlink alias,
+or a Windows case variant. Reconcile the old target by itself, then remove or
+disable it before enabling the replacement target. Discovery roots remain
+exclusive even when a target does not select the `skills` component.
+
+Plugin ownership also records the stable marketplace source. If the repository
+or `state_dir` moves, `register` removes bridge-recorded installs and the old
+marketplace entry before installing the same selection from the new path.
+
+The generated `state_dir` is operational, non-secret bridge state: rendered
+catalog content, small ownership records, and Skill backups. It contains no
+auth/session/trust records by design. Keep secrets out of the canonical catalog,
+because generated packages and backups reproduce catalog content.
+
+Read [the security model](docs/security.md) before using Hooks from an untrusted catalog.
+
+## Product limitations
+
+- Plugin manifests are not interchangeable; keep both product overlays.
+- Only the common command-hook schema should live in `common/hooks.json`. Use product additions for events or outputs with different semantics.
+- Codex requires users to review and trust changed non-managed Hooks.
+- Claude Code Desktop is available as a Linux beta as well as on Windows and
+  macOS. Plugins work in Local and SSH sessions; Anthropic documents that they
+  are unavailable in Remote (cloud) and WSL sessions.
+- Large Skill catalogs can be shortened in initial model context; prefer repo-scoped Skills or Plugins to keep activation focused.
+- Plugin caches are installation outputs. They are rendered or installed, never used as the canonical source.
+- Alpha releases do not provide an all-actions atomic transaction, a target
+  lock, automatic rollback, recovery logs, product capability/version probing,
+  or full post-install validation.
+- Symlink mode is live: editing canonical Skill content changes what the product
+  sees without another `apply`.
+- Product CLIs remain responsible for plugin caches, hook trust, permissions,
+  and installation behavior. Running previewed commands manually does not update
+  bridge ownership state.
+- Only contained regular-file symlinks are valid catalog inputs. Directory
+  symlinks, broken/escaping links, and nested Windows-incompatible names are
+  rejected; managed Skill copy mode rejects all source symlinks.
+
+See the full [compatibility matrix](docs/compatibility.md) and [architecture](docs/architecture.md).
+
+## Development
+
+```bash
+uv run --extra dev ruff check .
+uv run --extra dev ruff format --check .
+uv run --extra dev mypy
+uv run --extra dev pytest --cov=agent_config_bridge --cov-report=term-missing
+```
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and record significant design changes as an ADR under [docs/adr](docs/adr/README.md).
+
+## License
+
+[MIT](LICENSE)

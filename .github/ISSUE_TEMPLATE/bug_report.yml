@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible Agent Config Bridge problem.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include tokens, session data, credentials, or private Hook payloads.
+  - type: input
+    id: version
+    attributes:
+      label: Agent Config Bridge version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host environment
+      options:
+        - Linux
+        - WSL
+        - Windows
+    validations:
+      required: true
+  - type: textarea
+    id: products
+    attributes:
+      label: Product versions and surfaces
+      description: Include Codex/Claude Code versions and whether CLI or Desktop is affected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide a minimal redacted config, commands, expected behavior, and actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Paste relevant `agentbridge doctor --json` or `plan --json` output after checking it for sensitive data.

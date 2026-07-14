@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "hello-shared",
+  "displayName": "Hello Shared",
+  "version": "0.1.0",
+  "description": "A harmless greeting plugin demonstrating Codex and Claude Code source overlays.",
+  "author": {
+    "name": "Agent Config Bridge contributors",
+    "url": "https://github.com/ReS0421/agent-config-bridge"
+  },
+  "homepage": "https://github.com/ReS0421/agent-config-bridge",
+  "repository": "https://github.com/ReS0421/agent-config-bridge",
+  "license": "MIT",
+  "keywords": ["example", "greeting", "shared-config"],
+  "skills": "./skills/"
+}
