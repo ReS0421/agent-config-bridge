@@ -23,7 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, cast
 
 __all__ = [
     "HeartbeatSpec",
@@ -601,11 +601,11 @@ class WindowsTaskSchedulerBackend:
             return None
         raise ScheduleBackendError(_command_failure("could not query the Windows heartbeat task", result))
 
-    def _create_task(self, xml: str, *, force: bool, spec: HeartbeatSpec) -> None:
+    def _create_task(self, xml: bytes, *, force: bool, spec: HeartbeatSpec) -> None:
         temporary_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(prefix="agentbridge-heartbeat-", suffix=".xml", delete=False) as stream:
-                stream.write(xml.encode("utf-8"))
+                stream.write(xml)
                 temporary_path = Path(stream.name)
             argv = (
                 self._schtasks_executable,
@@ -968,7 +968,7 @@ def _task_child(parent: ET.Element, name: str, value: str | None = None, **attri
     return child
 
 
-def _windows_task_xml(spec: HeartbeatSpec, principal_user: str, task_name: str) -> str:
+def _windows_task_xml(spec: HeartbeatSpec, principal_user: str, task_name: str) -> bytes:
     ET.register_namespace("", _TASK_NAMESPACE)
     root = ET.Element(_task_tag("Task"), {"version": "1.3"})
     registration = _task_child(root, "RegistrationInfo")
@@ -1009,7 +1009,10 @@ def _windows_task_xml(spec: HeartbeatSpec, principal_user: str, task_name: str) 
     _task_child(execution, "Arguments", _windows_arguments(spec))
 
     ET.indent(root, space="  ")
-    return ET.tostring(root, encoding="unicode", xml_declaration=True) + "\n"
+    # SchTasks hands task definitions to the Windows XML stack as Unicode.
+    # Serializing the import file as BOM-marked UTF-16 keeps its byte stream
+    # consistent with the XML declaration and with Task Scheduler exports.
+    return cast(bytes, ET.tostring(root, encoding="utf-16", xml_declaration=True))
 
 
 def _inspect_windows_task_xml(xml: str, expected_target: str, task_name: str) -> tuple[str, str]:

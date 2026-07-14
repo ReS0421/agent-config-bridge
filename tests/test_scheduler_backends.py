@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import shlex
 import subprocess
@@ -51,6 +52,7 @@ class FakeTaskScheduler:
 
     def __init__(self) -> None:
         self.tasks: dict[str, str] = {}
+        self.imported_payloads: dict[str, bytes] = {}
         self.calls: list[tuple[tuple[str, ...], str | None]] = []
 
     def __call__(self, argv: tuple[str, ...], stdin: str | None) -> subprocess.CompletedProcess[str]:
@@ -70,7 +72,9 @@ class FakeTaskScheduler:
             if task_name in self.tasks and "/F" not in argv:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="task already exists")
             xml_path = Path(argv[argv.index("/XML") + 1])
-            self.tasks[task_name] = xml_path.read_text(encoding="utf-8")
+            payload = xml_path.read_bytes()
+            self.imported_payloads[task_name] = payload
+            self.tasks[task_name] = payload.decode("utf-16")
             return subprocess.CompletedProcess(argv, 0, stdout="SUCCESS", stderr="")
         if action == "/Delete":
             if task_name not in self.tasks:
@@ -259,6 +263,9 @@ def test_windows_task_create_is_xml_based_and_idempotent(tmp_path: Path) -> None
     assert plan.disposition is ScheduleDisposition.CREATE
     assert backend.apply(spec, plan)
 
+    payload = runner.imported_payloads[task_name]
+    assert payload.startswith(codecs.BOM_UTF16_LE)
+    assert payload.decode("utf-16").startswith("<?xml version='1.0' encoding='utf-16'?>")
     root = ET.fromstring(runner.tasks[task_name])
     namespace = {"t": _TASK_NAMESPACE}
     assert root.attrib["version"] == "1.3"
