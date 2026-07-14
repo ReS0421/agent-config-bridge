@@ -101,6 +101,8 @@ def test_validate_json_reports_catalog_inventory(
         "catalog": str((tmp_path / "catalog").resolve()),
         "hooks": 1,
         "plugins": 0,
+        "schedules": 0,
+        "settings": 0,
         "skills": 2,
         "valid": True,
     }

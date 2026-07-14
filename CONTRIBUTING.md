@@ -15,8 +15,9 @@ and focused implementation changes are welcome.
 
 ## Development setup
 
-Agent Config Bridge requires Python 3.11 or later and has no runtime
-dependencies. From a clone of the repository:
+Agent Config Bridge requires Python 3.11 or later. Runtime dependencies are
+`tomlkit` for comment-preserving Codex Settings edits and, on native Windows,
+`tzdata` for IANA Schedule timezones. From a clone of the repository:
 
 ```console
 python -m venv .venv
@@ -42,7 +43,8 @@ Changes must preserve these project guarantees:
 - `plan` is read-only.
 - Apply operations never replace unmanaged files or silently overwrite drifted
   managed files.
-- Only explicitly selected skills, plugins, and hooks are synchronized.
+- Only explicitly selected Skills, Plugins, Hooks, Settings, and Schedules are
+  synchronized.
 - Authentication, caches, logs, sessions, databases, and whole configuration
   homes are never synchronized.
 - Source catalogs remain separate from generated, content-addressed output.
@@ -50,10 +52,14 @@ Changes must preserve these project guarantees:
   immutable build.
 - Codex and Claude Code overlays remain product-specific where their formats or
   behavior differ.
-- Ownership reconciliation touches only standalone Skills applied by the bridge
-  and Plugins/Hooks registered through the bridge.
+- Ownership reconciliation touches only standalone Skills and Settings leaves
+  applied by the bridge, Plugins/Hooks registered through the bridge, and
+  target scheduler heartbeats recorded by the bridge.
 - Hooks are executable code. Tests and examples must be non-destructive, avoid
   network access, and never collect prompt or tool payloads.
+- Schedule prompts are unattended executable intent. Tests must cover minute
+  claiming, per-Schedule non-overlap, bounded execution, and absolute vendor
+  executable validation without invoking a real user scheduler.
 
 ## Catalog contributions
 
@@ -65,6 +71,12 @@ and must keep its Codex and Claude Code manifests in the corresponding
 `codex/` and `claude-code/` overlays. A hook uses `common/hooks.json` only for
 the intersection supported by both products; product-specific events belong in
 an overlay.
+
+A Settings bundle uses only product-native
+`codex/config.toml` and/or `claude-code/settings.json` fragments; there is no
+cross-product common Settings schema. A Schedule directory contains exactly
+`schedule.toml` and `PROMPT.md`, uses the strict portable schema documented in
+[Host-managed Schedules](docs/schedules.md), and must not embed secrets.
 
 Both Plugin manifests must have the same directory-matching `name` and strict
 SemVer `version`. Bump both versions whenever rendered Plugin content changes.
@@ -87,10 +99,18 @@ Hook/MCP commands and declare intent in product metadata.
 Treat everything under the configured state directory as generated output. Do
 not copy generated manifests back into the canonical catalog.
 
-The current alpha has no all-actions transaction, target lock, automatic
-rollback, or recovery log. Tests that add mutation behavior must cover partial
-failure and ownership/drift handling without describing those missing features
-as guarantees.
+The current alpha has no all-actions transaction, apply/register target lock,
+automatic rollback, or recovery log. External mutation can succeed before the
+matching ownership-state write; tests that add mutation behavior must cover that
+crash/partial-failure window and fail-closed ownership handling without
+describing rollback or adoption as guarantees. Schedule runtime locks are a
+separate mechanism, not an apply/register transaction.
+
+POSIX tests for new ownership state, Schedule snapshot/runtime files, and new
+Settings files should assert private `0600` files and `0700` managed
+directories. Do not translate those assertions into a Windows ACL guarantee:
+Windows inherits ACLs from the chosen product home or `state_dir`, and ACL
+hardening/auditing is outside the current bridge implementation.
 
 Before renaming/deleting a configured target or changing its product/home, keep
 its old identity, set `components = []`, and run `apply` plus `register`. Removing

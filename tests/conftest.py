@@ -25,11 +25,15 @@ def make_catalog(
     skills: Iterable[str] = ("hello",),
     plugins: Iterable[str] = (),
     hooks: Iterable[str] = (),
+    settings: Iterable[str] = (),
+    schedules: Iterable[str] = (),
 ) -> Path:
     """Create a small valid canonical catalog."""
 
     hooks = tuple(hooks)
-    for group in ("skills", "plugins", "hooks"):
+    settings = tuple(settings)
+    schedules = tuple(schedules)
+    for group in ("skills", "plugins", "hooks", "settings", "schedules"):
         (root / group).mkdir(parents=True, exist_ok=True)
     for name in skills:
         path = root / "skills" / name
@@ -77,6 +81,24 @@ def make_catalog(
         )
     if hooks:
         (root / "hooks" / ".version").write_text("0.1.0\n", encoding="utf-8")
+    for name in settings:
+        fragment = root / "settings" / name / "codex" / "config.toml"
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text(f'model = "{name}"\n', encoding="utf-8")
+    for name in schedules:
+        schedule = root / "schedules" / name
+        schedule.mkdir(parents=True)
+        (schedule / "schedule.toml").write_text(
+            (
+                "schema_version = 1\n"
+                'cron = "0 9 * * 1-5"\n'
+                'timezone = "UTC"\n'
+                'working_directory = "."\n'
+                "timeout_seconds = 3600\n"
+            ),
+            encoding="utf-8",
+        )
+        (schedule / "PROMPT.md").write_text(f"Run the {name} workflow.\n", encoding="utf-8")
     return root
 
 

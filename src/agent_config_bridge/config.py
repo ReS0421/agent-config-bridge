@@ -34,6 +34,7 @@ _TARGET_KEYS = frozenset(
         "platform",
         "user_home",
         "config_home",
+        "executable",
         "components",
         "surfaces",
         "enabled",
@@ -112,6 +113,7 @@ def load_config(path: str | os.PathLike[str]) -> BridgeConfig:
         config_directory=config_directory,
         inherited_components=components,
     )
+    _validate_schedule_surfaces(targets)
     _validate_target_destinations(targets)
     _validate_bridge_path_isolation(catalog, state_dir, targets)
 
@@ -122,6 +124,7 @@ def load_config(path: str | os.PathLike[str]) -> BridgeConfig:
         link_mode=link_mode,
         components=components,
         targets=targets,
+        config_path=config_path,
     )
 
 
@@ -219,6 +222,10 @@ def _parse_target(
     else:
         config_home = default_config_home(product, user_home)
 
+    executable = (
+        _parse_path(target["executable"], f"{context}.executable", base=user_home) if "executable" in target else None
+    )
+
     if "components" in target:
         components = _parse_enum_set(
             target["components"],
@@ -250,6 +257,7 @@ def _parse_target(
         components=components,
         surfaces=surfaces,
         enabled=enabled,
+        executable=executable,
     )
 
 
@@ -309,6 +317,17 @@ def _validate_target_destinations(targets: tuple[TargetConfig, ...]) -> None:
                     f"target {home_target.name!r} config_home overlaps target {skill_target.name!r} "
                     f"Skill root: {config_home} <-> {skill_root}"
                 )
+
+
+def _validate_schedule_surfaces(targets: tuple[TargetConfig, ...]) -> None:
+    """Require the CLI surface for host-managed recurring executions."""
+
+    for target in targets:
+        if target.enabled and Component.SCHEDULES in target.components and Surface.CLI not in target.surfaces:
+            raise ConfigError(
+                f"target {target.name!r} selects schedules but has no cli surface; "
+                "host-managed schedules invoke the product CLI"
+            )
 
 
 def _validate_bridge_path_isolation(

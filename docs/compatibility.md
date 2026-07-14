@@ -18,6 +18,15 @@ native Windows and Linux CI for Python 3.11 and 3.12. Native Windows product
 registration is modeled and unit-tested, but is not yet an automated vendor
 CLI integration job.
 
+Version 0.2 adds native Settings leaf projection and host-managed recurring CLI
+Schedules. These features use public Settings files and operating-system
+schedulers; they do not turn Codex or Claude's product-native scheduled tasks
+into a common API.
+
+The runtime requires Python 3.11+ and `tomlkit`. Native Windows installations
+also include `tzdata` so regional IANA Schedule timezones remain available when
+the operating system does not provide a Python-readable timezone database.
+
 ## Surface matrix
 
 | Product surface     | Windows                                                | Native Linux                              | WSL                                                       | Plugin/Hook boundary                                                |
@@ -41,6 +50,11 @@ documents Plugin support for Local and SSH sessions, but not Remote (cloud) or
 WSL sessions. The bridge target schema does not encode those Desktop session
 types; selecting the Desktop surface produces a compatibility warning, not a
 capability probe or a way to enable Plugins in an unsupported session.
+
+Settings compatibility follows the configured product home, but individual
+keys remain product-defined; the bridge does not assert that every public key is
+consumed by every Desktop surface. Host-managed Schedules require `cli` in the
+target surfaces and invoke that CLI even when `desktop` is also selected.
 
 ## Standalone Skills
 
@@ -75,6 +89,35 @@ Existing links and managed-copy markers are not adopted without matching
 target-scoped ownership state. During a target handoff, the old target keeps its
 physical Skill root reserved until an empty reconciliation completes; this also
 applies to physical aliases and case variants on Windows.
+
+## Settings
+
+Settings share a lifecycle, not a schema:
+
+| Concern | Codex | Claude Code |
+| --- | --- | --- |
+| Canonical fragment | `settings/<bundle>/codex/config.toml` | `settings/<bundle>/claude-code/settings.json` |
+| User destination | `<config_home>/config.toml` | `<config_home>/settings.json` |
+| Merge unit | Explicit scalar/array leaf | Explicit scalar/array leaf |
+| Unrelated values | Preserved | Preserved |
+| Formatting | Existing TOML comments/formatting preserved | JSON formatting may be normalized |
+| New-file POSIX mode | `0600` | `0600` |
+
+There is no `common` Settings fragment and no Codex-to-Claude key translation.
+Catalog authors must express each product's supported schema separately. The
+bridge validates syntax and ownership structure, not whether an installed
+product version recognizes a key.
+
+Every product fragment from every Settings bundle contributes to a target that
+selects `settings`. Mappings are containers; arrays are atomic leaves. Bundles
+cannot define duplicate or ancestor/descendant paths. A pre-existing unowned
+leaf is a conflict even when it has the requested value. Later updates and
+removals require the installed value to match its target ownership digest.
+
+Only the user-level public Settings files above are eligible. The bridge does
+not treat project-local settings, `~/.claude.json`, organization-managed policy,
+authentication, trust, or other product-home files as Settings fragments.
+Plugin marketplace registration remains a separate explicit workflow.
 
 ## Plugins and marketplaces
 
@@ -134,6 +177,52 @@ All Hook bundles selected for a product are packaged into the synthetic
 `catalog/hooks/.version`; bump that strict SemVer whenever the generated Hook
 package changes.
 
+## Schedules
+
+Bridge Schedules are host-managed CLI jobs:
+
+| Concern | Linux | Windows |
+| --- | --- | --- |
+| Heartbeat | Marked current-user crontab block | `AgentConfigBridge-Heartbeat-<target>` Task Scheduler task |
+| Frequency | Once per minute | Once per minute |
+| Schedule evaluation | Five-field cron plus IANA timezone | Same |
+| Registration | Must run on Linux target host | Must run on native Windows target host |
+| Product CLI | Validated absolute path pinned at registration | Validated absolute native `.exe`/`.com` path pinned at registration |
+| Host overlap policy | Cron may start each minute; bridge locks decide claims/runs | Task Scheduler `Parallel`, `PT0S`; bridge locks decide claims/runs |
+| Ownership check | Marker, content digest, target state | Task description digest, task content, target state |
+
+One heartbeat evaluates every published Schedule for its target. `apply`
+publishes the target snapshot; `register` installs the heartbeat. A target must
+include the `cli` surface. Codex runs `codex exec --ephemeral`; Claude Code runs
+`claude --print --no-session-persistence`. Prompts are sent on standard input,
+no permission-bypass flags are added, and missed minutes are not replayed.
+
+An optional target `executable` overrides product CLI discovery for Schedules.
+Otherwise `register` resolves `codex` or `claude` only from absolute non-CWD
+entries in its own `PATH` and prints the resolved path before confirmation. The
+resulting absolute path is stored in the heartbeat, so the later scheduler
+process does not depend on its usually smaller `PATH`. A short target lock makes
+snapshot/minute claiming idempotent and is released before vendor work. A
+separate target/Schedule lock skips only a recurrence whose previous run is
+still active. On Windows, `Parallel` allows later heartbeats to make new claims,
+and `PT0S` leaves duration enforcement to each Schedule's bounded timeout.
+Task Scheduler management itself uses the genuine System32 executable resolved
+through WinAPI rather than Windows current-directory command search.
+
+These jobs are intentionally separate from vendor-native automation:
+
+| Vendor feature | Product ownership/lifetime | Bridge behavior |
+| --- | --- | --- |
+| Codex scheduled tasks | Managed in ChatGPT web or Codex Desktop | Not imported, listed, or mutated |
+| Claude Code CLI `/loop` | Session-scoped; recurring tasks expire after seven days | Not used as durable scheduling |
+| Claude Desktop local tasks | Prompt file is public; cadence/folder/model/enabled state is UI-managed | Native task state is not synchronized |
+| Claude Remote Routines | Account-owned cloud resource | Already follows the account; not synchronized |
+
+Consequently, a bridge Schedule never appears in a Codex or Claude Desktop
+scheduler view. It starts a fresh CLI process and does not inherit a Desktop
+thread or session context. Native Windows and WSL are separate hosts and need
+separate targets and heartbeat registrations.
+
 ## Filesystem modes
 
 | Mode      | Current behavior                                        | Limitations                                                 |
@@ -158,21 +247,34 @@ This avoids host-umask and checkout noise, but it also means the bridge does not
 preserve or validate executable permission portability. Invoke scripts through
 an explicit interpreter and use product metadata for execution intent.
 
+This portable content rule is distinct from local state confidentiality. On
+POSIX, the bridge restricts new ownership files, Schedule snapshots/runtime
+files, and new Settings files to `0600`, with managed state/runtime directories
+at `0700`; existing Settings files retain their mode. Windows POSIX-style mode
+bits do not prove a private DACL, so Windows deployments rely on inherited ACLs
+and should use user-private locations for product homes and `state_dir`.
+
 ## Ownership and reconciliation
 
-`apply` records only standalone Skills. On a later plan it can:
+`apply` records standalone Skills and Settings leaves, and publishes Schedule
+snapshots. On a later plan it can:
 
 - remove a recorded symlink only if it still targets the recorded source;
 - update or remove a managed copy only if its marker matches and it has not
   drifted;
 - retain the displaced managed copy in the backup tree;
 - report replacement, marker mismatch, content drift, or unmanaged content as a
-  conflict.
+  conflict;
+- update/remove only Settings leaves whose current value still matches the
+  target ownership digest;
+- remove a deselected published Schedule pointer without touching a host
+  scheduler entry.
 
-`register` separately records only the Plugin names it successfully reconciles
-for a target. Later deselection removes only those recorded names. Claude
-registration includes marketplace update and Plugin update commands so a bumped
-local release is refreshed. Unrelated Plugins remain untouched.
+`register` separately records the Plugin names and host heartbeat it
+successfully reconciles for a target. Later deselection removes only those
+recorded items. Claude registration includes marketplace update and Plugin
+update commands so a bumped local release is refreshed. Unrelated Plugins and
+scheduler entries remain untouched.
 
 If a user copies a preview command and runs it manually, the product may change
 but bridge ownership state does not. Use `agentbridge register` when automatic
@@ -181,15 +283,19 @@ future reconciliation is desired.
 Target names identify ownership records. To rename/delete a target or change its
 product/home identity safely, first keep the old target identity, set
 `components = []`, run `apply` and `register`, and confirm the empty
-reconciliation. Only then change or remove it. Skipping this sequence leaves an
-orphan `state_dir/targets/<old-name>` record; diagnostics fail and `apply` plus
-`register` stop because the bridge cannot infer which new target, if any, owns
-the old state. Restore the old identity and reconcile it to empty.
+reconciliation of all five component classes. Only then change or remove it.
+Skipping this sequence leaves an orphan `state_dir/targets/<old-name>` record;
+diagnostics fail and `apply` plus `register` stop because the bridge cannot infer
+which new target, if any, owns the old state. Restore the old identity and
+reconcile it to empty.
 
 ## Known alpha limitations
 
-- No all-actions atomic transaction, target lock, automatic rollback, or
-  recovery log.
+- No all-actions atomic transaction, apply/register target lock, automatic
+  rollback, or recovery log. Schedule ticks use a separate runtime lock.
+- A crash between a successful external mutation and the matching ownership
+  write can leave a fail-closed conflict; the bridge has no automatic rollback
+  or adoption path for that window.
 - A sequential apply/register can stop after earlier actions succeeded; inspect
   a fresh plan before retrying.
 - Symlink mode is live and bypasses copy-mode update checkpoints.
@@ -198,6 +304,12 @@ the old state. Restore the old identity and reconcile it to empty.
 - Hook event parity is not inferred or tested by the bridge.
 - Product CLIs own trust approvals, permission policy, caches, and authentication.
 - Manual product commands bypass bridge ownership recording.
+- Settings remain product-specific, project-local and policy-managed Settings
+  are out of scope, and arrays are atomic merge leaves.
+- Host Schedules do not appear in native product scheduler UIs, do not inherit
+  conversation context, and do not replay missed minutes.
+- Host scheduler availability, product CLI authentication, and unattended
+  permission policy remain machine-local responsibilities.
 - Plugin content changes require the same new strict SemVer in both product
   manifests; Hook content changes require a new `hooks/.version`. For packages
   present in both the current published snapshot and its replacement, precedence
@@ -212,10 +324,16 @@ the old state. Restore the old identity and reconcile it to empty.
 - [OpenAI: Build skills](https://learn.chatgpt.com/docs/build-skills)
 - [OpenAI: Build plugins](https://learn.chatgpt.com/docs/build-plugins)
 - [OpenAI: Hooks](https://learn.chatgpt.com/docs/hooks)
+- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/basic-config)
+- [OpenAI: Scheduled tasks](https://learn.chatgpt.com/docs/automations)
 - [OpenAI: ChatGPT desktop app for Windows](https://learn.chatgpt.com/docs/windows/windows-app)
 - [OpenAI: WSL](https://learn.chatgpt.com/docs/windows/wsl)
 - [Anthropic: Extend Claude with skills](https://code.claude.com/docs/en/skills)
 - [Anthropic: Create plugins](https://code.claude.com/docs/en/plugins)
 - [Anthropic: Plugin marketplaces](https://code.claude.com/docs/en/plugin-marketplaces)
 - [Anthropic: Hooks reference](https://code.claude.com/docs/en/hooks)
+- [Anthropic: Claude Code configuration](https://code.claude.com/docs/en/configuration)
+- [Anthropic: Claude Code scheduled tasks](https://code.claude.com/docs/en/scheduled-tasks)
+- [Anthropic: Desktop scheduled tasks](https://code.claude.com/docs/en/desktop-scheduled-tasks)
+- [Anthropic: Remote Routines](https://code.claude.com/docs/en/web-scheduled-tasks)
 - [Anthropic: Claude Code on desktop](https://code.claude.com/docs/en/desktop)

@@ -1,7 +1,8 @@
 # Security Policy
 
-Agent Config Bridge manages executable hooks and links files into agent
-configuration locations. Security reports are taken seriously.
+Agent Config Bridge projects executable agent configuration and unattended
+Schedule prompts into product and host-managed locations. Security reports are
+taken seriously.
 
 ## Supported versions
 
@@ -29,9 +30,10 @@ maintainers will coordinate validation, remediation, and disclosure there.
 ## Security boundaries
 
 Useful reports include unintended writes outside managed paths, path traversal,
-unsafe symlink handling, overwrite of unmanaged content, command injection,
-secret leakage, generated-marketplace integrity failures, ownership-state
-confusion, and cases where a read-only plan operation changes state.
+unsafe symlink handling, overwrite of unmanaged content or Settings leaves,
+command injection, secret leakage, generated-marketplace or Schedule-snapshot
+integrity failures, scheduler ownership confusion, and cases where a read-only
+plan operation changes state.
 
 Catalog hooks are executable code. Running a hook that a user deliberately
 installed from an untrusted catalog is not, by itself, a vulnerability in Agent
@@ -39,14 +41,14 @@ Config Bridge. Executing a hook that was not selected, bypassing a conflict or
 trust check, or altering the hook during synchronization may be a vulnerability.
 
 Agent Config Bridge is not intended to synchronize authentication, session
-databases, caches, logs, trust decisions, or complete Codex or Claude Code
-configuration homes.
+databases, caches, logs, trust decisions, private Desktop scheduler state, or
+complete Codex or Claude Code configuration homes.
 
-The generated `state_dir` is non-secret operational state by design, but rendered
-packages and retained Skill backups reproduce canonical catalog content. A
-catalog containing embedded secrets can therefore copy them into generated
-state. Do not attach catalog or state files to a report without reviewing and
-redacting them.
+The generated `state_dir` is non-secret operational state by design, but
+rendered packages, retained Skill backups, Settings digests, and Schedule
+snapshots reproduce or describe canonical catalog content. A catalog containing
+embedded secrets can therefore copy them into generated state. Do not attach
+catalog or state files to a report without reviewing and redacting them.
 
 The current alpha does not claim an all-actions atomic transaction, target lock,
 automatic rollback, recovery log, product capability/version probe, arbitrary

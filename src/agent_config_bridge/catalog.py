@@ -6,6 +6,7 @@ import json
 import os
 import re
 import stat
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,12 +53,14 @@ class Artifact:
 
 @dataclass(frozen=True, slots=True)
 class CatalogInventory:
-    """Validated skills, plugins, and hooks discovered in a catalog."""
+    """Validated component artifacts discovered in a canonical catalog."""
 
     root: Path
     skills: tuple[Artifact, ...]
     plugins: tuple[Artifact, ...]
     hooks: tuple[Artifact, ...]
+    settings: tuple[Artifact, ...]
+    schedules: tuple[Artifact, ...]
     hook_version: str | None
 
 
@@ -81,12 +84,16 @@ def discover_catalog(config: BridgeConfig) -> CatalogInventory:
     skills = _discover_group(root / "skills", root, _validate_skill)
     plugins = _discover_group(root / "plugins", root, _validate_plugin)
     hooks = _discover_group(root / "hooks", root, _validate_hook)
+    settings = _discover_group(root / "settings", root, _validate_settings)
+    schedules = _discover_group(root / "schedules", root, _validate_schedule)
     hook_version = _read_hook_version(root / "hooks", root, required=bool(hooks))
     return CatalogInventory(
         root=root,
         skills=skills,
         plugins=plugins,
         hooks=hooks,
+        settings=settings,
+        schedules=schedules,
         hook_version=hook_version,
     )
 
@@ -237,6 +244,68 @@ def _validate_hook_groups(hooks: dict[Any, Any], path: Path) -> None:
                     isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
                 ):
                     raise CatalogError(f"hook timeout for event {event!r} must be a positive number: {path}")
+
+
+def _validate_settings(path: Path) -> None:
+    allowed_roots = {"codex", "claude-code"}
+    children = {child.name for child in path.iterdir()}
+    unknown = sorted(children - allowed_roots)
+    if unknown:
+        raise CatalogError(
+            f"settings bundle contains unsupported roots {', '.join(repr(name) for name in unknown)}: {path}"
+        )
+
+    codex_fragment = path / "codex" / "config.toml"
+    claude_fragment = path / "claude-code" / "settings.json"
+    if not codex_fragment.is_file() and not claude_fragment.is_file():
+        raise CatalogError(f"settings bundle must contain codex/config.toml or claude-code/settings.json: {path}")
+
+    for product_root, expected_name in ((path / "codex", "config.toml"), (path / "claude-code", "settings.json")):
+        if not product_root.exists():
+            continue
+        if product_root.is_symlink() or not product_root.is_dir():
+            raise CatalogError(f"settings product root must be a real directory: {product_root}")
+        entries = tuple(product_root.iterdir())
+        if len(entries) != 1 or entries[0].name != expected_name or entries[0].is_symlink():
+            raise CatalogError(f"settings product root may contain only a real {expected_name}: {product_root}")
+
+    if codex_fragment.is_file():
+        try:
+            with codex_fragment.open("rb") as stream:
+                payload = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise CatalogError(f"invalid Codex settings fragment: {codex_fragment}: {exc}") from exc
+        if not payload:
+            raise CatalogError(f"Codex settings fragment must contain at least one setting: {codex_fragment}")
+
+    if claude_fragment.is_file():
+        payload = _load_json(claude_fragment)
+        if not isinstance(payload, dict) or not payload:
+            raise CatalogError(f"Claude Code settings fragment must contain a non-empty object: {claude_fragment}")
+
+
+def _validate_schedule(path: Path) -> None:
+    expected = {"schedule.toml", "PROMPT.md"}
+    children = {child.name for child in path.iterdir()}
+    if children != expected:
+        raise CatalogError(
+            f"schedule must contain exactly schedule.toml and PROMPT.md: {path}; "
+            f"found {', '.join(sorted(children)) or 'nothing'}"
+        )
+    document = path / "schedule.toml"
+    prompt = path / "PROMPT.md"
+    if document.is_symlink() or prompt.is_symlink() or not document.is_file() or not prompt.is_file():
+        raise CatalogError(f"schedule sources must be real regular files: {path}")
+    try:
+        with document.open("rb") as stream:
+            payload = tomllib.load(stream)
+        prompt_text = prompt.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise CatalogError(f"invalid schedule source: {path}: {exc}") from exc
+    if not payload:
+        raise CatalogError(f"schedule.toml must contain a schedule definition: {document}")
+    if not prompt_text.strip():
+        raise CatalogError(f"schedule prompt must not be empty: {prompt}")
 
 
 def _validate_plugin_manifest(path: Path, artifact_name: str, product_name: str) -> str:

@@ -11,6 +11,11 @@ should edit:
   supported by both products.
 - `hooks/.version` is the strict SemVer of the generated
   `agent-config-bridge-hooks` Plugin.
+- `settings/<bundle>/codex/config.toml` and
+  `settings/<bundle>/claude-code/settings.json` are optional product-native
+  Settings fragments; there is no `common` Settings schema.
+- `schedules/<name>/schedule.toml` plus `PROMPT.md` define an optional portable
+  recurring CLI workflow.
 
 Agent Config Bridge merges source overlays into immutable, content-addressed
 output below `<state_dir>/builds/<digest>/`. It publishes an integrity-checked
@@ -18,6 +23,16 @@ copy at the stable `<state_dir>/marketplace` path used for product registration.
 Both locations are generated and must not be edited or committed. A product
 cache populated from the marketplace is also generated, not a second source of
 truth.
+
+Settings fragments are flattened to explicit owned leaves. Mappings are
+containers and arrays are atomic leaves; duplicate and ancestor/descendant
+claims across bundles are invalid. Schedules use the strict five-field cron,
+IANA timezone, target-home-relative worktree, bounded timeout, and non-empty
+prompt schema documented in [Host-managed Schedules](../docs/schedules.md).
+Every Schedule is rendered for every selected Schedule target, so enable the
+component on only one target when a workflow must run only once.
+Codex/Claude Desktop task stores, Claude CLI loop state, and Claude Remote
+Routines are product-owned runtime state, not canonical catalog inputs.
 
 Plugin directories and both manifest `name` values must match. Both manifests
 must use the same strict SemVer. Bump both versions whenever any rendered Plugin
@@ -45,7 +60,10 @@ are simple examples. The bridge enforces filesystem containment for source
 symlinks; it does not inspect textual path references in manifests or
 `.mcp.json`, so authors must review those references themselves.
 
-Generated bridge state is designed to be non-secret, but it reproduces catalog
-content and retained Skill copies. Never place credentials, authentication
+Generated bridge state is designed to be non-secret, but rendered packages,
+retained Skill copies, and Schedule snapshots reproduce catalog content.
+Settings values are written to the public vendor Settings file but ownership
+state retains only paths and digests. Never place credentials, authentication
 state, session data, logs, caches, trust decisions, or embedded secret values in
-this catalog.
+this catalog. Schedule prompts are unattended executable intent and require the
+same review discipline as Hooks.

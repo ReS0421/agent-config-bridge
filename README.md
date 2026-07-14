@@ -1,12 +1,16 @@
 # Agent Config Bridge
 
-One canonical catalog for Skills, Plugins, and Hooks across:
+One canonical catalog for Skills, Plugins, Hooks, Settings, and Schedules across:
 
 - Codex CLI and Codex Desktop
 - Claude Code CLI and Claude Code Desktop
 - native Windows, Linux, and WSL-accessible homes
 
-Agent Config Bridge does not pretend the products use identical formats. Skills can usually be shared directly. Plugins and hooks are rendered into product-specific manifests and marketplace packages from one version-controlled source.
+Agent Config Bridge does not pretend the products use identical formats. Skills
+can usually be shared directly. Plugins and Hooks are rendered into
+product-specific packages, Settings are merged into public product files by
+owned leaf, and Schedules are executed through host schedulers and product CLIs.
+All five component classes still come from one version-controlled catalog.
 
 > **Status: alpha.** The safety model and core workflow are implemented, but product schemas continue to evolve. Always review `agentbridge plan` before applying or registering anything.
 
@@ -14,13 +18,17 @@ Agent Config Bridge does not pretend the products use identical formats. Skills 
 
 Codex and Claude Code increasingly share the Agent Skills layout and similar plugin/hook concepts, but their discovery roots, manifests, marketplace files, caches, trust flows, and lifecycle events differ. Environment-specific homes such as `CODEX_HOME` make a directory-only symlink strategy brittle.
 
-Agent Config Bridge separates three concerns:
+Agent Config Bridge separates four concerns:
 
-1. **Canonical source** — one Git repository containing reviewed Skills, Plugin overlays, and Hook bundles.
+1. **Canonical source** — one Git repository containing reviewed Skills, Plugin
+   overlays, Hook bundles, product-specific Settings fragments, and portable
+   Schedule definitions.
 2. **Rendering** — separate Codex and Claude Code packages in immutable,
-   content-addressed builds, published through one stable local marketplace path.
+   content-addressed builds, plus immutable per-target Schedule snapshots.
 3. **Installation** — conflict-aware links or managed copies for standalone
-   Skills, plus explicit product CLI registration for Plugins and Hooks.
+   Skills and owned-leaf Settings patches.
+4. **Registration** — explicit product CLI registration for Plugins/Hooks and
+   an ownership-aware host heartbeat for Schedules.
 
 It never shares auth tokens, session databases, caches, logs, trust stores, or an entire product configuration home.
 
@@ -29,8 +37,8 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
 - Strict TOML configuration with global and per-target component selection
 - Read-only `validate`, `plan`, and `doctor` commands
 - Linux symlinks and a safe Windows copy fallback (`link_mode = "auto"`)
-- Ownership records for standalone Skills and bridge-registered Plugins/Hooks,
-  bound to their product, platform, and managed roots
+- Target-scoped ownership records for standalone Skills, Settings leaves,
+  bridge-registered Plugins/Hooks, and host scheduler heartbeats
 - Drift detection, deselection reconciliation, and retained backups for managed
   Skill copy updates/removals
 - Canonical Codex Skill destination: `~/.agents/skills`
@@ -39,8 +47,16 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
 - Product-specific local marketplace catalogs backed by immutable builds and
   published at `<state_dir>/marketplace`
 - Shared hook bundles packaged as a synthetic plugin instead of overwriting user settings
+- Product-specific Codex `config.toml` and Claude Code `settings.json`
+  fragments merged by explicit owned leaf, preserving unrelated local values
+- Portable five-field cron definitions with IANA time zones, per-target
+  immutable snapshots, overlap protection, and manual-run support
+- One target-scoped, once-per-minute heartbeat in the Linux user crontab or
+  Windows Task Scheduler; the heartbeat evaluates all due canonical Schedules
+- Registration-time discovery or an optional per-target override pins the
+  product CLI to an absolute executable path for unattended runs
 - Explicit `register` command that refreshes and reconciles bridge-managed
-  marketplace installations
+  marketplace installations and host scheduler heartbeats
 - POSIX and copyable PowerShell command previews according to target platform
 - Catalog validation for every nested Windows path component, with only
   contained file symlinks accepted
@@ -54,7 +70,11 @@ uv sync --extra dev
 uv run agentbridge --help
 ```
 
-The runtime uses only the Python 3.11+ standard library. `uv` is used for reproducible development, but the package can also be installed with `pipx` or `pip`.
+The runtime supports Python 3.11+ and uses `tomlkit` for comment-preserving
+Codex Settings edits. Native Windows also installs `tzdata` so IANA Schedule
+timezones do not depend on a system timezone database. `uv` is used for
+reproducible development, but the package can also be installed with `pipx` or
+`pip`.
 
 ## Quick start
 
@@ -72,15 +92,16 @@ agentbridge doctor
 agentbridge plan
 ```
 
-Apply standalone Skill links/copies and publish the local marketplace:
+Apply standalone Skill links/copies, merge selected Settings, publish the local
+marketplace, and render per-target Schedule snapshots:
 
 ```bash
 agentbridge apply --yes
 ```
 
-`apply` records the standalone Skills it manages and prints the product commands
-needed to activate rendered Plugins and Hooks. Registration is deliberately
-separate:
+`apply` records the standalone Skills and Settings leaves it manages and prints
+the product and host commands needed to activate rendered Plugins, Hooks, and
+Schedules. Registration is deliberately separate:
 
 ```bash
 agentbridge register --target local-codex --yes
@@ -88,7 +109,14 @@ agentbridge register --target local-claude-code --yes
 ```
 
 Omit `--target` to reconcile every enabled target for the current operating
-system; targets for another OS are left for registration on that OS.
+system; targets for another OS are left for registration on that OS. For a
+target with `schedules` selected, `register` installs or updates one heartbeat
+in that host's current-user scheduler. Run one published Schedule immediately
+without changing its cadence with:
+
+```bash
+agentbridge schedule run --target local-codex --name daily-review
+```
 
 Run registration from the target operating system. A WSL process may render a
 Windows target, but `plan` omits registration commands when the current host and
@@ -112,13 +140,14 @@ schema_version = 1
 catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto" # auto | symlink | copy
-components = ["skills", "plugins", "hooks"]
+components = ["skills", "plugins", "hooks", "settings", "schedules"]
 
 [[targets]]
 name = "local-codex"
 product = "codex"
 platform = "auto" # auto | linux | windows
 user_home = "~"
+# executable = "/absolute/path/to/codex" # optional Schedule CLI override
 surfaces = ["cli", "desktop"]
 enabled = true
 
@@ -127,7 +156,7 @@ name = "local-claude-code"
 product = "claude-code"
 platform = "auto"
 user_home = "~"
-components = ["skills", "hooks"] # optional target override
+components = ["skills", "hooks", "settings"] # optional target override
 surfaces = ["cli", "desktop"]
 enabled = true
 ```
@@ -141,6 +170,18 @@ catalog, generated state, enabled product homes, and Skill discovery roots.
 Product homes and discovery roots must also remain disjoint across enabled
 targets; Claude Code's own `<config_home>/skills` relationship is the intended
 exception. Isolated sibling directories under one `user_home` remain valid.
+
+The optional target `executable` selects the Codex or Claude Code CLI used by
+Schedules only; Plugin/Hook registration continues to use product commands from
+the registering process environment. An explicit path is normalized to an
+absolute host path (`user_home` is the base for a relative value), then must
+resolve to a real file. Linux requires it to be executable; Windows requires a
+native `.exe` or `.com` launcher. Without an override, `register` searches only
+absolute `PATH` entries for `codex` or `claude`, excluding the current directory
+and relative entries, then records the validated absolute path in the
+heartbeat. Registration prints the resolved bridge, product CLI, and config
+paths for review. Later Schedule ticks do not depend on cron or Task Scheduler
+`PATH` lookup.
 
 See [examples/bridge.toml](examples/bridge.toml) for a working selective-sharing example.
 
@@ -158,14 +199,22 @@ catalog/
 │       │   └── .codex-plugin/plugin.json
 │       └── claude-code/            # Claude Code overlay
 │           └── .claude-plugin/plugin.json
-└── hooks/
-    ├── .version                 # version of the generated hook plugin
-    └── audit-event/
-        ├── common/
-        │   ├── hooks.json          # common event/handler subset
-        │   └── scripts/
-        ├── codex/                  # optional additions
-        └── claude-code/             # optional additions
+├── hooks/
+│   ├── .version                 # version of the generated hook plugin
+│   └── audit-event/
+│       ├── common/
+│       │   ├── hooks.json       # common event/handler subset
+│       │   └── scripts/
+│       ├── codex/               # optional additions
+│       └── claude-code/         # optional additions
+├── settings/
+│   └── shared-defaults/
+│       ├── codex/config.toml    # Codex-native fragment
+│       └── claude-code/settings.json
+└── schedules/
+    └── daily-review/
+        ├── schedule.toml        # cron, timezone, worktree, timeout
+        └── PROMPT.md            # prompt passed on standard input
 ```
 
 `common/` is copied into each package, followed by only that product's overlay.
@@ -196,6 +245,22 @@ bit authored on one filesystem survives another OS or checkout. Prefer an
 explicit interpreter in Hook/MCP commands (for example, `python script.py`) and
 product manifest metadata instead of relying on ambient file mode.
 
+Settings deliberately have no `common` cross-product document. Every catalog
+bundle contributes its native fragment for a target's product; mappings are
+containers and arrays are atomic leaf values. An existing unowned leaf is a
+conflict even when it already equals the desired value. The bridge removes a
+deselected leaf only while its current digest still proves bridge ownership.
+Unrelated local settings remain in place, and Codex TOML comments are
+preserved. The bridge never manages credentials, `~/.claude.json`, managed
+policy, or whole product homes.
+
+A Schedule directory contains exactly `schedule.toml` and `PROMPT.md`. The
+definition uses a strict five-field numeric cron expression, an IANA timezone,
+a portable working directory relative to the target `user_home`, and an
+optional bounded timeout. `apply` must run before `register` so the heartbeat
+can consume a current immutable snapshot. See [Schedules](docs/schedules.md)
+for the schema and lifecycle.
+
 ## Safety model
 
 - `plan` and `doctor` never write.
@@ -211,18 +276,27 @@ product manifest metadata instead of relying on ambient file mode.
   configured state directory.
 - Marketplace builds are immutable and addressed by source digest; the stable
   published snapshot is integrity-checked before reuse or replacement.
-- Plugin/hook registration requires separate confirmation.
+- Settings update/remove only while each current value matches its target-scoped
+  ownership digest; unrelated values are never backed up or copied into state.
+- Plugin/Hook and host scheduler registration require separate confirmation.
 - `register` removes only Plugins/Hooks recorded by an earlier bridge
   registration. Before any product registration commands it verifies that the product's
   bridge-named marketplace is absent, still at the recorded source, or already
   at the desired source after a partial retry; unrelated sources are refused.
+- Scheduler registration replaces or removes only a target-scoped crontab block
+  or Windows task whose ownership marker and digest remain intact.
+- On POSIX, new ownership state, Schedule snapshots/runtime files, and newly
+  created Settings files are restricted to user-private modes. Windows mode
+  bits are not an ACL guarantee; place `state_dir` and product homes in a
+  user-private ACL-protected location.
 - Product runtime state and secrets are out of scope by design.
 
 Target `name` is the ownership-state identity. Before renaming or deleting a
 target—or changing its product/home identity—keep the old identity, set
 `components = []`, run both `apply` and `register` to reconcile its managed
-Skills/Plugins/Hooks, and only then change or remove the target. Otherwise the
-old `state_dir/targets/<name>` record becomes orphaned and diagnostics report
+Skills/Plugins/Hooks/Settings/Schedules, and only then change or remove the
+target. Otherwise the old `state_dir/targets/<name>` record becomes orphaned and
+diagnostics report
 that it cannot be reconciled automatically. `apply` and `register` then stop until
 the old target identity is restored and reconciled; the bridge never adopts or
 deletes orphan state by guesswork.
@@ -242,7 +316,8 @@ catalog content, small ownership records, and Skill backups. It contains no
 auth/session/trust records by design. Keep secrets out of the canonical catalog,
 because generated packages and backups reproduce catalog content.
 
-Read [the security model](docs/security.md) before using Hooks from an untrusted catalog.
+Read [the security model](docs/security.md) before applying an untrusted catalog
+or enabling unattended Schedules.
 
 ## Product limitations
 
@@ -254,9 +329,25 @@ Read [the security model](docs/security.md) before using Hooks from an untrusted
   are unavailable in Remote (cloud) and WSL sessions.
 - Large Skill catalogs can be shortened in initial model context; prefer repo-scoped Skills or Plugins to keep activation focused.
 - Plugin caches are installation outputs. They are rendered or installed, never used as the canonical source.
-- Alpha releases do not provide an all-actions atomic transaction, a target
-  lock, automatic rollback, recovery logs, product capability/version probing,
-  or full post-install validation.
+- Host-managed Schedules do not appear in the Codex Desktop or Claude Code
+  Desktop scheduler views. Codex scheduled tasks are web/Desktop-managed;
+  Claude CLI loops are session-scoped, while Claude Desktop task cadence and
+  Remote Routines are product-managed. The bridge does not copy or edit their
+  private/native scheduler state.
+- Scheduled prompts run fresh, non-persistent CLI invocations. They do not
+  inherit a Desktop conversation, and missed minutes are not replayed.
+- Windows Task Scheduler permits parallel minute heartbeats with no scheduler
+  execution-time cap. A short minute-claim lock suppresses duplicate claims;
+  a separate per-Schedule lock skips only a recurrence whose previous run is
+  still active, while the Schedule's own timeout remains authoritative.
+- Alpha releases do not provide an all-actions atomic transaction, an
+  apply/register target lock, automatic rollback, recovery logs, product
+  capability/version probing, or full post-install validation. Schedule ticks
+  use a separate runtime lock.
+- A process crash can occur after an external file, product registry, crontab,
+  or Task Scheduler mutation succeeds but before its ownership-state write.
+  The next run fails closed or reports a conflict; inspect the external state
+  and reconcile explicitly rather than expecting automatic rollback.
 - Symlink mode is live: editing canonical Skill content changes what the product
   sees without another `apply`.
 - Product CLIs remain responsible for plugin caches, hook trust, permissions,

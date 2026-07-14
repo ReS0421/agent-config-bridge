@@ -17,20 +17,30 @@ from agent_config_bridge.path_safety import path_comparison_key
 __all__ = [
     "BridgeStateError",
     "RegistrationState",
+    "SchedulerState",
+    "SettingStateEntry",
+    "SettingsState",
     "SkillStateEntry",
     "desired_plugin_names",
     "find_orphaned_target_states",
     "read_registration_state",
+    "read_scheduler_state",
+    "read_settings_state",
     "read_skill_state",
     "read_registered_plugins",
     "registration_state_path",
     "registration_marketplace_source",
+    "scheduler_state_path",
+    "settings_state_path",
     "skill_state_path",
     "write_registered_plugins",
+    "write_scheduler_state",
+    "write_settings_state",
     "write_skill_state",
 ]
 
 _ARTIFACT_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 class BridgeStateError(RuntimeError):
@@ -53,6 +63,33 @@ class RegistrationState:
 
     plugins: tuple[str, ...]
     marketplace_source: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SettingStateEntry:
+    """One product setting leaf previously managed for a target."""
+
+    source_id: str
+    path: tuple[str, ...]
+    value_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SettingsState:
+    """Ownership needed to update or remove selected product-setting leaves."""
+
+    file_created: bool
+    created_containers: tuple[tuple[str, ...], ...]
+    entries: tuple[SettingStateEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerState:
+    """One host heartbeat previously registered for a target."""
+
+    backend: str
+    heartbeat_digest: str
+    config_path: str
 
 
 def desired_plugin_names(target: TargetConfig, inventory: CatalogInventory) -> tuple[str, ...]:
@@ -82,6 +119,18 @@ def skill_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
     """Return the validated per-target standalone Skill ownership record path."""
 
     return _state_path(config, target, "skills.json")
+
+
+def settings_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
+    """Return the validated per-target setting ownership record path."""
+
+    return _state_path(config, target, "settings.json")
+
+
+def scheduler_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
+    """Return the validated per-target host-scheduler ownership record path."""
+
+    return _state_path(config, target, "scheduler.json")
 
 
 def read_skill_state(config: BridgeConfig, target: TargetConfig) -> tuple[SkillStateEntry, ...]:
@@ -146,6 +195,82 @@ def read_registered_plugins(config: BridgeConfig, target: TargetConfig) -> tuple
     return read_registration_state(config, target).plugins
 
 
+def read_settings_state(config: BridgeConfig, target: TargetConfig) -> SettingsState:
+    """Read product-setting leaves previously reconciled through apply."""
+
+    path = settings_state_path(config, target)
+    if not path.exists():
+        if path.is_symlink():
+            raise BridgeStateError(f"settings ownership state is a broken symlink: {path}")
+        return SettingsState(file_created=False, created_containers=(), entries=())
+    payload = _read_state_payload(path, "settings ownership state")
+    try:
+        if payload["schema_version"] != 1 or payload["target"] != target.name:
+            raise ValueError("schema version or target does not match")
+        _require_identity(payload, _settings_identity(target), path)
+        file_created = payload["file_created"]
+        raw_containers = payload["created_containers"]
+        raw_entries = payload["settings"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BridgeStateError(f"invalid settings ownership state: {path}") from exc
+    if type(file_created) is not bool or not isinstance(raw_containers, list) or not isinstance(raw_entries, list):
+        raise BridgeStateError(f"invalid settings ownership state: {path}")
+
+    containers = tuple(_parse_setting_path(item, path) for item in raw_containers)
+    if len(containers) != len(set(containers)):
+        raise BridgeStateError(f"duplicate created containers in settings ownership state: {path}")
+
+    entries: list[SettingStateEntry] = []
+    seen_paths: set[tuple[str, ...]] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise BridgeStateError(f"invalid setting entry in ownership state: {path}")
+        source_id = raw_entry.get("source_id")
+        value_digest = raw_entry.get("value_digest")
+        setting_path = _parse_setting_path(raw_entry.get("path"), path)
+        if (
+            not isinstance(source_id, str)
+            or not source_id.startswith("settings/")
+            or "\x00" in source_id
+            or not isinstance(value_digest, str)
+            or _SHA256.fullmatch(value_digest) is None
+            or setting_path in seen_paths
+        ):
+            raise BridgeStateError(f"invalid setting entry in ownership state: {path}")
+        seen_paths.add(setting_path)
+        entries.append(SettingStateEntry(source_id=source_id, path=setting_path, value_digest=value_digest))
+    return SettingsState(file_created=file_created, created_containers=containers, entries=tuple(entries))
+
+
+def read_scheduler_state(config: BridgeConfig, target: TargetConfig) -> SchedulerState | None:
+    """Read a host heartbeat registration previously reconciled through register."""
+
+    path = scheduler_state_path(config, target)
+    if not path.exists():
+        if path.is_symlink():
+            raise BridgeStateError(f"scheduler ownership state is a broken symlink: {path}")
+        return None
+    payload = _read_state_payload(path, "scheduler ownership state")
+    try:
+        if payload["schema_version"] != 1 or payload["target"] != target.name:
+            raise ValueError("schema version or target does not match")
+        _require_identity(payload, _scheduler_identity(target), path)
+        backend = payload["backend"]
+        heartbeat_digest = payload["heartbeat_digest"]
+        config_path = payload["config_path"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BridgeStateError(f"invalid scheduler ownership state: {path}") from exc
+    if (
+        backend not in {"cron", "task-scheduler"}
+        or not isinstance(heartbeat_digest, str)
+        or _SHA256.fullmatch(heartbeat_digest) is None
+        or not isinstance(config_path, str)
+        or not config_path
+    ):
+        raise BridgeStateError(f"invalid scheduler ownership state: {path}")
+    return SchedulerState(backend=backend, heartbeat_digest=heartbeat_digest, config_path=config_path)
+
+
 def read_registration_state(config: BridgeConfig, target: TargetConfig) -> RegistrationState:
     """Read registered Plugin IDs and their recorded marketplace source."""
 
@@ -197,6 +322,60 @@ def write_registered_plugins(
         "plugins": list(plugins),
     }
     _write_state_document(path, payload, "plugin ownership state")
+
+
+def write_settings_state(
+    config: BridgeConfig,
+    target: TargetConfig,
+    state: SettingsState,
+) -> None:
+    """Atomically record owned product-setting leaves for one target."""
+
+    path = settings_state_path(config, target)
+    if not state.entries:
+        _remove_state_document(path, "settings ownership state")
+        return
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "target": target.name,
+        "identity": _settings_identity(target),
+        "file_created": state.file_created,
+        "created_containers": [list(item) for item in state.created_containers],
+        "settings": [
+            {
+                "source_id": entry.source_id,
+                "path": list(entry.path),
+                "value_digest": entry.value_digest,
+            }
+            for entry in state.entries
+        ],
+    }
+    _write_state_document(path, payload, "settings ownership state")
+
+
+def write_scheduler_state(
+    config: BridgeConfig,
+    target: TargetConfig,
+    state: SchedulerState | None,
+) -> None:
+    """Atomically record or clear one host scheduler registration."""
+
+    path = scheduler_state_path(config, target)
+    if state is None:
+        _remove_state_document(path, "scheduler ownership state")
+        return
+    _write_state_document(
+        path,
+        {
+            "schema_version": 1,
+            "target": target.name,
+            "identity": _scheduler_identity(target),
+            "backend": state.backend,
+            "heartbeat_digest": state.heartbeat_digest,
+            "config_path": state.config_path,
+        },
+        "scheduler ownership state",
+    )
 
 
 def write_skill_state(
@@ -262,7 +441,10 @@ def find_orphaned_target_states(config: BridgeConfig) -> tuple[str, ...]:
     for candidate in sorted(resolved_targets_root.iterdir(), key=lambda path: path.name):
         if candidate.is_symlink() or not candidate.is_dir() or _ARTIFACT_NAME.fullmatch(candidate.name) is None:
             raise BridgeStateError(f"invalid target ownership state directory: {candidate}")
-        has_state = any((candidate / filename).exists() for filename in ("skills.json", "plugins.json"))
+        has_state = any(
+            (candidate / filename).exists()
+            for filename in ("skills.json", "plugins.json", "settings.json", "scheduler.json")
+        )
         if has_state and candidate.name not in enabled_names:
             orphaned.append(candidate.name)
     return tuple(orphaned)
@@ -287,6 +469,24 @@ def _registration_identity(target: TargetConfig) -> dict[str, str]:
     }
 
 
+def _settings_identity(target: TargetConfig) -> dict[str, str]:
+    filename = "config.toml" if target.product is Product.CODEX else "settings.json"
+    return {
+        "product": target.product.value,
+        "platform": target.platform.value,
+        "settings_file": _path_identity(target.config_home / filename, target.platform),
+    }
+
+
+def _scheduler_identity(target: TargetConfig) -> dict[str, str]:
+    return {
+        "product": target.product.value,
+        "platform": target.platform.value,
+        "user_home": _path_identity(target.user_home, target.platform),
+        "config_home": _path_identity(target.config_home, target.platform),
+    }
+
+
 def _require_identity(payload: dict[str, Any], expected: dict[str, str], path: Path) -> None:
     if payload.get("identity") != expected:
         raise BridgeStateError(
@@ -297,6 +497,24 @@ def _require_identity(payload: dict[str, Any], expected: dict[str, str], path: P
 
 def _path_identity(path: Path, platform: Platform) -> str:
     return path_comparison_key(path, windows=platform is Platform.WINDOWS)
+
+
+def _parse_setting_path(value: object, state_path: Path) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or not all(isinstance(part, str) and part for part in value):
+        raise BridgeStateError(f"invalid setting path in ownership state: {state_path}")
+    return tuple(value)
+
+
+def _read_state_payload(path: Path, description: str) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        raise BridgeStateError(f"{description} is not a regular file: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BridgeStateError(f"invalid {description}: {path}") from exc
+    if not isinstance(payload, dict):
+        raise BridgeStateError(f"invalid {description}: {path}")
+    return payload
 
 
 def _write_state_document(path: Path, payload: dict[str, Any], description: str) -> None:

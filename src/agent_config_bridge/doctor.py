@@ -49,7 +49,8 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
             "catalog.valid",
             (
                 f"catalog contains {len(inventory.skills)} skills, {len(inventory.plugins)} plugins, "
-                f"and {len(inventory.hooks)} hook bundles"
+                f"{len(inventory.hooks)} hook bundles, {len(inventory.settings)} settings bundles, "
+                f"and {len(inventory.schedules)} schedules"
             ),
         )
     ]
@@ -143,6 +144,41 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
 
         if same_platform and Component.HOOKS in target.components:
             checks.extend(_hook_feature_checks(target.name, target.product, target.config_home))
+
+        if Component.SETTINGS in target.components:
+            filename = "config.toml" if target.product is Product.CODEX else "settings.json"
+            checks.append(
+                DoctorCheck(
+                    CheckLevel.INFO,
+                    "settings.owned-leaves",
+                    f"settings are merged as owned leaves into {target.config_home / filename}",
+                    target.name,
+                )
+            )
+
+        if Component.SCHEDULES in target.components:
+            checks.append(
+                DoctorCheck(
+                    CheckLevel.INFO,
+                    "schedules.host-managed",
+                    (
+                        "recurring runs use the host scheduler and product CLI; they do not appear in "
+                        "the product-native Desktop scheduler"
+                    ),
+                    target.name,
+                )
+            )
+            if same_platform:
+                scheduler = "crontab" if target.platform is Platform.LINUX else "schtasks.exe"
+                scheduler_path = shutil.which(scheduler)
+                checks.append(
+                    DoctorCheck(
+                        CheckLevel.OK if scheduler_path else CheckLevel.WARNING,
+                        "schedules.backend",
+                        f"host scheduler executable: {scheduler_path or f'{scheduler} not found on PATH'}",
+                        target.name,
+                    )
+                )
 
         if (
             target.product is Product.CLAUDE_CODE

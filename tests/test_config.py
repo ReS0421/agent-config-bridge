@@ -57,8 +57,9 @@ def test_load_config_builds_typed_immutable_model(tmp_path: Path) -> None:
     assert config.schema_version == 1
     assert config.catalog == (tmp_path / "catalog").resolve()
     assert config.state_dir == (tmp_path / "var/state").resolve()
+    assert config.config_path == config_path.resolve()
     assert config.link_mode is LinkMode.AUTO
-    assert config.components == frozenset(Component)
+    assert config.components == frozenset({Component.SKILLS, Component.PLUGINS, Component.HOOKS})
     assert isinstance(config.targets, tuple)
 
     target = config.targets[0]
@@ -70,6 +71,47 @@ def test_load_config_builds_typed_immutable_model(tmp_path: Path) -> None:
     assert target.components is config.components
     assert target.surfaces == frozenset(Surface)
     assert target.enabled is True
+
+
+def test_load_config_accepts_settings_and_schedules_components(tmp_path: Path) -> None:
+    """The v1 schema can opt into the two additive v0.2 component values."""
+
+    config_path = _write_config(tmp_path)
+    text = config_path.read_text(encoding="utf-8").replace(
+        'components = ["skills", "plugins", "hooks"]',
+        'components = ["settings", "schedules"]',
+    )
+    config_path.write_text(text, encoding="utf-8")
+
+    config = load_config(config_path)
+
+    assert config.components == frozenset({Component.SETTINGS, Component.SCHEDULES})
+    assert config.targets[0].components is config.components
+
+
+def test_load_config_resolves_optional_target_executable_from_user_home(tmp_path: Path) -> None:
+    """A relative Schedule CLI override becomes a stable absolute target path."""
+
+    config_path = _write_config(tmp_path, target_extra='executable = "bin/codex"')
+
+    target = load_config(config_path).targets[0]
+
+    assert target.executable == (target.user_home / "bin/codex").resolve()
+
+
+def test_load_config_requires_cli_surface_for_schedules(tmp_path: Path) -> None:
+    """Host-managed schedules always invoke the configured product CLI."""
+
+    config_path = _write_config(tmp_path)
+    text = (
+        config_path.read_text(encoding="utf-8")
+        .replace('components = ["skills", "plugins", "hooks"]', 'components = ["schedules"]')
+        .replace('surfaces = ["cli", "desktop"]', 'surfaces = ["desktop"]')
+    )
+    config_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="schedules.*cli surface"):
+        load_config(config_path)
 
 
 def test_load_config_expands_environment_and_user_paths(

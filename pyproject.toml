@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-config-bridge"
-version = "0.1.0"
-description = "Share one canonical skills, plugins, and hooks catalog across Codex and Claude Code surfaces."
+version = "0.2.0"
+description = "Share canonical skills, plugins, hooks, settings, and schedules across Codex and Claude Code."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "ReS0421" }]
-keywords = ["codex", "claude-code", "agent-skills", "plugins", "hooks"]
+keywords = ["codex", "claude-code", "agent-skills", "plugins", "hooks", "settings", "scheduling"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -21,7 +21,10 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+  "tomlkit>=0.13,<1",
+  "tzdata>=2025.2; platform_system == 'Windows'",
+]
 
 [project.optional-dependencies]
 dev = [
@@ -46,6 +49,9 @@ packages = ["src/agent_config_bridge"]
 addopts = "-ra --strict-markers"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+  "windows_scheduler_integration: mutates a uniquely named Windows Task Scheduler task and requires explicit opt-in",
+]
 
 [tool.coverage.run]
 branch = true

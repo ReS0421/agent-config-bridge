@@ -18,16 +18,30 @@ from agent_config_bridge.catalog import CatalogError, CatalogInventory, discover
 from agent_config_bridge.config import ConfigError, load_config
 from agent_config_bridge.doctor import CheckLevel, run_doctor
 from agent_config_bridge.filesystem import FilesystemError
-from agent_config_bridge.models import BridgeConfig, Platform, Product, TargetConfig
+from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key
 from agent_config_bridge.planner import CommandHint, SyncPlan, build_plan
 from agent_config_bridge.platforms import UnsupportedPlatformError, current_platform
 from agent_config_bridge.renderer import RenderError, render_marketplace
+from agent_config_bridge.schedule_runner import ScheduleRunnerError, run_due_schedules, run_named_schedule
+from agent_config_bridge.schedule_store import ScheduleStoreError
+from agent_config_bridge.scheduler_backends import ScheduleBackendError
+from agent_config_bridge.scheduler_registration import (
+    SchedulerRegistrationError,
+    SchedulerRegistrationPlan,
+    apply_scheduler_registrations,
+    build_scheduler_registration,
+    resolve_vendor_executable,
+    validate_vendor_executable,
+)
+from agent_config_bridge.schedules import ScheduleError, ScheduleExecutionError
+from agent_config_bridge.settings import SettingsError
 from agent_config_bridge.state import (
     BridgeStateError,
     desired_plugin_names,
     find_orphaned_target_states,
     read_registration_state,
+    read_scheduler_state,
     registration_marketplace_source,
     write_registered_plugins,
 )
@@ -45,6 +59,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "init":
             return _command_init(args)
+        if args.command == "schedule":
+            config = load_config(Path(args.config))
+            return _command_schedule(config, args)
         config, inventory = _load_context(Path(args.config))
         if args.command == "validate":
             return _command_validate(inventory, args.json)
@@ -67,6 +84,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         FilesystemError,
         RenderError,
         BridgeStateError,
+        ScheduleBackendError,
+        SchedulerRegistrationError,
+        ScheduleRunnerError,
+        ScheduleStoreError,
+        ScheduleError,
+        ScheduleExecutionError,
+        SettingsError,
         UnsupportedPlatformError,
         OSError,
         subprocess.CalledProcessError,
@@ -79,13 +103,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentbridge",
-        description="Share canonical skills, plugins, and hooks across Codex and Claude Code.",
+        description="Share canonical agent settings and automations across Codex and Claude Code.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="create a starter config and empty catalog")
     init_parser.add_argument("--config", default=_DEFAULT_CONFIG)
     init_parser.add_argument("--force", action="store_true", help="replace only the generated config file")
+
+    schedule_parser = subparsers.add_parser("schedule", help="run a rendered host-managed schedule")
+    schedule_subparsers = schedule_parser.add_subparsers(dest="schedule_command", required=True)
+    tick_parser = schedule_subparsers.add_parser("tick", help="run schedules due in the current minute")
+    tick_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+    tick_parser.add_argument("--target", required=True)
+    tick_parser.add_argument("--vendor-executable", required=True, type=Path, help=argparse.SUPPRESS)
+    run_parser = schedule_subparsers.add_parser("run", help="run one rendered schedule immediately")
+    run_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+    run_parser.add_argument("--target", required=True)
+    run_parser.add_argument("--name", required=True)
 
     for command, help_text in (
         ("validate", "validate config and catalog structure"),
@@ -117,13 +152,56 @@ def _load_context(config_path: Path) -> tuple[BridgeConfig, CatalogInventory]:
     return config, inventory
 
 
+def _command_schedule(config: BridgeConfig, args: argparse.Namespace) -> int:
+    targets = {target.name: target for target in config.targets if target.enabled}
+    target = targets.get(args.target)
+    if target is None:
+        raise ConfigError(f"unknown or disabled target: {args.target!r}")
+    host_platform = current_platform()
+    if target.platform is not host_platform:
+        raise ConfigError(
+            f"target {target.name!r} uses {target.platform.value}; "
+            f"run its schedule from that platform, not {host_platform.value}"
+        )
+    if Component.SCHEDULES not in target.components:
+        print(f"schedule target {target.name!r} is deselected; nothing to run")
+        return 0
+
+    if args.schedule_command == "tick":
+        vendor_executable = validate_vendor_executable(target, args.vendor_executable)
+        result = run_due_schedules(config, target, vendor_executable=vendor_executable)
+    elif args.schedule_command == "run":
+        result = run_named_schedule(
+            config,
+            target,
+            args.name,
+            vendor_executable=resolve_vendor_executable(target),
+        )
+    else:  # pragma: no cover - argparse restricts the nested command
+        raise ConfigError(f"unknown schedule command: {args.schedule_command}")
+
+    if result.skipped_reason:
+        print(f"schedule tick skipped for {target.name}: {result.skipped_reason}")
+        return 0
+    failed = False
+    for run in result.runs:
+        if run.skipped_reason:
+            print(f"schedule skipped: {target.name}/{run.name}: {run.skipped_reason}")
+        elif run.succeeded:
+            print(f"schedule completed: {target.name}/{run.name}")
+        else:
+            failed = True
+            print(f"schedule failed: {target.name}/{run.name}: {run.error}", file=sys.stderr)
+    return 1 if failed else 0
+
+
 def _command_init(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser().resolve()
     if config_path.exists() and not args.force:
         raise ConfigError(f"config already exists (use --force to replace it): {config_path}")
 
     catalog = config_path.parent / "catalog"
-    for group in ("skills", "plugins", "hooks"):
+    for group in ("skills", "plugins", "hooks", "settings", "schedules"):
         (catalog / group).mkdir(parents=True, exist_ok=True)
     template = """schema_version = 1
 
@@ -131,7 +209,7 @@ def _command_init(args: argparse.Namespace) -> int:
 catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks"]
+components = ["skills", "plugins", "hooks", "settings", "schedules"]
 
 [[targets]]
 name = "local-codex"
@@ -161,6 +239,8 @@ def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
         "skills": len(inventory.skills),
         "plugins": len(inventory.plugins),
         "hooks": len(inventory.hooks),
+        "settings": len(inventory.settings),
+        "schedules": len(inventory.schedules),
         "valid": True,
     }
     if as_json:
@@ -168,7 +248,8 @@ def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
     else:
         print(
             f"valid: {payload['skills']} skills, {payload['plugins']} plugins, "
-            f"{payload['hooks']} hook bundles in {payload['catalog']}"
+            f"{payload['hooks']} hook bundles, {payload['settings']} settings bundles, "
+            f"and {payload['schedules']} schedules in {payload['catalog']}"
         )
     return 0
 
@@ -235,6 +316,7 @@ def _command_apply(
         "applied": len(result.applied),
         "backups": [str(path) for path in result.backups],
         "marketplace": str(result.marketplace.root) if result.marketplace else None,
+        "schedule_snapshots": [str(rendered.published_file) for rendered in result.schedules],
         "registration_commands": [_command_payload(command) for command in plan.commands],
     }
     if as_json:
@@ -243,10 +325,12 @@ def _command_apply(
         print(f"applied {payload['applied']} actions")
         if result.marketplace:
             print(f"marketplace: {result.marketplace.root}")
+        for rendered in result.schedules:
+            print(f"schedule snapshot [{rendered.target}]: {rendered.published_file}")
         for backup in result.backups:
             print(f"backup: {backup}")
         if plan.commands:
-            print("plugin registration remains explicit; review and run:")
+            print("plugin and schedule registration remains explicit; review and run:")
             for command in plan.commands:
                 print(f"  [{command.target}] {_format_command(command)}")
     return 0
@@ -283,13 +367,36 @@ def _command_register(
             raise ConfigError(f"target {name!r} uses {target.platform.value}; run registration from that platform")
 
     commands = tuple(command for command in plan.commands if command.target in target_names)
-    if not commands:
-        print("no plugin registration commands are required")
+    scheduler_registrations = _build_scheduler_registrations(
+        config,
+        inventory,
+        tuple(known_targets[name] for name in sorted(target_names)),
+    )
+    if commands:
+        print("product commands to execute:")
+        for command in commands:
+            print(f"  [{command.target}] {_format_command(command)}")
+    if scheduler_registrations:
+        print("host scheduler reconciliation:")
+        for registration in scheduler_registrations:
+            print(
+                f"  [{registration.target.name}] {registration.plan.disposition.value.upper()} "
+                f"{registration.plan.backend.value}: {registration.plan.detail}"
+            )
+            print(f"    agentbridge: {registration.spec.agentbridge_executable}")
+            print(f"    product CLI: {registration.spec.vendor_executable}")
+            print(f"    config: {registration.spec.config_path}")
+    conflicts = tuple(registration for registration in scheduler_registrations if registration.has_conflict)
+    if conflicts:
+        raise ConfigError(
+            "resolve host scheduler conflicts before registering: "
+            + ", ".join(registration.target.name for registration in conflicts)
+        )
+    has_scheduler_changes = any(registration.has_changes for registration in scheduler_registrations)
+    if not commands and not has_scheduler_changes:
+        print("no plugin or host scheduler registration changes are required")
         return 0
-    print("commands to execute:")
-    for command in commands:
-        print(f"  [{command.target}] {_format_command(command)}")
-    if not _confirm("Execute these product CLI commands?", confirmed):
+    if not _confirm("Execute these product and host scheduler changes?", confirmed):
         print("cancelled", file=sys.stderr)
         return 2
 
@@ -297,7 +404,16 @@ def _command_register(
     fresh_plan = build_plan(config, fresh_inventory)
     if fresh_plan != plan:
         raise ConfigError("catalog, generated state, or destinations changed; review a fresh plan")
-    render_marketplace(config, fresh_inventory)
+    fresh_scheduler_registrations = _build_scheduler_registrations(
+        config,
+        fresh_inventory,
+        tuple(known_targets[name] for name in sorted(target_names)),
+        reviewed=scheduler_registrations,
+    )
+    if _scheduler_review_keys(fresh_scheduler_registrations) != _scheduler_review_keys(scheduler_registrations):
+        raise ConfigError("host scheduler state changed; review a fresh registration plan")
+    if commands:
+        render_marketplace(config, fresh_inventory)
 
     commands_by_target: dict[str, tuple[CommandHint, ...]] = {}
     for name in sorted(target_names):
@@ -317,7 +433,47 @@ def _command_register(
             command_environment.update(dict(command.environment))
             _run_registration_command(command, command_environment)
         write_registered_plugins(config, target, desired_plugin_names(target, fresh_inventory))
+    apply_scheduler_registrations(config, fresh_inventory, fresh_scheduler_registrations)
     return 0
+
+
+def _build_scheduler_registrations(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    targets: tuple[TargetConfig, ...],
+    *,
+    reviewed: tuple[SchedulerRegistrationPlan, ...] = (),
+) -> tuple[SchedulerRegistrationPlan, ...]:
+    reviewed_by_target = {item.target.name: item for item in reviewed}
+    registrations: list[SchedulerRegistrationPlan] = []
+    for target in targets:
+        state = read_scheduler_state(config, target)
+        if Component.SCHEDULES not in target.components and state is None:
+            continue
+        previous = reviewed_by_target.get(target.name)
+        registrations.append(
+            build_scheduler_registration(
+                config,
+                inventory,
+                target,
+                executable=previous.spec.agentbridge_executable if previous is not None else None,
+                vendor_executable=previous.spec.vendor_executable if previous is not None else None,
+            )
+        )
+    return tuple(registrations)
+
+
+def _scheduler_review_keys(registrations: tuple[SchedulerRegistrationPlan, ...]) -> tuple[object, ...]:
+    return tuple(
+        (
+            registration.target.name,
+            registration.spec,
+            registration.plan,
+            registration.desired,
+            registration.previous_state,
+        )
+        for registration in registrations
+    )
 
 
 def _preflight_registration_ownership(

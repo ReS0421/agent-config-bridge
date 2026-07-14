@@ -23,6 +23,8 @@ class Component(StrEnum):
     SKILLS = "skills"
     PLUGINS = "plugins"
     HOOKS = "hooks"
+    SETTINGS = "settings"
+    SCHEDULES = "schedules"
 
 
 class Product(StrEnum):
@@ -71,6 +73,7 @@ class TargetConfig:
     components: frozenset[Component]
     surfaces: frozenset[Surface]
     enabled: bool
+    executable: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,3 +86,4 @@ class BridgeConfig:
     link_mode: LinkMode
     components: frozenset[Component]
     targets: tuple[TargetConfig, ...]
+    config_path: Path | None = None

@@ -6,26 +6,32 @@ schema_version = 1
 catalog = "../catalog"
 state_dir = "../.agentbridge"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks"]
+components = ["skills", "plugins", "hooks", "settings", "schedules"]
 
-# This target inherits all three bridge-level components. The same user home is
+# This target inherits all five bridge-level components. The same user home is
 # used by Codex CLI and Desktop; Agent Config Bridge installs each artifact once.
 # Set config_home explicitly when a launcher injects a non-default CODEX_HOME.
+# Schedules require the cli surface: apply publishes their snapshot and register
+# installs one current-user host heartbeat for this target. Register discovers
+# codex on its PATH and pins the absolute path; uncomment an absolute host-native
+# override when discovery is ambiguous.
 [[targets]]
 name = "local-codex"
 product = "codex"
 platform = "auto"
 user_home = "~"
+# executable = "/absolute/path/to/codex"
 surfaces = ["cli", "desktop"]
 enabled = true
 
 # A target-level component list is an explicit override. This target shares
-# skills and hooks with Claude Code CLI and Desktop, but not plugins.
+# skills, hooks, and public settings with Claude Code CLI and Desktop, but not
+# plugins or schedules. Product-native Desktop tasks are not synchronized.
 [[targets]]
 name = "local-claude-code"
 product = "claude-code"
 platform = "auto"
 user_home = "~"
-components = ["skills", "hooks"]
+components = ["skills", "hooks", "settings"]
 surfaces = ["cli", "desktop"]
 enabled = true

@@ -18,12 +18,30 @@ from agent_config_bridge.renderer import (
     marketplace_is_current,
     marketplace_publish_path,
 )
+from agent_config_bridge.schedule_store import (
+    read_schedule_set,
+    schedule_publish_path,
+    schedule_set_digest,
+    schedule_set_is_current,
+)
+from agent_config_bridge.schedules import discover_schedules
+from agent_config_bridge.settings import (
+    OwnedSettingLeaf,
+    SettingDisposition,
+    SettingsPatchPlan,
+    build_settings_patch,
+    discover_settings_fragments,
+    plan_settings_patch,
+    settings_patch_digest,
+)
 from agent_config_bridge.state import (
     BridgeStateError,
+    SettingsState,
     SkillStateEntry,
     desired_plugin_names,
     find_orphaned_target_states,
     read_registration_state,
+    read_settings_state,
     read_skill_state,
     registration_marketplace_source,
 )
@@ -44,6 +62,7 @@ class Operation(StrEnum):
     LINK = "link"
     COPY = "copy"
     RENDER = "render"
+    PATCH = "patch"
     REMOVE = "remove"
 
 
@@ -120,6 +139,8 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
     host_platform = current_platform()
     previous_skills_by_target = {target.name: read_skill_state(config, target) for target in enabled_targets}
     _validate_skill_root_reservations(enabled_targets, previous_skills_by_target)
+    schedule_catalog = discover_schedules(config)
+    settings_fragments = discover_settings_fragments(inventory.root)
 
     for target_name in find_orphaned_target_states(config):
         warnings.append(
@@ -189,6 +210,77 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
                     )
                 )
 
+        settings_state = read_settings_state(config, target)
+        settings_destination = _settings_destination(target)
+        desired_settings = (
+            build_settings_patch(target.product, settings_fragments) if Component.SETTINGS in target.components else ()
+        )
+        previous_settings = _owned_settings(settings_state)
+        settings_plan = plan_settings_patch(
+            target.product,
+            settings_destination,
+            desired_settings,
+            previous_settings,
+        )
+        if settings_plan.changes:
+            actions.append(_settings_action(target, inventory, settings_plan))
+        if Component.SETTINGS in target.components:
+            for fragment in settings_fragments:
+                if fragment.product is target.product:
+                    reviews.append(
+                        f"{target.name}: settings fragment {fragment.path} manages "
+                        f"{len(fragment.leaves)} explicit leaf values in {settings_destination}"
+                    )
+
+        published_schedules = schedule_publish_path(config, target)
+        schedules_selected = Component.SCHEDULES in target.components and bool(schedule_catalog.schedules)
+        if schedules_selected:
+            schedule_digest = schedule_set_digest(schedule_catalog, target)
+            if not os.path.lexists(published_schedules):
+                schedule_disposition = Disposition.CREATE
+            else:
+                schedule_disposition = (
+                    Disposition.NOOP
+                    if schedule_set_is_current(config, schedule_catalog, target)
+                    else Disposition.UPDATE
+                )
+            actions.append(
+                Action(
+                    operation=Operation.RENDER,
+                    disposition=schedule_disposition,
+                    component=Component.SCHEDULES,
+                    target=target.name,
+                    name="host-schedules",
+                    source=inventory.root / "schedules",
+                    destination=published_schedules,
+                    detail="publish an immutable target-native schedule snapshot",
+                    source_id=f"schedules/{target.name}",
+                    source_digest=schedule_digest,
+                )
+            )
+        elif os.path.lexists(published_schedules):
+            current_schedules = read_schedule_set(config, target)
+            actions.append(
+                Action(
+                    operation=Operation.REMOVE,
+                    disposition=Disposition.REMOVE,
+                    component=Component.SCHEDULES,
+                    target=target.name,
+                    name="host-schedules",
+                    source=current_schedules.build_file if current_schedules is not None else inventory.root,
+                    destination=published_schedules,
+                    detail="remove the deselected published schedule pointer",
+                    source_id=f"schedules/{target.name}",
+                    source_digest=current_schedules.digest if current_schedules is not None else None,
+                )
+            )
+
+        if Component.SCHEDULES in target.components:
+            warnings.append(
+                f"{target.name}: schedules are host-managed CLI runs and do not appear in product-native "
+                "Desktop scheduler views; run register on the target host to reconcile the minute heartbeat"
+            )
+
         if Component.HOOKS in target.components:
             reviews.extend(_hook_reviews(target, inventory))
         if Component.PLUGINS in target.components:
@@ -227,6 +319,62 @@ def _skill_destination(target: TargetConfig) -> Path:
     if target.product is Product.CODEX:
         return target.user_home / ".agents" / "skills"
     return target.config_home / "skills"
+
+
+def _settings_destination(target: TargetConfig) -> Path:
+    filename = "config.toml" if target.product is Product.CODEX else "settings.json"
+    return target.config_home / filename
+
+
+def _owned_settings(state: SettingsState) -> tuple[OwnedSettingLeaf, ...]:
+    return tuple(
+        OwnedSettingLeaf(
+            source_id=entry.source_id,
+            path=entry.path,
+            digest=entry.value_digest,
+            created_parents=tuple(
+                parent
+                for parent in state.created_containers
+                if len(parent) < len(entry.path) and entry.path[: len(parent)] == parent
+            ),
+        )
+        for entry in state.entries
+    )
+
+
+def _settings_action(
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    plan: SettingsPatchPlan,
+) -> Action:
+    counts = {
+        disposition: sum(change.disposition is disposition for change in plan.changes)
+        for disposition in SettingDisposition
+    }
+    if plan.has_conflicts:
+        disposition = Disposition.CONFLICT
+    elif not plan.has_changes:
+        disposition = Disposition.NOOP
+    elif counts[SettingDisposition.REMOVE] and not plan.desired:
+        disposition = Disposition.REMOVE
+    elif plan.destination_existed:
+        disposition = Disposition.UPDATE
+    else:
+        disposition = Disposition.CREATE
+
+    details = ", ".join(f"{kind.value}={counts[kind]}" for kind in SettingDisposition if counts[kind])
+    return Action(
+        operation=Operation.PATCH,
+        disposition=disposition,
+        component=Component.SETTINGS,
+        target=target.name,
+        name="product-settings",
+        source=inventory.root / "settings",
+        destination=plan.destination,
+        detail=f"merge owned setting leaves ({details})",
+        source_id=f"settings/{target.name}",
+        source_digest=settings_patch_digest(plan.desired),
+    )
 
 
 def _validate_skill_root_reservations(

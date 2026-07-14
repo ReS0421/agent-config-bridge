@@ -7,11 +7,13 @@ decision.
 
 ## Index
 
-| ADR                                              | Decision                         | Status   | Date       |
-| ------------------------------------------------ | -------------------------------- | -------- | ---------- |
-| [0001](0001-render-target-specific-artifacts.md) | Render target-specific artifacts | Accepted | 2026-07-14 |
-| [0002](0002-never-share-runtime-state.md)        | Never share runtime state        | Accepted | 2026-07-14 |
-| [0003](0003-use-dual-marketplace-packages.md)    | Use dual marketplace packages    | Accepted | 2026-07-14 |
+| ADR                                                          | Decision                                  | Status   | Date       |
+| ------------------------------------------------------------ | ----------------------------------------- | -------- | ---------- |
+| [0001](0001-render-target-specific-artifacts.md)             | Render target-specific artifacts          | Accepted | 2026-07-14 |
+| [0002](0002-never-share-runtime-state.md)                    | Never share runtime state                 | Accepted | 2026-07-14 |
+| [0003](0003-use-dual-marketplace-packages.md)                | Use dual marketplace packages             | Accepted | 2026-07-14 |
+| [0004](0004-manage-declarative-settings-by-owned-leaf.md)    | Manage declarative settings by owned leaf | Accepted | 2026-07-14 |
+| [0005](0005-use-host-scheduler-adapters.md)                  | Use host scheduler adapters               | Accepted | 2026-07-14 |
 
 ## Statuses
 

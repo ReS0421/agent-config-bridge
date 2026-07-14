@@ -51,6 +51,12 @@ jobs:
       - name: Test
         run: uv run pytest --cov=agent_config_bridge --cov-report=term-missing
 
+      - name: Exercise Windows Task Scheduler round trip
+        if: matrix.os == 'windows-latest' && matrix.python-version == '3.12'
+        env:
+          AGENTBRIDGE_RUN_WINDOWS_SCHEDULER_INTEGRATION: "1"
+        run: uv run pytest -q tests/test_windows_task_scheduler_integration.py
+
       - name: Build distribution
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
         run: uv build
