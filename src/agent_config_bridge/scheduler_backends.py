@@ -469,7 +469,10 @@ class WindowsTaskSchedulerBackend:
         self._create_task(xml, force=inspection.plan.disposition is ScheduleDisposition.UPDATE, spec=spec)
         converged = self.plan(spec)
         if converged.disposition is not ScheduleDisposition.NOOP:
-            raise ScheduleBackendError("Windows heartbeat task update did not converge to the reviewed specification")
+            raise ScheduleBackendError(
+                "Windows heartbeat task update did not converge to the reviewed specification "
+                f"({converged.disposition.value}: {converged.detail})"
+            )
         return True
 
     def remove(self, spec: HeartbeatSpec, reviewed_plan: SchedulePlan) -> bool:

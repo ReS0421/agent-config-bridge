@@ -12,6 +12,7 @@ import pytest
 
 from agent_config_bridge.scheduler_backends import (
     HeartbeatSpec,
+    ScheduleBackendError,
     ScheduleDisposition,
     WindowsTaskSchedulerBackend,
 )
@@ -41,7 +42,18 @@ def test_windows_task_scheduler_import_export_round_trip(tmp_path: Path) -> None
     try:
         create = backend.plan(spec)
         assert create.disposition is ScheduleDisposition.CREATE
-        assert backend.apply(spec, create)
+        try:
+            assert backend.apply(spec, create)
+        except ScheduleBackendError as exc:
+            exported = subprocess.run(
+                (backend.schtasks_executable, "/Query", "/TN", task_name, "/XML"),
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            pytest.fail(
+                f"{exc}\nTask Scheduler export (exit {exported.returncode}):\n{exported.stdout}\n{exported.stderr}"
+            )
         assert backend.plan(spec).disposition is ScheduleDisposition.NOOP
 
         removal = backend.plan_remove(spec)
