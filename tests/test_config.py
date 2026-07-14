@@ -547,8 +547,8 @@ enabled = true
         load_config(config_path)
 
 
-def test_load_config_rejects_nested_skill_roots_when_skills_unselected(tmp_path: Path) -> None:
-    """All vendor discovery roots remain disjoint regardless of selection."""
+def test_load_config_allows_passive_codex_targets_to_share_skill_root(tmp_path: Path) -> None:
+    """Separate Codex installations may consume one root when neither writes it."""
 
     config_path = _write_config(tmp_path)
     text = config_path.read_text(encoding="utf-8").replace(
@@ -561,18 +561,69 @@ def test_load_config_rejects_nested_skill_roots_when_skills_unselected(tmp_path:
             f"""
 
 [[targets]]
-name = "nested-claude"
-product = "claude-code"
+name = "orca-codex"
+product = "codex"
 platform = "linux"
 user_home = {str(tmp_path / "home")!r}
-config_home = ".agents/skills/claude-runtime"
+config_home = ".orca/codex-runtime"
 components = ["plugins"]
 surfaces = ["cli"]
 enabled = true
 """
         )
 
-    with pytest.raises(ConfigError, match="overlapping Skill roots"):
+    config = load_config(config_path)
+
+    assert [target.name for target in config.targets] == ["local-codex", "orca-codex"]
+
+
+def test_load_config_allows_one_writer_with_passive_shared_skill_consumer(tmp_path: Path) -> None:
+    """A non-writing Codex installation may observe the active writer's root."""
+
+    config_path = _write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            f"""
+
+[[targets]]
+name = "orca-codex"
+product = "codex"
+platform = "linux"
+user_home = {str(tmp_path / "home")!r}
+config_home = ".orca/codex-runtime"
+components = ["plugins"]
+surfaces = ["cli"]
+enabled = true
+"""
+        )
+
+    config = load_config(config_path)
+
+    assert Component.SKILLS in config.targets[0].components
+    assert Component.SKILLS not in config.targets[1].components
+
+
+def test_load_config_rejects_two_writers_for_shared_skill_root(tmp_path: Path) -> None:
+    """Two Codex installations cannot both write their shared discovery root."""
+
+    config_path = _write_config(tmp_path)
+    with config_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            f"""
+
+[[targets]]
+name = "orca-codex"
+product = "codex"
+platform = "linux"
+user_home = {str(tmp_path / "home")!r}
+config_home = ".orca/codex-runtime"
+components = ["skills"]
+surfaces = ["cli"]
+enabled = true
+"""
+        )
+
+    with pytest.raises(ConfigError, match="both select skills.*same skill destination"):
         load_config(config_path)
 
 

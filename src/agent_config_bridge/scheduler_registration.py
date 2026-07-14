@@ -118,7 +118,7 @@ def validate_vendor_executable(target: TargetConfig, executable: Path) -> Path:
         raise SchedulerRegistrationError(f"resolved {command} command is not executable: {stable_path}")
     if target.platform is Platform.WINDOWS and stable_path.suffix.casefold() not in {".exe", ".com"}:
         raise SchedulerRegistrationError(
-            f"scheduled Windows targets require a native .exe or .com {command} launcher, found: {stable_path}"
+            f"Windows targets require a native .exe or .com {command} launcher, found: {stable_path}"
         )
     return stable_path
 

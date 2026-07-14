@@ -82,19 +82,21 @@ surfaces = ["cli", "desktop"]
 enabled = true
 ```
 
-`executable` is an optional per-target override for Scheduled Codex or Claude
-Code runs. Use an absolute host-native path for the clearest cross-host config.
+`executable` is an optional per-target override for Plugin/Hook registration,
+its marketplace preflight, and Scheduled Codex or Claude Code runs. Use an
+absolute host-native path for the clearest cross-host config.
 The loader also accepts a relative spelling beneath `user_home`, but normalizes
 it to an absolute path before use. Registration requires a real file, executable
 permission on Linux, and a native `.exe` or `.com` launcher on Windows.
 
-When `executable` is omitted, `register` searches the registering process
-`PATH`, but accepts only absolute entries and skips the current directory and
-all relative entries. It applies the same launcher validation. The resulting
-absolute path is embedded in the heartbeat and its ownership digest, and all
-resolved heartbeat paths are printed before confirmation. Scheduled runs
-therefore do not rely on cron or Task Scheduler finding the vendor CLI. The
-override affects Schedules only, not Plugin/Hook registration commands.
+For the heartbeat, an omitted `executable` makes `register` search the
+registering process `PATH`, accepting only absolute entries and skipping the
+current directory and all relative entries. It applies the same launcher
+validation. The resulting absolute path is embedded in the heartbeat and its
+ownership digest, so Scheduled runs do not rely on cron or Task Scheduler PATH
+lookup. Plugin/Hook registration uses the same validated override. Without one,
+those interactive commands preserve the normal bare product command and PATH
+lookup.
 
 Use a host-specific config file with native paths. The heartbeat records the
 absolute config path, so a native Windows target must be registered from
@@ -193,7 +195,8 @@ codex exec --ephemeral -C <working-directory> -
 claude --print --no-session-persistence
 ```
 
-The target's `CODEX_HOME` or `CLAUDE_CONFIG_DIR` is set locally. No
+The target's `CODEX_HOME` is set locally. Claude sets `CLAUDE_CONFIG_DIR` for a
+custom home and removes an inherited value for its default profile. No
 permission-bypass option is added. Each run starts a fresh CLI process and does
 not inherit a Desktop thread, Claude CLI session, or previous Schedule context.
 

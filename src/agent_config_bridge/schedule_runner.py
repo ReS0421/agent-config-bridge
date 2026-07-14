@@ -14,8 +14,9 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO
 
-from agent_config_bridge.models import BridgeConfig, Product, TargetConfig
+from agent_config_bridge.models import BridgeConfig, TargetConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point
+from agent_config_bridge.platforms import scope_product_home_environment
 from agent_config_bridge.schedule_store import read_schedule_set
 from agent_config_bridge.schedules import (
     ScheduleError,
@@ -144,10 +145,7 @@ def _execute_snapshots(
     execute: ExecutionFunction,
 ) -> tuple[ScheduleRun, ...]:
     local_environment = dict(os.environ if environment is None else environment)
-    if target.product is Product.CODEX:
-        local_environment["CODEX_HOME"] = str(target.config_home)
-    else:
-        local_environment["CLAUDE_CONFIG_DIR"] = str(target.config_home)
+    scope_product_home_environment(local_environment, target)
 
     runs: list[ScheduleRun] = []
     for snapshot in snapshots:

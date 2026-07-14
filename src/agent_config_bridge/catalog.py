@@ -160,11 +160,25 @@ def _validate_skill(path: Path) -> None:
     except StopIteration as exc:
         raise CatalogError(f"Skill manifest has no closing YAML frontmatter delimiter: {skill}") from exc
     frontmatter: dict[str, str] = {}
+    current_key: str | None = None
+    continuations: dict[str, list[str]] = {}
     for line in lines[1:closing_index]:
-        if line[:1].isspace() or ":" not in line:
+        if line[:1].isspace():
+            if current_key in {"name", "description"} and line.strip():
+                continuations.setdefault(current_key, []).append(line.strip())
+            continue
+        if ":" not in line:
+            current_key = None
             continue
         key, value = line.split(":", maxsplit=1)
-        frontmatter[key.strip()] = value.strip()
+        current_key = key.strip()
+        frontmatter[current_key] = value.strip()
+    for key, parts in continuations.items():
+        prefix = frontmatter.get(key, "")
+        if prefix in {"", ">", ">-", ">+", "|", "|-", "|+"}:
+            frontmatter[key] = " ".join(parts)
+        elif parts:
+            frontmatter[key] = " ".join((prefix, *parts))
     raw_name = frontmatter.get("name", "")
     name = raw_name[1:-1] if len(raw_name) >= 2 and raw_name[0] == raw_name[-1] and raw_name[0] in "\"'" else raw_name
     if name != path.name:

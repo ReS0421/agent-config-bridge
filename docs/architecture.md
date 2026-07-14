@@ -31,9 +31,10 @@ The bridge is designed to:
 It does not synchronize login state, conversations, history, caches, approval
 databases, arbitrary or managed-policy settings, private Desktop scheduler
 state, or cloud-side installations. It does not translate settings or Hook
-semantics, probe installed product versions/capabilities, invoke vendor
-validators for arbitrary catalog content, or assert that a Plugin is fully
-active after the product CLI returns.
+semantics, infer installed product capabilities, invoke vendor validators for
+arbitrary catalog content, or assert that a Plugin is fully active after the
+product CLI returns. `doctor` reports the selected launcher's informational
+`--version` output without turning it into a capability decision.
 
 ## System context
 
@@ -114,11 +115,14 @@ accessible using the path syntax of the process running the bridge. In practice,
 host-specific TOML files can point to the same canonical catalog: use a native
 Windows path when running on Windows and a Linux or `/mnt/...` path when running
 under WSL. Registration still runs on the target platform. Two enabled targets
-cannot use equal or nested `config_home` paths, even across products, or equal
-or nested Skill discovery roots. Discovery roots are checked for every enabled
-target even when `skills` is not selected, because the products still discover
-content there. An enabled target's `config_home` also cannot overlap another
-target's discovery root; Codex cannot overlap its own root. Claude Code's
+cannot use equal or nested `config_home` paths, even across products. Equal or
+nested physical Skill discovery roots are allowed only under a single-writer
+rule: at most one target may select `skills`, while all other targets sharing
+that root are passive consumers with `skills` excluded. Planning also counts a
+non-empty previous Skill ownership record as a writer claim until cleanup has
+completed, which keeps two-step target handoffs fail-closed. An enabled target's
+`config_home` also cannot overlap another target's discovery root; Codex cannot
+overlap its own root. Claude Code's
 intentional same-target `<config_home>/skills` relationship is the sole
 exception. Target `surfaces` currently drives compatibility diagnostics; it
 does not cause a separate surface-specific render. A target selecting
@@ -138,16 +142,17 @@ models a custom `CLAUDE_CONFIG_DIR`. Selected Settings target
 Claude Code. Schedule working directories are portable relative paths resolved
 beneath each target's `user_home` during rendering.
 
-The optional target `executable` controls only Scheduled product CLI runs. The
+The optional target `executable` controls Plugin/Hook registration, its
+marketplace ownership preflight, and Scheduled product CLI runs. The
 loader normalizes it to an absolute path, using `user_home` as the base for a
 relative spelling. At registration the path must resolve to a real executable
 file (and to a native `.exe` or `.com` launcher for Windows). When it is omitted,
-the registering process searches only absolute `PATH` entries for `codex` or
-`claude`, excluding the current directory and relative entries. Either way, the
-validated absolute vendor path becomes part of the reviewed heartbeat command
-and ownership digest, so the host scheduler never has to rediscover it. Windows
-Task Scheduler operations use the absolute System32 path returned by WinAPI,
-not an environment-derived or bare `schtasks.exe` command.
+Plugin/Hook commands retain the product's bare PATH command. Schedule
+registration uses the stricter absolute, non-CWD PATH search. Its validated
+absolute vendor path becomes part of the reviewed heartbeat command and
+ownership digest, so the host scheduler never has to rediscover it. Windows Task
+Scheduler operations use the absolute System32 path returned by WinAPI, not an
+environment-derived or bare `schtasks.exe` command.
 
 ## Canonical catalog
 
@@ -345,14 +350,23 @@ and bridge ownership records. It reports:
 
 Text command previews use POSIX environment assignment/quoting for Linux targets
 and PowerShell `$env:` assignment plus single-quoted arguments for Windows
-targets. JSON plans expose the argv and environment separately. When the running
-host and target platforms differ, planning omits registration commands and emits
-a warning to rerun from the target platform with native paths.
+targets. A default Claude profile is represented as `env -u
+CLAUDE_CONFIG_DIR` on POSIX and `Remove-Item Env:CLAUDE_CONFIG_DIR` in
+PowerShell. JSON plans expose argv, environment assignments, and
+`environment_unsets` separately. When the running host and target platforms
+differ, planning omits registration commands and emits a warning to rerun from
+the target platform with native paths.
 
 Planning does not probe product versions or feature capabilities, run vendor
 schema validators, resolve executable arguments, or validate an installed cache.
 Review items are an inspection aid, not a safety certification, and may include
 literal command or URL values from the catalog.
+
+`doctor` separately validates the exact explicit or PATH-selected product
+launcher and invokes it once with `--version`. A missing or invalid configured
+launcher is an error; ambient PATH discovery and version-probe failures are
+warnings unless an explicit launcher caused them. This reports identity and
+version only; it does not certify Plugin, Hook, Settings, or Schedule support.
 
 ## Apply and filesystem reconciliation
 
@@ -398,9 +412,11 @@ manual recovery.
 `register` is deliberately separate from `apply`. It requires confirmation,
 refuses targets whose platform differs from the current host, rechecks the plan
 and scheduler inspection, publishes the marketplace, and executes product
-commands sequentially with the target's `CODEX_HOME` or
-`CLAUDE_CONFIG_DIR` environment. It then reconciles any selected or previously
-owned scheduler heartbeat.
+commands sequentially with the target's product-home environment. Codex always
+receives `CODEX_HOME`; Claude removes an inherited `CLAUDE_CONFIG_DIR` for the
+default profile and sets it only for a custom `config_home`, because default
+profile metadata lives beside `<user_home>/.claude`. It then reconciles any selected or previously owned
+scheduler heartbeat.
 
 The desired installation set is the selected canonical Plugins plus the
 generated Hook Plugin when Hooks are selected. Registration:
@@ -493,8 +509,9 @@ merely sharing a `user_home` ancestor is allowed. See
   explicit reconciliation.
 - Symlink mode is live; canonical Skill edits are visible immediately without
   another `apply`.
-- No automatic product capability/version probing, arbitrary vendor artifact
-  validation, or full installed-state validation.
+- No automatic product capability inference, arbitrary vendor artifact
+  validation, or full installed-state validation. Doctor's selected-CLI
+  `--version` probe is informational.
 - Product CLIs own trust, permissions, plugin caches, and refresh behavior.
 - Manual product commands do not update bridge ownership records.
 - Settings are schema-preserving native fragments, not a cross-product

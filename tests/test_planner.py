@@ -55,6 +55,47 @@ def test_plan_honors_custom_claude_config_home_for_skills(tmp_path: Path) -> Non
     assert plan.actions[0].destination == tmp_path / "custom-claude/skills/hello"
 
 
+def test_plan_uses_claude_default_profile_without_config_dir_override(tmp_path: Path) -> None:
+    """Default Claude registration must not select the nested ``.claude/.claude.json`` profile."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared-plugin",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        product=Product.CLAUDE_CODE,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+
+    plan = build_plan(config, discover_catalog(config))
+
+    assert plan.commands
+    assert all(command.environment == () for command in plan.commands)
+    assert all(command.environment_unsets == ("CLAUDE_CONFIG_DIR",) for command in plan.commands)
+
+
+def test_plan_sets_claude_config_dir_for_custom_home(tmp_path: Path) -> None:
+    """A non-default Claude home remains explicitly scoped for every product command."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared-plugin",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        product=Product.CLAUDE_CODE,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+    custom_home = tmp_path / "custom-claude"
+    target = replace(config.targets[0], config_home=custom_home)
+    config = replace(config, targets=(target,))
+
+    plan = build_plan(config, discover_catalog(config))
+
+    assert plan.commands
+    assert all(dict(command.environment) == {"CLAUDE_CONFIG_DIR": str(custom_home)} for command in plan.commands)
+    assert all(command.environment_unsets == () for command in plan.commands)
+
+
 def test_plan_treats_unmanaged_destination_as_conflict(tmp_path: Path) -> None:
     """Existing user content is never adopted or overwritten implicitly."""
 
@@ -144,6 +185,26 @@ def test_plan_includes_render_and_registration_hints(tmp_path: Path) -> None:
     assert [hint.argv[0:3] for hint in plan.commands[:1]] == [("codex", "plugin", "marketplace")]
     assert any("shared-plugin@agent-config-bridge" in hint.argv for hint in plan.commands)
     assert any("agent-config-bridge-hooks@agent-config-bridge" in hint.argv for hint in plan.commands)
+
+
+def test_plan_uses_explicit_product_executable_for_every_plugin_command(tmp_path: Path) -> None:
+    """The reviewed plugin plan carries the same target CLI into registration and preflight."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared-plugin",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+    executable = tmp_path / "tools/codex-custom"
+    target = replace(config.targets[0], executable=executable)
+    config = replace(config, targets=(target,))
+
+    plan = build_plan(config, discover_catalog(config))
+
+    assert plan.commands
+    assert {command.argv[0] for command in plan.commands} == {str(executable)}
 
 
 def test_plan_removes_plugins_deselected_after_bridge_registration(tmp_path: Path) -> None:
@@ -246,6 +307,84 @@ def test_plan_warns_about_disabled_target_ownership_state(tmp_path: Path) -> Non
     plan = build_plan(replace(config, targets=(disabled,)), inventory)
 
     assert any("ownership state has no enabled target" in warning for warning in plan.warnings)
+
+
+def test_plan_allows_passive_codex_installation_to_share_writer_root(tmp_path: Path) -> None:
+    """Only the selected writer projects Skills into a shared Codex discovery root."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, target_name="writer")
+    writer = config.targets[0]
+    passive = replace(
+        writer,
+        name="orca-runtime",
+        config_home=writer.user_home / ".orca/codex-runtime",
+        components=frozenset({Component.PLUGINS}),
+    )
+
+    plan = build_plan(replace(config, targets=(writer, passive)), discover_catalog(config))
+
+    skill_actions = [action for action in plan.actions if action.component is Component.SKILLS]
+    assert [action.target for action in skill_actions] == ["writer"]
+
+
+def test_plan_allows_retained_skill_owner_with_passive_shared_consumer(tmp_path: Path) -> None:
+    """Cleanup may mutate a retained root while another installation only consumes it."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, target_name="owner")
+    inventory = discover_catalog(config)
+    owner = config.targets[0]
+    write_skill_state(config, owner, inventory)
+    cleanup_owner = replace(owner, components=frozenset())
+    passive = replace(
+        owner,
+        name="orca-runtime",
+        config_home=owner.user_home / ".orca/codex-runtime",
+        components=frozenset({Component.PLUGINS}),
+    )
+
+    plan = build_plan(replace(config, targets=(cleanup_owner, passive)), inventory)
+
+    skill_actions = [action for action in plan.actions if action.component is Component.SKILLS]
+    assert len(skill_actions) == 1
+    assert skill_actions[0].target == "owner"
+    assert skill_actions[0].operation is Operation.REMOVE
+
+
+def test_plan_rejects_two_current_writers_for_shared_skill_root(tmp_path: Path) -> None:
+    """Typed configurations cannot bypass the loader's single-writer rule."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, target_name="first")
+    first = config.targets[0]
+    second = replace(
+        first,
+        name="second",
+        config_home=first.user_home / ".orca/codex-runtime",
+    )
+
+    with pytest.raises(BridgeStateError, match="overlapping physical Skill discovery roots"):
+        build_plan(replace(config, targets=(first, second)), discover_catalog(config))
+
+
+def test_plan_rejects_skill_handoff_until_previous_owner_is_reconciled(tmp_path: Path) -> None:
+    """A retained claim and a new writer cannot overlap during a handoff."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, target_name="old")
+    inventory = discover_catalog(config)
+    old = config.targets[0]
+    write_skill_state(config, old, inventory)
+    cleanup_old = replace(old, components=frozenset())
+    new = replace(
+        old,
+        name="new",
+        config_home=old.user_home / ".orca/codex-runtime",
+    )
+
+    with pytest.raises(BridgeStateError, match="remains reserved by target 'old'"):
+        build_plan(replace(config, targets=(cleanup_old, new)), inventory)
 
 
 def test_plan_reserves_skill_root_through_physical_directory_alias(tmp_path: Path) -> None:

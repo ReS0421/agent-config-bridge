@@ -293,10 +293,10 @@ def _validate_target_destinations(targets: tuple[TargetConfig, ...]) -> None:
                 previous_target.platform,
                 left_context=f"target {target.name!r} Skill root",
                 right_context=f"target {previous_target.name!r} Skill root",
-            ):
+            ) and (Component.SKILLS in target.components and Component.SKILLS in previous_target.components):
                 raise ConfigError(
                     f"targets {previous_target.name!r} and {target.name!r} "
-                    f"manage the same skill destination or overlapping Skill roots: "
+                    f"both select skills for the same skill destination or overlapping Skill roots: "
                     f"{previous_root} <-> {skill_root}"
                 )
         skill_destinations.append((target, skill_root))

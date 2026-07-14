@@ -12,7 +12,11 @@ from agent_config_bridge.catalog import Artifact, CatalogInventory
 from agent_config_bridge.filesystem import read_managed_marker, tree_digest
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key, paths_overlap, read_symlink_target
-from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.platforms import (
+    current_platform,
+    product_home_environment,
+    product_home_environment_unsets,
+)
 from agent_config_bridge.renderer import (
     marketplace_build_path,
     marketplace_is_current,
@@ -102,6 +106,7 @@ class CommandHint:
     environment: tuple[tuple[str, str], ...]
     argv: tuple[str, ...]
     reason: str
+    environment_unsets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,9 +391,10 @@ def _validate_skill_root_reservations(
     A target with recorded Skill ownership keeps its physical destination
     reserved while ``components=[]`` is used to reconcile that state. This
     prevents a new target from observing the old files as a no-op immediately
-    before the old target removes them. All enabled discovery roots remain
-    isolated even without a current Skill selection because products still
-    discover content at those paths.
+    before the old target removes them. A target that neither selects Skills
+    nor has prior Skill ownership is a passive consumer and may share another
+    target's discovery root. At most one target may hold a current or retained
+    write claim for an overlapping set of roots.
     """
 
     reservations: list[tuple[TargetConfig, Path, tuple[SkillStateEntry, ...]]] = []
@@ -402,6 +408,11 @@ def _validate_skill_root_reservations(
                 reserved_destination,
                 reserved_target,
             ):
+                continue
+
+            reserved_claims_root = Component.SKILLS in reserved_target.components or bool(reserved_skills)
+            target_claims_root = Component.SKILLS in target.components or bool(previous_skills)
+            if not (reserved_claims_root and target_claims_root):
                 continue
 
             if reserved_skills or previous_skills:
@@ -909,20 +920,28 @@ def _registration_hints(
         if not selected_names and not removed_names:
             continue
 
+        executable = (
+            str(target.executable)
+            if target.executable is not None
+            else ("codex" if target.product is Product.CODEX else "claude")
+        )
+        environment = product_home_environment(target)
+        environment_unsets = product_home_environment_unsets(target)
+
         if target.product is Product.CODEX:
-            environment = (("CODEX_HOME", str(target.config_home)),)
             for name in removed_names:
                 hints.append(
                     CommandHint(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("codex", "plugin", "remove", f"{name}@agent-config-bridge"),
+                        argv=(executable, "plugin", "remove", f"{name}@agent-config-bridge"),
                         reason=(
                             f"remove bridge-managed Codex plugin {name} before marketplace relocation"
                             if source_changed
                             else f"remove deselected bridge-managed Codex plugin {name}"
                         ),
+                        environment_unsets=environment_unsets,
                     )
                 )
             if source_changed:
@@ -931,8 +950,9 @@ def _registration_hints(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("codex", "plugin", "marketplace", "remove", "agent-config-bridge"),
+                        argv=(executable, "plugin", "marketplace", "remove", "agent-config-bridge"),
                         reason="remove the relocated Codex marketplace before registering its new source",
+                        environment_unsets=environment_unsets,
                     )
                 )
             if selected_names:
@@ -941,8 +961,9 @@ def _registration_hints(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("codex", "plugin", "marketplace", "add", str(build_root)),
+                        argv=(executable, "plugin", "marketplace", "add", str(build_root)),
                         reason="register or refresh the stable Codex marketplace",
+                        environment_unsets=environment_unsets,
                     )
                 )
             for name in selected_names:
@@ -951,8 +972,9 @@ def _registration_hints(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("codex", "plugin", "add", f"{name}@agent-config-bridge"),
+                        argv=(executable, "plugin", "add", f"{name}@agent-config-bridge"),
                         reason=f"install or refresh rendered Codex plugin {name}",
+                        environment_unsets=environment_unsets,
                     )
                 )
             if previous_names and not selected_names and not source_changed:
@@ -961,12 +983,12 @@ def _registration_hints(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("codex", "plugin", "marketplace", "remove", "agent-config-bridge"),
+                        argv=(executable, "plugin", "marketplace", "remove", "agent-config-bridge"),
                         reason="remove the unused Codex marketplace",
+                        environment_unsets=environment_unsets,
                     )
                 )
         else:
-            environment = (("CLAUDE_CONFIG_DIR", str(target.config_home)),)
             for name in removed_names:
                 hints.append(
                     CommandHint(
@@ -974,7 +996,7 @@ def _registration_hints(
                         platform=target.platform,
                         environment=environment,
                         argv=(
-                            "claude",
+                            executable,
                             "plugin",
                             "uninstall",
                             f"{name}@agent-config-bridge",
@@ -987,6 +1009,7 @@ def _registration_hints(
                             if source_changed
                             else f"remove deselected bridge-managed Claude Code plugin {name}"
                         ),
+                        environment_unsets=environment_unsets,
                     )
                 )
             if source_changed:
@@ -995,8 +1018,9 @@ def _registration_hints(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("claude", "plugin", "marketplace", "remove", "agent-config-bridge"),
+                        argv=(executable, "plugin", "marketplace", "remove", "agent-config-bridge"),
                         reason="remove the relocated Claude Code marketplace before registering its new source",
+                        environment_unsets=environment_unsets,
                     )
                 )
             if selected_names:
@@ -1006,15 +1030,17 @@ def _registration_hints(
                             target=target.name,
                             platform=target.platform,
                             environment=environment,
-                            argv=("claude", "plugin", "marketplace", "add", str(build_root)),
+                            argv=(executable, "plugin", "marketplace", "add", str(build_root)),
                             reason="register the stable Claude Code marketplace",
+                            environment_unsets=environment_unsets,
                         ),
                         CommandHint(
                             target=target.name,
                             platform=target.platform,
                             environment=environment,
-                            argv=("claude", "plugin", "marketplace", "update", "agent-config-bridge"),
+                            argv=(executable, "plugin", "marketplace", "update", "agent-config-bridge"),
                             reason="refresh the Claude Code marketplace cache",
+                            environment_unsets=environment_unsets,
                         ),
                     )
                 )
@@ -1026,7 +1052,7 @@ def _registration_hints(
                             platform=target.platform,
                             environment=environment,
                             argv=(
-                                "claude",
+                                executable,
                                 "plugin",
                                 "install",
                                 f"{name}@agent-config-bridge",
@@ -1034,13 +1060,14 @@ def _registration_hints(
                                 "user",
                             ),
                             reason=f"install rendered Claude Code plugin {name} when absent",
+                            environment_unsets=environment_unsets,
                         ),
                         CommandHint(
                             target=target.name,
                             platform=target.platform,
                             environment=environment,
                             argv=(
-                                "claude",
+                                executable,
                                 "plugin",
                                 "update",
                                 f"{name}@agent-config-bridge",
@@ -1048,6 +1075,7 @@ def _registration_hints(
                                 "user",
                             ),
                             reason=f"refresh rendered Claude Code plugin {name}",
+                            environment_unsets=environment_unsets,
                         ),
                     )
                 )
@@ -1057,8 +1085,9 @@ def _registration_hints(
                         target=target.name,
                         platform=target.platform,
                         environment=environment,
-                        argv=("claude", "plugin", "marketplace", "remove", "agent-config-bridge"),
+                        argv=(executable, "plugin", "marketplace", "remove", "agent-config-bridge"),
                         reason="remove the unused Claude Code marketplace",
+                        environment_unsets=environment_unsets,
                     )
                 )
     return tuple(hints)

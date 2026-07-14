@@ -14,7 +14,7 @@ components = ["skills", "plugins", "hooks", "settings", "schedules"]
 # Schedules require the cli surface: apply publishes their snapshot and register
 # installs one current-user host heartbeat for this target. Register discovers
 # codex on its PATH and pins the absolute path; uncomment an absolute host-native
-# override when discovery is ambiguous.
+# override when Plugin registration or Schedule discovery is ambiguous.
 [[targets]]
 name = "local-codex"
 product = "codex"

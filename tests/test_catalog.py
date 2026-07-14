@@ -62,6 +62,26 @@ def test_discover_catalog_validates_skill_frontmatter(tmp_path: Path, contents: 
         discover_catalog(make_config(tmp_path, catalog))
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        "description:\n  A folded continuation without an explicit scalar marker.\n  Use it for migration.",
+        "description: >\n  A folded block scalar.\n  Use it for migration.",
+        "description: |\n  A literal block scalar.\n  Use it for migration.",
+    ],
+)
+def test_discover_catalog_accepts_multiline_skill_description(tmp_path: Path, description: str) -> None:
+    """Installed Skills commonly wrap long YAML descriptions across lines."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    (catalog / "skills/hello/SKILL.md").write_text(
+        f"---\nname: hello\n{description}\n---\n\nRun the workflow.\n",
+        encoding="utf-8",
+    )
+
+    assert discover_catalog(make_config(tmp_path, catalog)).skills[0].name == "hello"
+
+
 def test_discover_catalog_rejects_manifest_name_mismatch(tmp_path: Path) -> None:
     """Plugin namespaces cannot silently diverge across manifests."""
 

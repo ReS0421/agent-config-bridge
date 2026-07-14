@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `migrate-skills` dry-run/apply workflow for importing multiple existing Skill
+  roots by priority, deduplicating portable text line endings, retaining
+  divergent variants, repairing explicitly approved legacy frontmatter, and
+  generating content-free HADS Markdown and JSON reports.
+- Discovery-root redirect diagnostics for symlinks, junctions, and directory
+  reparse points.
+- Doctor validation and `--version` probing for the exact configured or
+  PATH-selected product executable.
+- Single-writer/multiple-passive-consumer support for installations sharing one
+  physical Skill discovery root.
+- End-to-end Windows, Linux, and WSL onboarding documentation.
+
+### Changed
+
+- Default Claude homes remove any inherited `CLAUDE_CONFIG_DIR`; command plans,
+  JSON, copyable previews, and internal registration all model that removal,
+  while custom homes still receive the reviewed value.
+- A target `executable` now selects the reviewed product CLI for Plugin/Hook
+  preflight and registration as well as Schedules.
+- Skill validation accepts wrapped YAML `description` values commonly found in
+  installed Skills.
+
+### Security
+
+- Skill migration never mutates source roots; refuses overlapping or redirected
+  catalog, conflict, and report outputs; verifies retained variants on rerun;
+  bounds each Skill to 100 MiB before reading; excludes transient bytecode/cache
+  artifacts; materializes only contained regular-file links; escapes untrusted
+  report text; and reports secret rule/file matches without matched values.
+- `migrate-skills --json` now emits one JSON document for dry runs, applies, and
+  no-op report refreshes.
+
 ## [0.2.0] - 2026-07-14
 
 ### Added

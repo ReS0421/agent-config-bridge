@@ -13,7 +13,7 @@ import pytest
 from agent_config_bridge import cli
 from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.config import load_config
-from agent_config_bridge.models import Platform
+from agent_config_bridge.models import Platform, Product
 from agent_config_bridge.planner import CommandHint, build_plan
 from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.state import read_registered_plugins, write_registered_plugins
@@ -26,6 +26,7 @@ def _write_config(
     components: tuple[str, ...],
     product: str = "codex",
     target_name: str = "local",
+    target_extra: str = "",
 ) -> Path:
     """Write an integration-test config whose paths stay below ``tmp_path``."""
 
@@ -50,6 +51,7 @@ platform = {json.dumps(current_platform().value)}
 user_home = {json.dumps(home.as_posix())}
 surfaces = ["cli", "desktop"]
 enabled = true
+{target_extra}
 """,
         encoding="utf-8",
     )
@@ -67,6 +69,17 @@ def _successful_product_run(
     if argv == ("claude", "plugin", "marketplace", "list", "--json"):
         return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
     return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
+def _write_launcher(path: Path) -> Path:
+    """Create a host-executable test product launcher."""
+
+    if current_platform() is Platform.WINDOWS:
+        path = path.with_suffix(".exe")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o700)
+    return path
 
 
 def test_init_creates_starter_config_and_refuses_unconfirmed_overwrite(
@@ -129,6 +142,23 @@ def test_plan_json_returns_one_for_unmanaged_destination_conflict(
     assert sentinel.read_text(encoding="utf-8") == "keep me"
 
 
+def test_plan_json_models_claude_default_profile_environment_removal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Machine-readable commands make the default Claude profile selection explicit."""
+
+    make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config_path = _write_config(tmp_path, components=("plugins",), product="claude-code")
+
+    assert cli.main(["plan", "--config", str(config_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["commands"]
+    assert all(command["environment"] == {} for command in payload["commands"])
+    assert all(command["environment_unsets"] == ["CLAUDE_CONFIG_DIR"] for command in payload["commands"])
+
+
 def test_register_requires_confirmation_before_running_product_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -168,6 +198,102 @@ def test_register_confirmed_passes_scoped_home_to_product_commands(
         assert invocation.kwargs["env"]["CODEX_HOME"] == str(tmp_path / "home" / ".codex")
     config = load_config(config_path)
     assert read_registered_plugins(config, config.targets[0]) == ("shared",)
+
+
+def test_register_uses_claude_default_profile_without_config_dir_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default Claude registration inherits its normal top-level profile layout."""
+
+    make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config_path = _write_config(tmp_path, components=("plugins",), product="claude-code")
+    run = Mock(side_effect=_successful_product_run)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "inherited-wrong-profile"))
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli.main(["register", "--config", str(config_path), "--target", "local", "--yes"]) == 0
+
+    assert run.call_count == 5
+    for invocation in run.call_args_list:
+        assert "CLAUDE_CONFIG_DIR" not in invocation.kwargs["env"]
+
+
+def test_register_sets_claude_config_dir_for_custom_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom Claude homes remain scoped consistently across preflight and mutations."""
+
+    make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    custom_home = tmp_path / "claude-profile"
+    config_path = _write_config(
+        tmp_path,
+        components=("plugins",),
+        product="claude-code",
+        target_extra=f"config_home = {json.dumps(custom_home.as_posix())}",
+    )
+    run = Mock(side_effect=_successful_product_run)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "inherited-wrong-profile"))
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli.main(["register", "--config", str(config_path), "--target", "local", "--yes"]) == 0
+
+    for invocation in run.call_args_list:
+        assert invocation.kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(custom_home)
+
+
+def test_register_uses_validated_explicit_executable_for_preflight_and_mutations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit target launcher replaces the PATH command throughout registration."""
+
+    make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    executable = _write_launcher(tmp_path / "tools/codex-custom")
+    config_path = _write_config(
+        tmp_path,
+        components=("plugins",),
+        target_extra=f"executable = {json.dumps(executable.as_posix())}",
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1:] == ("plugin", "marketplace", "list", "--json"):
+            return subprocess.CompletedProcess(argv, 0, stdout='{"marketplaces": []}', stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli.main(["register", "--config", str(config_path), "--target", "local", "--yes"]) == 0
+
+    assert calls[0] == (str(executable), "plugin", "marketplace", "list", "--json")
+    assert calls
+    assert {argv[0] for argv in calls} == {str(executable)}
+
+
+def test_register_rejects_missing_explicit_executable_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Plugin registration applies the same real-file validation as scheduled runs."""
+
+    make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    missing = tmp_path / "tools/missing-codex"
+    config_path = _write_config(
+        tmp_path,
+        components=("plugins",),
+        target_extra=f"executable = {json.dumps(missing.as_posix())}",
+    )
+    run = Mock()
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli.main(["register", "--config", str(config_path), "--target", "local", "--yes"]) == 2
+
+    run.assert_not_called()
+    assert "could not resolve the codex executable" in capsys.readouterr().err
 
 
 def test_register_reconciles_deselected_plugins_recorded_by_bridge(
@@ -213,6 +339,56 @@ def test_windows_command_preview_uses_powershell_syntax() -> None:
     preview = cli._format_command(command)
 
     assert preview == "$env:CODEX_HOME = 'C:\\Users\\Res\\.codex'; & 'codex' 'plugin' 'list'"
+
+
+def test_windows_command_preview_quotes_explicit_executable() -> None:
+    """A selected Windows launcher remains a safe copyable PowerShell invocation."""
+
+    command = CommandHint(
+        target="windows-codex",
+        platform=Platform.WINDOWS,
+        environment=(("CODEX_HOME", r"C:\Users\Res\.codex"),),
+        argv=(r"C:\Program Files\Codex\codex.exe", "plugin", "list"),
+        reason="test",
+    )
+
+    preview = cli._format_command(command)
+
+    assert preview == (
+        "$env:CODEX_HOME = 'C:\\Users\\Res\\.codex'; & 'C:\\Program Files\\Codex\\codex.exe' 'plugin' 'list'"
+    )
+
+
+def test_posix_command_preview_unsets_claude_default_profile_override() -> None:
+    """Linux previews cannot inherit a caller's custom Claude profile."""
+
+    command = CommandHint(
+        target="linux-claude",
+        platform=Platform.LINUX,
+        environment=(),
+        argv=("claude", "plugin", "list"),
+        reason="test",
+        environment_unsets=("CLAUDE_CONFIG_DIR",),
+    )
+
+    assert cli._format_command(command) == "env -u CLAUDE_CONFIG_DIR claude plugin list"
+
+
+def test_windows_command_preview_unsets_claude_default_profile_override() -> None:
+    """Windows previews remove the inherited profile before invoking Claude."""
+
+    command = CommandHint(
+        target="windows-claude",
+        platform=Platform.WINDOWS,
+        environment=(),
+        argv=("claude.exe", "plugin", "list"),
+        reason="test",
+        environment_unsets=("CLAUDE_CONFIG_DIR",),
+    )
+
+    assert cli._format_command(command) == (
+        "Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue; & 'claude.exe' 'plugin' 'list'"
+    )
 
 
 def test_register_treats_confirmed_missing_claude_removals_as_idempotent(
@@ -331,7 +507,36 @@ def test_removal_probe_fails_closed_on_unknown_vendor_json(monkeypatch: pytest.M
         lambda *_args, **_kwargs: subprocess.CompletedProcess(command.argv, 0, stdout='[{"plugin": "shared"}]'),
     )
 
-    assert not cli._removal_is_already_satisfied(command, {})
+    assert not cli._removal_is_already_satisfied(command, {}, Product.CLAUDE_CODE)
+
+
+def test_removal_retry_reuses_explicit_product_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Idempotence probes never fall back to a different PATH-discovered CLI."""
+
+    executable = "/opt/claude/claude"
+    command = CommandHint(
+        target="claude",
+        platform=current_platform(),
+        environment=(),
+        argv=(executable, "plugin", "marketplace", "remove", "agent-config-bridge"),
+        reason="test",
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def run(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if len(calls) == 1:
+            raise subprocess.CalledProcessError(1, argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    cli._run_registration_command(command, {}, Product.CLAUDE_CODE)
+
+    assert calls == [
+        command.argv,
+        (executable, "plugin", "marketplace", "list", "--json"),
+    ]
 
 
 def test_register_refuses_cleanup_when_named_marketplace_has_another_source(

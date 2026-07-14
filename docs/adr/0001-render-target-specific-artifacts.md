@@ -87,8 +87,9 @@ Skills applied by the bridge and Plugins/Hooks registered through the bridge.
 
 - **Semantic drift:** explicit overlays, rendered fixtures, plan review items,
   and product-side testing.
-- **Unknown vendor version:** document that alpha releases do not probe product
-  versions or capabilities; require users to review product compatibility.
+- **Unknown vendor capability:** Doctor reports the selected launcher's
+  informational `--version` output but does not infer capabilities from it;
+  require users to review product compatibility.
 - **Renderer compromise:** content hashes, fresh-plan comparison, generated-tree
   integrity checks, and code review.
 
