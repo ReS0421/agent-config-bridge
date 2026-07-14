@@ -216,8 +216,11 @@ def test_migration_treats_text_line_endings_as_identical(tmp_path: Path) -> None
     second = tmp_path / "second"
     _skill(first, "portable")
     _skill(second, "portable")
+    first_manifest = first / "portable/SKILL.md"
     manifest = second / "portable/SKILL.md"
-    manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+    normalized = manifest.read_text(encoding="utf-8").encode("utf-8")
+    first_manifest.write_bytes(normalized)
+    manifest.write_bytes(normalized.replace(b"\n", b"\r\n"))
 
     plan = _plan(
         tmp_path,

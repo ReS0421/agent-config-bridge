@@ -74,6 +74,8 @@ def _successful_product_run(
 def _write_launcher(path: Path) -> Path:
     """Create a host-executable test product launcher."""
 
+    if current_platform() is Platform.WINDOWS:
+        path = path.with_suffix(".exe")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     path.chmod(0o700)
