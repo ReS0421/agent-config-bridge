@@ -971,6 +971,22 @@ def _task_child(parent: ET.Element, name: str, value: str | None = None, **attri
     return child
 
 
+def _task_children_are_supported(
+    parent: ET.Element,
+    *,
+    required: tuple[str, ...],
+    optional: tuple[str, ...] = (),
+) -> bool:
+    """Accept only known direct children with safe required/optional cardinality."""
+
+    allowed_tags = {_task_tag(name) for name in (*required, *optional)}
+    return (
+        all(child.tag in allowed_tags for child in parent)
+        and all(len(parent.findall(_task_tag(name))) == 1 for name in required)
+        and all(len(parent.findall(_task_tag(name))) <= 1 for name in optional)
+    )
+
+
 def _windows_task_xml(spec: HeartbeatSpec, principal_user: str, task_name: str) -> bytes:
     ET.register_namespace("", _TASK_NAMESPACE)
     root = ET.Element(_task_tag("Task"), {"version": "1.3"})
@@ -1052,19 +1068,28 @@ def _inspect_windows_task_xml(xml: str, expected_target: str, task_name: str) ->
         raise ScheduleConflictError("scheduled task Exec action has unsupported fields")
 
     principal = principals[0]
-    principal_fields = {_task_tag("UserId"), _task_tag("LogonType"), _task_tag("RunLevel")}
-    if {child.tag for child in principal} != principal_fields or len(principal) != len(principal_fields):
+    if not _task_children_are_supported(
+        principal,
+        required=("UserId", "LogonType"),
+        optional=("RunLevel",),
+    ):
         raise ScheduleConflictError("scheduled task principal has unsupported fields")
 
     trigger = triggers[0]
-    trigger_fields = {_task_tag("Enabled"), _task_tag("StartBoundary"), _task_tag("Repetition")}
-    if {child.tag for child in trigger} != trigger_fields or len(trigger) != len(trigger_fields):
+    if not _task_children_are_supported(
+        trigger,
+        required=("StartBoundary", "Repetition"),
+        optional=("Enabled",),
+    ):
         raise ScheduleConflictError("scheduled task trigger has unsupported fields")
     repetitions = trigger.findall(f"./{_task_tag('Repetition')}")
     if len(repetitions) != 1:
         raise ScheduleConflictError("scheduled task repetition policy is malformed")
-    repetition_fields = {_task_tag("Interval"), _task_tag("StopAtDurationEnd")}
-    if {child.tag for child in repetitions[0]} != repetition_fields or len(repetitions[0]) != len(repetition_fields):
+    if not _task_children_are_supported(
+        repetitions[0],
+        required=("Interval",),
+        optional=("StopAtDurationEnd",),
+    ):
         raise ScheduleConflictError("scheduled task repetition policy has unsupported fields")
 
     marker_match = _WINDOWS_MARKER.fullmatch(descriptions[0].text or "")
@@ -1074,40 +1099,70 @@ def _inspect_windows_task_xml(xml: str, expected_target: str, task_name: str) ->
     if _DIGEST.fullmatch(claimed_digest) is None:  # pragma: no cover - marker regex guarantees this
         raise ScheduleConflictError("scheduled task has an invalid bridge ownership digest")
 
-    required_setting_names = (
-        "MultipleInstancesPolicy",
-        "DisallowStartIfOnBatteries",
-        "StopIfGoingOnBatteries",
-        "StartWhenAvailable",
-        "Enabled",
-        "ExecutionTimeLimit",
-    )
-    if any(len(settings[0].findall(f"./{_task_tag(name)}")) != 1 for name in required_setting_names):
+    settings_element = settings[0]
+    if not _task_children_are_supported(
+        settings_element,
+        required=(
+            "MultipleInstancesPolicy",
+            "DisallowStartIfOnBatteries",
+            "StopIfGoingOnBatteries",
+            "StartWhenAvailable",
+            "ExecutionTimeLimit",
+        ),
+        optional=(
+            "Enabled",
+            "RunOnlyIfIdle",
+            "RunOnlyIfNetworkAvailable",
+            "WakeToRun",
+            "IdleSettings",
+            "UseUnifiedSchedulingEngine",
+        ),
+    ):
         raise ScheduleConflictError("scheduled task execution settings are missing or duplicated")
     for name in ("RunOnlyIfIdle", "RunOnlyIfNetworkAvailable", "WakeToRun"):
-        values = settings[0].findall(f"./{_task_tag(name)}")
-        if len(values) > 1 or (values and values[0].text != "false"):
+        values = settings_element.findall(f"./{_task_tag(name)}")
+        if values and values[0].text != "false":
             raise ScheduleConflictError(f"scheduled task has an unsupported {name} policy")
-    if settings[0].find(f"./{_task_tag('RestartOnFailure')}") is not None:
-        raise ScheduleConflictError("scheduled task has an unsupported restart policy")
+
+    idle_settings = settings_element.findall(f"./{_task_tag('IdleSettings')}")
+    if idle_settings and (
+        not _task_children_are_supported(
+            idle_settings[0],
+            required=("StopOnIdleEnd", "RestartOnIdle"),
+        )
+        or (
+            idle_settings[0].findtext(_task_tag("StopOnIdleEnd")) != "true"
+            or idle_settings[0].findtext(_task_tag("RestartOnIdle")) != "false"
+        )
+    ):
+        raise ScheduleConflictError("scheduled task has unsupported idle defaults")
+    unified_engine = settings_element.findall(f"./{_task_tag('UseUnifiedSchedulingEngine')}")
+    if unified_engine and unified_engine[0].text != "true":
+        raise ScheduleConflictError("scheduled task has an unsupported unified scheduling engine policy")
 
     command = execution.findtext(_task_tag("Command"))
     arguments = execution.findtext(_task_tag("Arguments"))
     interval = repetitions[0].findtext(_task_tag("Interval"))
-    stop_at_duration_end = repetitions[0].findtext(_task_tag("StopAtDurationEnd"))
-    trigger_enabled = trigger.findtext(_task_tag("Enabled"))
+    # Task Scheduler omits several elements when they equal their safe schema
+    # defaults.  Canonicalize only those allowlisted omissions after validating
+    # child cardinality; explicit non-default values still change the digest.
+    stop_at_duration_end = repetitions[0].findtext(
+        _task_tag("StopAtDurationEnd"),
+        _TASK_STOP_AT_DURATION_END,
+    )
+    trigger_enabled = trigger.findtext(_task_tag("Enabled"), _TASK_ENABLED)
     start_boundary = trigger.findtext(_task_tag("StartBoundary"))
     principal_id = principal.get("id")
     principal_user = principal.findtext(_task_tag("UserId"))
     logon_type = principal.findtext(_task_tag("LogonType"))
-    run_level = principal.findtext(_task_tag("RunLevel"))
+    run_level = principal.findtext(_task_tag("RunLevel"), _TASK_RUN_LEVEL)
     actions_context = actions[0].get("Context")
-    instances_policy = settings[0].findtext(_task_tag("MultipleInstancesPolicy"))
-    execution_time_limit = settings[0].findtext(_task_tag("ExecutionTimeLimit"))
-    disallow_on_batteries = settings[0].findtext(_task_tag("DisallowStartIfOnBatteries"))
-    stop_on_batteries = settings[0].findtext(_task_tag("StopIfGoingOnBatteries"))
-    start_when_available = settings[0].findtext(_task_tag("StartWhenAvailable"))
-    task_enabled = settings[0].findtext(_task_tag("Enabled"))
+    instances_policy = settings_element.findtext(_task_tag("MultipleInstancesPolicy"))
+    execution_time_limit = settings_element.findtext(_task_tag("ExecutionTimeLimit"))
+    disallow_on_batteries = settings_element.findtext(_task_tag("DisallowStartIfOnBatteries"))
+    stop_on_batteries = settings_element.findtext(_task_tag("StopIfGoingOnBatteries"))
+    start_when_available = settings_element.findtext(_task_tag("StartWhenAvailable"))
+    task_enabled = settings_element.findtext(_task_tag("Enabled"), _TASK_ENABLED)
     if command is None or arguments is None or interval is None:
         raise ScheduleConflictError("scheduled task action or once-per-minute trigger is malformed")
     if not all(

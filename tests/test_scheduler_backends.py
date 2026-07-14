@@ -296,6 +296,36 @@ def test_windows_task_create_is_xml_based_and_idempotent(tmp_path: Path) -> None
     assert sum(argv[1] == "/Create" for argv, _stdin in runner.calls) == create_count
 
 
+def test_windows_inspection_canonicalizes_task_scheduler_export_defaults(tmp_path: Path) -> None:
+    """Windows export omissions and injected defaults preserve the owned digest."""
+
+    runner = FakeTaskScheduler()
+    backend = WindowsTaskSchedulerBackend(runner=runner, principal_user="test")
+    spec = _spec(tmp_path)
+    backend.apply(spec, backend.plan(spec))
+    task_name = backend.task_name(spec)
+    exported = runner.tasks[task_name]
+    exported = exported.replace("      <RunLevel>LeastPrivilege</RunLevel>\n", "")
+    exported = exported.replace("      <Enabled>true</Enabled>\n", "")
+    exported = exported.replace("        <StopAtDurationEnd>false</StopAtDurationEnd>\n", "")
+    exported = exported.replace("    <Enabled>true</Enabled>\n", "")
+    exported = exported.replace(
+        "  </Settings>",
+        "    <IdleSettings>\n"
+        "      <StopOnIdleEnd>true</StopOnIdleEnd>\n"
+        "      <RestartOnIdle>false</RestartOnIdle>\n"
+        "    </IdleSettings>\n"
+        "    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>\n"
+        "  </Settings>",
+    )
+    runner.tasks[task_name] = exported
+
+    assert "<RunLevel>" not in exported
+    assert "<StopAtDurationEnd>" not in exported
+    assert "<Enabled>" not in exported
+    assert backend.plan(spec).disposition is ScheduleDisposition.NOOP
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows system-directory APIs")
 def test_windows_backend_ignores_environment_and_uses_absolute_system_schtasks(
     tmp_path: Path,
@@ -392,6 +422,16 @@ def test_windows_drifted_execution_policy_is_a_conflict(tmp_path: Path) -> None:
             "<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>",
         ),
         lambda xml: xml.replace("</Settings>", "<RunOnlyIfIdle>true</RunOnlyIfIdle></Settings>"),
+        lambda xml: xml.replace(
+            "</Settings>",
+            "<IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd>"
+            "<RestartOnIdle>false</RestartOnIdle></IdleSettings></Settings>",
+        ),
+        lambda xml: xml.replace(
+            "</Settings>",
+            "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine></Settings>",
+        ),
+        lambda xml: xml.replace("</Settings>", "<UnknownDefault>false</UnknownDefault></Settings>"),
     ],
 )
 def test_windows_rejects_unowned_task_semantic_drift(tmp_path: Path, mutate) -> None:  # type: ignore[no-untyped-def]
