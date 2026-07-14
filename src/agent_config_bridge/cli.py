@@ -21,7 +21,7 @@ from agent_config_bridge.filesystem import FilesystemError
 from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key
 from agent_config_bridge.planner import CommandHint, SyncPlan, build_plan
-from agent_config_bridge.platforms import UnsupportedPlatformError, current_platform
+from agent_config_bridge.platforms import UnsupportedPlatformError, current_platform, scope_product_home_environment
 from agent_config_bridge.renderer import RenderError, render_marketplace
 from agent_config_bridge.schedule_runner import ScheduleRunnerError, run_due_schedules, run_named_schedule
 from agent_config_bridge.schedule_store import ScheduleStoreError
@@ -36,6 +36,14 @@ from agent_config_bridge.scheduler_registration import (
 )
 from agent_config_bridge.schedules import ScheduleError, ScheduleExecutionError
 from agent_config_bridge.settings import SettingsError
+from agent_config_bridge.skill_migration import (
+    MigrationError,
+    MigrationSource,
+    apply_skill_migration,
+    build_skill_migration_plan,
+    migration_report_json,
+    write_migration_reports,
+)
 from agent_config_bridge.state import (
     BridgeStateError,
     desired_plugin_names,
@@ -59,6 +67,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "init":
             return _command_init(args)
+        if args.command == "migrate-skills":
+            return _command_migrate_skills(args)
         if args.command == "schedule":
             config = load_config(Path(args.config))
             return _command_schedule(config, args)
@@ -91,6 +101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ScheduleError,
         ScheduleExecutionError,
         SettingsError,
+        MigrationError,
         UnsupportedPlatformError,
         OSError,
         subprocess.CalledProcessError,
@@ -110,6 +121,38 @@ def _build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser("init", help="create a starter config and empty catalog")
     init_parser.add_argument("--config", default=_DEFAULT_CONFIG)
     init_parser.add_argument("--force", action="store_true", help="replace only the generated config file")
+
+    migration_parser = subparsers.add_parser(
+        "migrate-skills",
+        help="import existing user Skill roots into one canonical catalog",
+    )
+    migration_parser.add_argument(
+        "--source",
+        action="append",
+        required=True,
+        metavar="LABEL=PATH",
+        help="source root in priority order; repeat for every discovery root",
+    )
+    migration_parser.add_argument("--catalog", required=True, type=Path, help="canonical catalog directory")
+    migration_parser.add_argument(
+        "--conflicts",
+        required=True,
+        type=Path,
+        help="private directory that retains divergent variants",
+    )
+    migration_parser.add_argument(
+        "--report",
+        required=True,
+        type=Path,
+        help="HADS .md report outside every source, catalog, and conflict store",
+    )
+    migration_parser.add_argument(
+        "--repair-legacy-frontmatter",
+        action="store_true",
+        help="add minimal name/description frontmatter only to migrated copies that have none",
+    )
+    migration_parser.add_argument("--json", action="store_true", help="emit the content-free migration report")
+    migration_parser.add_argument("-y", "--yes", action="store_true", help="confirm catalog and report writes")
 
     schedule_parser = subparsers.add_parser("schedule", help="run a rendered host-managed schedule")
     schedule_subparsers = schedule_parser.add_subparsers(dest="schedule_command", required=True)
@@ -150,6 +193,97 @@ def _load_context(config_path: Path) -> tuple[BridgeConfig, CatalogInventory]:
     config = load_config(config_path)
     inventory = discover_catalog(config)
     return config, inventory
+
+
+def _command_migrate_skills(args: argparse.Namespace) -> int:
+    sources = tuple(_parse_migration_source(value) for value in args.source)
+    plan = build_skill_migration_plan(
+        sources,
+        catalog=args.catalog,
+        conflicts=args.conflicts,
+        report=args.report,
+        repair_legacy_frontmatter=args.repair_legacy_frontmatter,
+    )
+    payload = migration_report_json(plan)
+    if not args.json:
+        summary = payload["summary"]
+        assert isinstance(summary, dict)
+        print(
+            "migration plan: "
+            f"{summary['skill_names']} names, {summary['create']} create, "
+            f"{summary['unchanged']} unchanged, {summary['conflict']} conflict, "
+            f"{summary['blocked']} blocked"
+        )
+        for decision in plan.decisions:
+            if decision.disposition.value in {"conflict", "blocked"}:
+                print(f"{decision.disposition.value.upper():8} {decision.name}: {decision.detail}")
+
+    pending = any(decision.disposition.value in {"create", "conflict"} for decision in plan.decisions)
+    if not pending:
+        reports: tuple[Path, Path] | None = None
+        if args.yes:
+            reports = write_migration_reports(plan)
+            if not args.json:
+                print(f"wrote migration reports: {reports[0]}, {reports[1]}")
+        return _finish_migration_command(
+            payload,
+            json_output=args.json,
+            applied=False,
+            reports=reports,
+            exit_code=1 if plan.has_blocked else 0,
+        )
+    if not args.yes:
+        if args.json:
+            return _finish_migration_command(
+                payload,
+                json_output=True,
+                applied=False,
+                reports=None,
+                exit_code=1,
+            )
+        print("migration not applied; rerun with --yes after reviewing the plan")
+        return 1
+
+    apply_skill_migration(plan)
+    reports = write_migration_reports(plan)
+    if not args.json:
+        print(f"migrated canonical Skills to {plan.catalog / 'skills'}")
+        if plan.has_conflicts:
+            print(f"retained divergent variants below {plan.conflicts}")
+        print(f"wrote migration reports: {reports[0]}, {reports[1]}")
+    return _finish_migration_command(
+        payload,
+        json_output=args.json,
+        applied=True,
+        reports=reports,
+        exit_code=1 if plan.has_conflicts or plan.has_blocked else 0,
+    )
+
+
+def _finish_migration_command(
+    payload: dict[str, object],
+    *,
+    json_output: bool,
+    applied: bool,
+    reports: tuple[Path, Path] | None,
+    exit_code: int,
+) -> int:
+    payload["execution"] = {
+        "applied": applied,
+        "reports_written": reports is not None,
+        "markdown_report": str(reports[0]) if reports else None,
+        "json_report": str(reports[1]) if reports else None,
+    }
+    if json_output:
+        _print_json(payload)
+    return exit_code
+
+
+def _parse_migration_source(value: str) -> MigrationSource:
+    label, separator, raw_path = value.partition("=")
+    if not separator or not label or not raw_path:
+        raise MigrationError(f"migration source must use LABEL=PATH: {value!r}")
+    return MigrationSource(label=label, root=Path(raw_path).expanduser().absolute())
 
 
 def _command_schedule(config: BridgeConfig, args: argparse.Namespace) -> int:
@@ -367,6 +501,10 @@ def _command_register(
             raise ConfigError(f"target {name!r} uses {target.platform.value}; run registration from that platform")
 
     commands = tuple(command for command in plan.commands if command.target in target_names)
+    for name in sorted(target_names):
+        target = known_targets[name]
+        target_commands = tuple(command for command in commands if command.target == name)
+        _validate_registration_executable(target, target_commands)
     scheduler_registrations = _build_scheduler_registrations(
         config,
         inventory,
@@ -421,8 +559,9 @@ def _command_register(
         target_commands = tuple(command for command in commands if command.target == name)
         commands_by_target[name] = target_commands
         environment = os.environ.copy()
+        scope_product_home_environment(environment, target)
         if target_commands:
-            environment.update(dict(target_commands[0].environment))
+            _scope_command_environment(environment, target_commands[0])
             _preflight_registration_ownership(config, target, target_commands, environment)
 
     for name in sorted(target_names):
@@ -430,8 +569,9 @@ def _command_register(
         target_commands = commands_by_target[name]
         for command in target_commands:
             command_environment = os.environ.copy()
-            command_environment.update(dict(command.environment))
-            _run_registration_command(command, command_environment)
+            scope_product_home_environment(command_environment, target)
+            _scope_command_environment(command_environment, command)
+            _run_registration_command(command, command_environment, target.product)
         write_registered_plugins(config, target, desired_plugin_names(target, fresh_inventory))
     apply_scheduler_registrations(config, fresh_inventory, fresh_scheduler_registrations)
     return 0
@@ -488,7 +628,8 @@ def _preflight_registration_ownership(
     if not commands:
         return
 
-    actual_source = _registered_marketplace_source(target, environment)
+    executable = _registration_command_executable(target, commands)
+    actual_source = _registered_marketplace_source(target, environment, executable)
     if actual_source is None:
         # A retry may start after the old marketplace was already removed.
         return
@@ -505,13 +646,11 @@ def _preflight_registration_ownership(
 def _registered_marketplace_source(
     target: TargetConfig,
     environment: dict[str, str],
+    executable: str,
 ) -> str | None:
     """Return the physical source for the bridge-named product marketplace."""
 
-    if target.product is Product.CODEX:
-        argv = ("codex", "plugin", "marketplace", "list", "--json")
-    else:
-        argv = ("claude", "plugin", "marketplace", "list", "--json")
+    argv = (executable, "plugin", "marketplace", "list", "--json")
     try:
         result = subprocess.run(
             argv,
@@ -592,33 +731,38 @@ def _claude_marketplace_source(payload: object, target: TargetConfig) -> str | N
     return source_path
 
 
-def _run_registration_command(command: CommandHint, environment: dict[str, str]) -> None:
+def _run_registration_command(
+    command: CommandHint,
+    environment: dict[str, str],
+    product: Product,
+) -> None:
     try:
         subprocess.run(command.argv, check=True, env=environment)
     except subprocess.CalledProcessError:
-        if _removal_is_already_satisfied(command, environment):
+        if _removal_is_already_satisfied(command, environment, product):
             return
         raise
 
 
-def _removal_is_already_satisfied(command: CommandHint, environment: dict[str, str]) -> bool:
+def _removal_is_already_satisfied(
+    command: CommandHint,
+    environment: dict[str, str],
+    product: Product,
+) -> bool:
     argv = command.argv
+    executable = argv[0]
+    arguments = argv[1:]
     probe_argv: tuple[str, ...]
     removal_kind: str
-    if argv[:3] == ("claude", "plugin", "uninstall") and len(argv) >= 4:
-        probe_argv = ("claude", "plugin", "list", "--json")
-        expected_name = argv[3]
+    if product is Product.CLAUDE_CODE and arguments[:2] == ("plugin", "uninstall") and len(arguments) >= 3:
+        probe_argv = (executable, "plugin", "list", "--json")
+        expected_name = arguments[2]
         removal_kind = "plugin"
 
-    elif argv[:4] == ("claude", "plugin", "marketplace", "remove") and len(argv) == 5:
-        probe_argv = ("claude", "plugin", "marketplace", "list", "--json")
-        expected_name = argv[4]
-        removal_kind = "marketplace"
-
-    elif argv[:4] == ("codex", "plugin", "marketplace", "remove") and len(argv) == 5:
-        probe_argv = ("codex", "plugin", "marketplace", "list", "--json")
-        expected_name = argv[4]
-        removal_kind = "codex-marketplace"
+    elif arguments[:3] == ("plugin", "marketplace", "remove") and len(arguments) == 4:
+        probe_argv = (executable, "plugin", "marketplace", "list", "--json")
+        expected_name = arguments[3]
+        removal_kind = "codex-marketplace" if product is Product.CODEX else "marketplace"
 
     else:
         return False
@@ -659,6 +803,27 @@ def _removal_is_already_satisfied(command: CommandHint, environment: dict[str, s
     return not any(isinstance(entry, dict) and entry.get("name") == expected_name for entry in payload)
 
 
+def _registration_command_executable(target: TargetConfig, commands: tuple[CommandHint, ...]) -> str:
+    """Return the single executable reviewed for one target's commands."""
+
+    executables = {command.argv[0] for command in commands}
+    if len(executables) != 1:
+        raise ConfigError(f"target {target.name!r}: registration commands do not use one product executable")
+    return next(iter(executables))
+
+
+def _validate_registration_executable(target: TargetConfig, commands: tuple[CommandHint, ...]) -> None:
+    """Validate an explicit CLI override and the command plan that consumes it."""
+
+    if not commands:
+        return
+    planned = _registration_command_executable(target, commands)
+    default = "codex" if target.product is Product.CODEX else "claude"
+    expected = str(validate_vendor_executable(target, target.executable)) if target.executable is not None else default
+    if planned != expected:
+        raise ConfigError(f"target {target.name!r}: registration command executable changed after planning")
+
+
 def _confirm(prompt: str, confirmed: bool) -> bool:
     if confirmed:
         return True
@@ -687,12 +852,28 @@ def _print_plan(plan: SyncPlan) -> None:
 
 def _format_command(command: CommandHint) -> str:
     if command.platform.value == "windows":
-        environment = "; ".join(f"$env:{key} = {_powershell_quote(value)}" for key, value in command.environment)
+        unsets = "; ".join(f"Remove-Item Env:{key} -ErrorAction SilentlyContinue" for key in command.environment_unsets)
+        assignments = "; ".join(f"$env:{key} = {_powershell_quote(value)}" for key, value in command.environment)
+        environment = "; ".join(part for part in (unsets, assignments) if part)
         argv = " ".join(_powershell_quote(value) for value in command.argv)
         return f"{environment}; & {argv}" if environment else f"& {argv}"
+    if command.environment_unsets:
+        environment_argv = ["env"]
+        for key in command.environment_unsets:
+            environment_argv.extend(("-u", key))
+        environment_argv.extend(f"{key}={value}" for key, value in command.environment)
+        return shlex.join((*environment_argv, *command.argv))
     environment = " ".join(f"{key}={shlex.quote(value)}" for key, value in command.environment)
     argv = shlex.join(command.argv)
     return f"{environment} {argv}".strip()
+
+
+def _scope_command_environment(environment: dict[str, str], command: CommandHint) -> None:
+    """Apply one planned environment delta to an internal subprocess scope."""
+
+    for key in command.environment_unsets:
+        environment.pop(key, None)
+    environment.update(dict(command.environment))
 
 
 def _powershell_quote(value: str) -> str:
@@ -714,6 +895,7 @@ def _command_payload(command: CommandHint) -> dict[str, Any]:
     return {
         "target": command.target,
         "environment": dict(command.environment),
+        "environment_unsets": list(command.environment_unsets),
         "argv": list(command.argv),
         "reason": command.reason,
     }

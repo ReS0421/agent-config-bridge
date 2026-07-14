@@ -60,6 +60,9 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
 - POSIX and copyable PowerShell command previews according to target platform
 - Catalog validation for every nested Windows path component, with only
   contained file symlinks accepted
+- Conservative multi-root Skill migration with deterministic priority,
+  conflict retention, secret-pattern scanning, legacy frontmatter repair, and
+  HADS Markdown plus JSON reports
 
 ## Install for development
 
@@ -83,6 +86,25 @@ Create a new bridge catalog:
 ```bash
 agentbridge init
 ```
+
+Or migrate existing user Skill roots into a private canonical catalog before
+configuring targets:
+
+```bash
+agentbridge migrate-skills \
+  --source linux-agents="$HOME/.agents/skills" \
+  --source windows-agents=/mnt/c/Users/USER/.agents/skills \
+  --catalog /mnt/c/Users/USER/AgentConfig/catalog \
+  --conflicts /mnt/c/Users/USER/AgentConfig/conflicts \
+  --report /mnt/c/Users/USER/AgentConfig/reports/skill-migration.md
+```
+
+The command is read-only unless `--yes` is supplied. Its `.md` report must stay
+outside every source, the catalog, and the conflict store; `--json` produces one
+machine-readable document. Review retained conflicts and license/provenance
+before applying the migrated catalog. See the
+[Windows, Linux, and WSL onboarding guide](docs/onboarding.md) for the complete
+workflow and four-root migration example.
 
 Add canonical artifacts below `catalog/`, then inspect everything before writing:
 
@@ -147,7 +169,7 @@ name = "local-codex"
 product = "codex"
 platform = "auto" # auto | linux | windows
 user_home = "~"
-# executable = "/absolute/path/to/codex" # optional Schedule CLI override
+# executable = "/absolute/path/to/codex" # optional product CLI override
 surfaces = ["cli", "desktop"]
 enabled = true
 
@@ -164,24 +186,34 @@ enabled = true
 `config_home` is optional and defaults to `<user_home>/.codex` or
 `<user_home>/.claude`. Keep it explicit for nonstandard runtimes. For Claude
 Code, standalone Skills are projected to `<config_home>/skills`, so a custom
-`CLAUDE_CONFIG_DIR` layout is honored. Relative catalog and state paths resolve
-from the TOML file. The loader rejects physical equal/nested overlap among the
-catalog, generated state, enabled product homes, and Skill discovery roots.
-Product homes and discovery roots must also remain disjoint across enabled
-targets; Claude Code's own `<config_home>/skills` relationship is the intended
-exception. Isolated sibling directories under one `user_home` remain valid.
+`CLAUDE_CONFIG_DIR` layout is honored. For Claude's default
+`<user_home>/.claude` home, Bridge removes any inherited `CLAUDE_CONFIG_DIR`
+because setting it would select a nested `<user_home>/.claude/.claude.json`
+profile; custom homes set the reviewed value explicitly.
+Relative catalog and state paths resolve from the TOML file. The loader keeps
+the catalog and generated state physically isolated from enabled product homes
+and Skill discovery roots. Product homes must also remain disjoint from other
+targets' discovery roots; Claude Code's own `<config_home>/skills` relationship
+is the intended exception. Multiple installations may consume the same physical
+Skill root when at most one selects `skills`; every other target must exclude
+that component. A previous Skill ownership record remains a write claim until its
+target completes cleanup, so handoffs still require two separate reconciliations.
+Isolated sibling directories under one `user_home` remain valid.
+`doctor` warns when a declared Skill discovery root, or one of its existing
+parents, is redirected through a symlink, junction, or directory reparse point.
+Validation and planning still use the effective physical path for isolation and
+ownership checks. Standalone Skill links below the discovery root do not trigger
+this warning.
 
 The optional target `executable` selects the Codex or Claude Code CLI used by
-Schedules only; Plugin/Hook registration continues to use product commands from
-the registering process environment. An explicit path is normalized to an
-absolute host path (`user_home` is the base for a relative value), then must
-resolve to a real file. Linux requires it to be executable; Windows requires a
-native `.exe` or `.com` launcher. Without an override, `register` searches only
-absolute `PATH` entries for `codex` or `claude`, excluding the current directory
-and relative entries, then records the validated absolute path in the
-heartbeat. Registration prints the resolved bridge, product CLI, and config
-paths for review. Later Schedule ticks do not depend on cron or Task Scheduler
-`PATH` lookup.
+Plugin/Hook registration, its marketplace ownership preflight, and Schedules.
+An explicit path is normalized to an absolute host path (`user_home` is the base
+for a relative value), then must resolve to a real file. Linux requires it to be
+executable; Windows requires a native `.exe` or `.com` launcher. Without an
+override, Plugin/Hook registration preserves the normal bare `codex` or
+`claude` PATH lookup. Schedule registration separately resolves only absolute
+non-CWD `PATH` entries and pins that validated path in the heartbeat. Later
+Schedule ticks therefore do not depend on cron or Task Scheduler `PATH` lookup.
 
 See [examples/bridge.toml](examples/bridge.toml) for a working selective-sharing example.
 
@@ -263,7 +295,9 @@ for the schema and lifecycle.
 
 ## Safety model
 
-- `plan` and `doctor` never write.
+- `plan` and `doctor` never write Bridge or product state. `doctor` invokes the
+  selected product executable with `--version`, so review explicit executable
+  paths as code before running it.
 - Existing unmanaged destinations are conflicts, even when their content happens to match.
 - A previously recorded Skill symlink is removed on deselection only while it
   still points to the recorded canonical source; links are never repointed or
@@ -342,8 +376,9 @@ or enabling unattended Schedules.
   still active, while the Schedule's own timeout remains authoritative.
 - Alpha releases do not provide an all-actions atomic transaction, an
   apply/register target lock, automatic rollback, recovery logs, product
-  capability/version probing, or full post-install validation. Schedule ticks
-  use a separate runtime lock.
+  capability inference, or full post-install validation. Doctor's selected-CLI
+  `--version` probe is informational. Schedule ticks use a separate runtime
+  lock.
 - A process crash can occur after an external file, product registry, crontab,
   or Task Scheduler mutation succeeds but before its ownership-state write.
   The next run fails closed or reports a conflict; inspect the external state

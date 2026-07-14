@@ -122,12 +122,38 @@ Implemented validation includes:
 - integrity hashes for immutable and published rendered marketplaces.
 
 The bridge does not scan unexpected executables, run arbitrary vendor validators,
-probe product versions, verify Hook semantics, or decide that a catalog is safe.
-Validation is structural; code review remains necessary.
+verify Hook semantics, infer capabilities from a version, or decide that a
+catalog is safe. Catalog validation is structural; Doctor's selected-CLI
+`--version` probe does not replace code review.
+
+## Importing existing Skill roots
+
+`migrate-skills` treats every source as untrusted and read-only. It rejects
+physical overlap with its outputs and refuses catalog groups, conflict-store
+ancestors, or report parents redirected through symlinks, junctions, or reparse
+points. Apply revalidates those boundaries and the physical source roots before
+writing. Existing retained conflict variants must match their expected digest;
+drift fails closed instead of being silently accepted.
+
+Each accepted Skill is bounded to 100 MiB before a file read can exceed the
+remaining budget. The importer excludes transient Python bytecode and macOS
+metadata, materializes only contained regular-file links, normalizes text line
+endings for identity, and scans accepted bytes for selected high-confidence
+credential formats. Secret reports contain rule names and relative files, never
+matched values, and dynamic Markdown fields are escaped. This scanner is a
+guardrail rather than a complete secret detector; manually review imported
+scripts, binaries, provenance, and redistribution rights.
+
+The Markdown report must use a `.md` suffix and live outside every source, the
+catalog, and the conflict store. `--json` writes exactly one document to stdout,
+so automation never needs to split human status text from machine output.
 
 ## Plan before mutation
 
-`validate`, `plan`, and `doctor` are read-only. `plan` reports:
+`validate`, `plan`, and `doctor` do not write Bridge or product state. `doctor`
+does execute the selected product CLI with `--version`, so an explicit target
+`executable` remains executable supply-chain input and must be reviewed before
+running diagnostics. `plan` reports:
 
 - Skill creates, updates, removals, no-ops, and conflicts;
 - aggregate Settings leaf dispositions, fragment paths, and destinations;
@@ -135,7 +161,8 @@ Validation is structural; code review remains necessary.
 - marketplace create/update state;
 - Hook events, matchers, handler types, and command/URL/prompt values;
 - Plugin `.mcp.json` or manifest MCP command/URL values;
-- product CLI argv and environment needed for later registration;
+- product CLI argv, environment assignments, and environment removals needed
+  for later registration;
 - relevant warnings, including the Claude Code Desktop session boundary.
 
 Review items intentionally display literal catalog command and URL fields. They
@@ -226,7 +253,9 @@ selected Plugin; product CLIs still own the result.
 ## Registration and product-owned trust
 
 `register` requires confirmation, runs only on the configured target platform,
-rechecks the plan, and passes `CODEX_HOME` or `CLAUDE_CONFIG_DIR` explicitly. It
+rechecks the plan, and passes the configured product home explicitly. Claude's
+default home is the exception: it removes an inherited `CLAUDE_CONFIG_DIR` so
+the CLI uses the top-level default profile rather than a nested profile. It
 records desired Plugin names only after all planned commands for that target
 succeed, and separately records a successfully reconciled host heartbeat. Later
 deselection removes only names and scheduler entries in those bridge records;

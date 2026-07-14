@@ -198,7 +198,7 @@ def test_one_invalid_schedule_does_not_abort_other_due_runs(tmp_path: Path) -> N
     assert seen == ["second"]
 
 
-def test_manual_run_uses_claude_home_and_fixed_argv(tmp_path: Path) -> None:
+def test_manual_run_uses_claude_default_profile_and_fixed_argv(tmp_path: Path) -> None:
     config, target = _published_target(tmp_path, product=Product.CLAUDE_CODE)
     seen: list[VendorInvocation] = []
 
@@ -206,11 +206,17 @@ def test_manual_run_uses_claude_home_and_fixed_argv(tmp_path: Path) -> None:
         seen.append(invocation)
         return VendorExecutionResult(argv=invocation.argv, returncode=0, stdout="", stderr="")
 
-    result = run_named_schedule(config, target, "daily-review", environment={}, execute=execute)
+    result = run_named_schedule(
+        config,
+        target,
+        "daily-review",
+        environment={"CLAUDE_CONFIG_DIR": str(tmp_path / "inherited-wrong-profile")},
+        execute=execute,
+    )
 
     assert result.runs[0].succeeded
     assert seen[0].argv == ("claude", "--print", "--no-session-persistence")
-    assert dict(seen[0].environment or ())["CLAUDE_CONFIG_DIR"] == str(target.config_home)
+    assert "CLAUDE_CONFIG_DIR" not in dict(seen[0].environment or ())
 
 
 def test_manual_run_rejects_unknown_schedule(tmp_path: Path) -> None:

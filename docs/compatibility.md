@@ -1,9 +1,10 @@
 # Compatibility
 
 This document describes the implemented local projection targets and known
-product boundaries as of 2026-07-14. Vendor behavior changes quickly. An alpha
+product boundaries as of 2026-07-15. Vendor behavior changes quickly. An alpha
 bridge release validates its own catalog and generated-state invariants, but it
-does not probe installed product versions or certify every vendor schema.
+does not infer product capabilities or certify every vendor schema. `doctor`
+does report the exact selected executable's `--version` output.
 
 “Targeted” means the bridge can model the local filesystem home and generate
 product CLI commands for that combination. It does not mean every component has
@@ -17,6 +18,13 @@ idempotent retry, deselection, and removal. The bridge test suite also runs on
 native Windows and Linux CI for Python 3.11 and 3.12. Native Windows product
 registration is modeled and unit-tested, but is not yet an automated vendor
 CLI integration job.
+
+The 0.2.0 local host audit also exercised native Windows Skill projection with
+official standalone Codex 0.144.4, Claude Code 2.1.20, Python 3.12, and a native
+`agentbridge.exe`: 107 managed copies per product converged to a 215-action NOOP
+plan. Codex Plugin add/list/remove and marketplace-list command surfaces were
+probed successfully; no native Windows Plugin registration was performed
+because the audited catalog contained no Plugin or Hook artifact.
 
 Version 0.2 adds native Settings leaf projection and host-managed recurring CLI
 Schedules. These features use public Settings files and operating-system
@@ -65,7 +73,7 @@ entry point is `SKILL.md`, plus optional referenced files.
 | ------------------------- | ---------------------------------- | ----------------------------------------------- |
 | Bridge-managed user root  | `<user_home>/.agents/skills`       | `<config_home>/skills`                          |
 | Default `config_home`     | `<user_home>/.codex`               | `<user_home>/.claude`                           |
-| Custom home behavior      | Registration receives `CODEX_HOME` | Skills and registration use `CLAUDE_CONFIG_DIR` |
+| Custom home behavior      | Registration receives `CODEX_HOME` | Custom homes use `CLAUDE_CONFIG_DIR`; the default profile removes inherited overrides |
 | Linux `auto` mode         | Directory symlink                  | Directory symlink                               |
 | Windows `auto` mode       | Managed directory copy             | Managed directory copy                          |
 | Product-specific metadata | May be consumed by Codex           | May be consumed by Claude Code                  |
@@ -89,6 +97,12 @@ Existing links and managed-copy markers are not adopted without matching
 target-scoped ownership state. During a target handoff, the old target keeps its
 physical Skill root reserved until an empty reconciliation completes; this also
 applies to physical aliases and case variants on Windows.
+
+Separate installations may discover the same physical Skill root. Configure
+exactly one of those targets with `skills`; targets that only consume the shared
+root must exclude that component. A retained ownership record counts as the one
+writer claim, so moving ownership requires cleaning the old target before
+selecting `skills` on the replacement.
 
 ## Settings
 
@@ -128,7 +142,7 @@ The package concepts are similar, but the contracts are not interchangeable:
 | Plugin manifest     | `.codex-plugin/plugin.json`        | `.claude-plugin/plugin.json`      |
 | Marketplace         | `.agents/plugins/marketplace.json` | `.claude-plugin/marketplace.json` |
 | Rendered package    | `plugins/codex/<name>`             | `plugins/claude-code/<name>`      |
-| Registration home   | `CODEX_HOME=<config_home>`         | `CLAUDE_CONFIG_DIR=<config_home>` |
+| Registration home   | `CODEX_HOME=<config_home>`         | custom Claude homes set `CLAUDE_CONFIG_DIR`; the default removes it |
 | Product cache/trust | Owned by Codex                     | Owned by Claude Code              |
 
 OpenAI currently recognizes a legacy-compatible repo marketplace at
@@ -197,11 +211,13 @@ include the `cli` surface. Codex runs `codex exec --ephemeral`; Claude Code runs
 `claude --print --no-session-persistence`. Prompts are sent on standard input,
 no permission-bypass flags are added, and missed minutes are not replayed.
 
-An optional target `executable` overrides product CLI discovery for Schedules.
-Otherwise `register` resolves `codex` or `claude` only from absolute non-CWD
-entries in its own `PATH` and prints the resolved path before confirmation. The
-resulting absolute path is stored in the heartbeat, so the later scheduler
-process does not depend on its usually smaller `PATH`. A short target lock makes
+An optional target `executable` overrides product CLI selection for Plugin/Hook
+registration, marketplace preflight, and Schedules. Without it, Plugin/Hook
+commands use the normal bare product command; Schedule registration resolves
+`codex` or `claude` only from absolute non-CWD entries in its own `PATH`. The
+resulting absolute Schedule path is stored in the heartbeat, so the later
+scheduler process does not depend on its usually smaller `PATH`. A short target
+lock makes
 snapshot/minute claiming idempotent and is released before vendor work. A
 separate target/Schedule lock skips only a recurrence whose previous run is
 still active. On Windows, `Parallel` allows later heartbeats to make new claims,
@@ -299,8 +315,9 @@ reconcile it to empty.
 - A sequential apply/register can stop after earlier actions succeeded; inspect
   a fresh plan before retrying.
 - Symlink mode is live and bypasses copy-mode update checkpoints.
-- No product capability/version probing, automatic vendor validation of
-  arbitrary artifacts, or full post-install/cache validation.
+- No product capability inference, automatic vendor validation of arbitrary
+  artifacts, or full post-install/cache validation. Doctor's executable
+  `--version` probe is informational rather than a capability certification.
 - Hook event parity is not inferred or tested by the bridge.
 - Product CLIs own trust approvals, permission policy, caches, and authentication.
 - Manual product commands bypass bridge ownership recording.

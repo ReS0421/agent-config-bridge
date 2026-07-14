@@ -14,7 +14,9 @@ from agent_config_bridge.platforms import (
     UnsupportedPlatformError,
     current_platform,
     default_config_home,
+    product_home_environment,
     resolve_platform,
+    scope_product_home_environment,
 )
 
 __all__ = [
@@ -30,5 +32,7 @@ __all__ = [
     "current_platform",
     "default_config_home",
     "load_config",
+    "product_home_environment",
     "resolve_platform",
+    "scope_product_home_environment",
 ]

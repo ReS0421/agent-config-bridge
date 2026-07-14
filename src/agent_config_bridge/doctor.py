@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
@@ -12,10 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.catalog import CatalogInventory
-from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, Surface
-from agent_config_bridge.path_safety import path_comparison_key
+from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, Surface, TargetConfig
+from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key
 from agent_config_bridge.planner import Disposition, SyncPlan
 from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.scheduler_registration import SchedulerRegistrationError, validate_vendor_executable
 from agent_config_bridge.state import find_orphaned_target_states
 
 __all__ = ["CheckLevel", "DoctorCheck", "run_doctor"]
@@ -99,6 +101,9 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
 
         checks.append(_home_check(target.name, target.user_home))
         checks.append(_config_home_check(target.name, target.config_home))
+        skill_root_redirect = _skill_discovery_root_redirect_check(target)
+        if skill_root_redirect is not None:
+            checks.append(skill_root_redirect)
 
         same_platform = target.platform is host_platform
         if not same_platform:
@@ -114,16 +119,7 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                 )
             )
         else:
-            executable = "codex" if target.product is Product.CODEX else "claude"
-            resolved = shutil.which(executable)
-            checks.append(
-                DoctorCheck(
-                    CheckLevel.OK if resolved else CheckLevel.WARNING,
-                    "target.executable",
-                    f"{executable} executable: {resolved or 'not found on this process PATH'}",
-                    target.name,
-                )
-            )
+            checks.append(_executable_check(target))
 
         if same_platform and target.product is Product.CODEX and current_codex_home:
             expected_path = target.config_home.resolve()
@@ -200,6 +196,71 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
     return tuple(checks)
 
 
+def _executable_check(target: TargetConfig) -> DoctorCheck:
+    """Validate and version-probe the exact product launcher a target selects."""
+
+    command = "codex" if target.product is Product.CODEX else "claude"
+    explicit = target.executable is not None
+    candidate = target.executable
+    if candidate is None:
+        discovered = shutil.which(command)
+        if discovered is None:
+            return DoctorCheck(
+                CheckLevel.WARNING,
+                "target.executable",
+                f"{command} executable was not found on this process PATH; version probe skipped",
+                target.name,
+            )
+        candidate = Path(discovered)
+
+    try:
+        selected = validate_vendor_executable(target, candidate)
+    except SchedulerRegistrationError as exc:
+        source = "configured executable" if explicit else "PATH-selected executable"
+        return DoctorCheck(
+            CheckLevel.ERROR if explicit else CheckLevel.WARNING,
+            "target.executable",
+            f"{source} is invalid: {exc}; version probe skipped",
+            target.name,
+        )
+
+    source = "configured" if explicit else "PATH-selected"
+    try:
+        result = subprocess.run(
+            (str(selected), "--version"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+        return DoctorCheck(
+            CheckLevel.ERROR if explicit else CheckLevel.WARNING,
+            "target.executable",
+            f"{command} executable ({source}): {selected}; version probe failed: {exc}",
+            target.name,
+        )
+
+    raw_version = result.stdout.strip() or result.stderr.strip()
+    version = "".join(character for character in " ".join(raw_version.split()) if character.isprintable())
+    if len(version) > 512:
+        version = f"{version[:511]}…"
+    if result.returncode != 0 or not version:
+        detail = f"exit {result.returncode}" if result.returncode else "no version output"
+        return DoctorCheck(
+            CheckLevel.ERROR if explicit else CheckLevel.WARNING,
+            "target.executable",
+            f"{command} executable ({source}): {selected}; version probe failed ({detail})",
+            target.name,
+        )
+    return DoctorCheck(
+        CheckLevel.OK,
+        "target.executable",
+        f"{command} executable ({source}): {selected}; version: {version}",
+        target.name,
+    )
+
+
 def _home_check(target: str, path: Path) -> DoctorCheck:
     if not path.is_dir():
         return DoctorCheck(CheckLevel.ERROR, "target.home", f"user home is not a directory: {path}", target)
@@ -262,6 +323,47 @@ def _config_home_check(target: str, path: Path) -> DoctorCheck:
         "target.config-home",
         f"config home does not exist but can be created below writable parent: {parent}",
         target,
+    )
+
+
+def _skill_discovery_root_redirect_check(target: TargetConfig) -> DoctorCheck | None:
+    """Report a discovery root redirected by an existing symlink or junction.
+
+    Only the declared root and its parent chain are inspected. Standalone Skill
+    symlinks below the root are expected bridge/user content and must not trigger
+    this diagnostic.
+    """
+
+    root = target.user_home / ".agents" / "skills" if target.product is Product.CODEX else target.config_home / "skills"
+    absolute_root = Path(os.path.abspath(root))
+    redirected_components: list[Path] = []
+    for candidate in reversed((absolute_root, *absolute_root.parents)):
+        try:
+            is_symlink = candidate.is_symlink()
+            is_reparse_point = is_directory_reparse_point(candidate)
+        except OSError:
+            continue
+        if is_symlink or is_reparse_point:
+            redirected_components.append(candidate)
+
+    if not redirected_components:
+        return None
+
+    try:
+        physical_root = absolute_root.resolve(strict=False)
+        destination = f"effective physical location {physical_root}"
+    except (OSError, RuntimeError) as error:
+        destination = f"an effective location that could not be resolved ({error})"
+    redirects = ", ".join(str(path) for path in redirected_components)
+    return DoctorCheck(
+        CheckLevel.WARNING,
+        "skills.discovery-root-redirected",
+        (
+            f"Skill discovery root {absolute_root} is redirected through {redirects} to {destination}; "
+            "configuration validation and planning use physical path identity, so confirm this redirection "
+            "is intentional"
+        ),
+        target.name,
     )
 
 
