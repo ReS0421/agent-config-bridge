@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
 __all__ = [
     "HeartbeatSpec",
@@ -680,11 +681,9 @@ def _windows_system_directory() -> Path:
     import ctypes
     from ctypes import wintypes
 
-    win_dll = ctypes.WinDLL  # type: ignore[attr-defined]  # Windows-only ctypes API.
-    win_error = ctypes.WinError  # type: ignore[attr-defined]  # Windows-only ctypes API.
-    get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]  # Windows-only ctypes API.
     try:
-        kernel32 = win_dll("kernel32", use_last_error=True)
+        ctypes_api: Any = ctypes
+        kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
     except (AttributeError, OSError) as exc:  # pragma: no cover - only reachable on broken Windows runtimes
         raise RuntimeError("Windows system APIs are unavailable") from exc
     kernel32.GetSystemDirectoryW.argtypes = (wintypes.LPWSTR, wintypes.UINT)
@@ -692,7 +691,7 @@ def _windows_system_directory() -> Path:
     buffer = ctypes.create_unicode_buffer(32_768)
     length = kernel32.GetSystemDirectoryW(buffer, len(buffer))
     if length == 0:
-        raise win_error(get_last_error())
+        raise ctypes_api.WinError(ctypes_api.get_last_error())
     if length >= len(buffer):
         raise RuntimeError("Windows system directory exceeds the supported path length")
     system_directory = Path(buffer.value)
@@ -729,12 +728,10 @@ def _windows_current_user_sid() -> str:
     class TokenUser(ctypes.Structure):
         _fields_ = [("user", SidAndAttributes)]
 
-    win_dll = ctypes.WinDLL  # type: ignore[attr-defined]  # Windows-only ctypes API.
-    win_error = ctypes.WinError  # type: ignore[attr-defined]  # Windows-only ctypes API.
-    get_last_error = ctypes.get_last_error  # type: ignore[attr-defined]  # Windows-only ctypes API.
     try:
-        kernel32 = win_dll("kernel32", use_last_error=True)
-        advapi32 = win_dll("advapi32", use_last_error=True)
+        ctypes_api: Any = ctypes
+        kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes_api.WinDLL("advapi32", use_last_error=True)
     except (AttributeError, OSError) as exc:  # pragma: no cover - only reachable on broken Windows runtimes
         raise RuntimeError("Windows security APIs are unavailable") from exc
 
@@ -766,12 +763,12 @@ def _windows_current_user_sid() -> str:
 
     token = wintypes.HANDLE()
     if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), token_query, ctypes.byref(token)):
-        raise win_error(get_last_error())
+        raise ctypes_api.WinError(ctypes_api.get_last_error())
     try:
         required = wintypes.DWORD()
         advapi32.GetTokenInformation(token, token_user_class, None, 0, ctypes.byref(required))
-        if get_last_error() != error_insufficient_buffer or required.value == 0:
-            raise win_error(get_last_error())
+        if ctypes_api.get_last_error() != error_insufficient_buffer or required.value == 0:
+            raise ctypes_api.WinError(ctypes_api.get_last_error())
         buffer = ctypes.create_string_buffer(required.value)
         if not advapi32.GetTokenInformation(
             token,
@@ -780,11 +777,11 @@ def _windows_current_user_sid() -> str:
             required,
             ctypes.byref(required),
         ):
-            raise win_error(get_last_error())
+            raise ctypes_api.WinError(ctypes_api.get_last_error())
         token_user = ctypes.cast(buffer, ctypes.POINTER(TokenUser)).contents
         sid = wintypes.LPWSTR()
         if not advapi32.ConvertSidToStringSidW(token_user.user.sid, ctypes.byref(sid)):
-            raise win_error(get_last_error())
+            raise ctypes_api.WinError(ctypes_api.get_last_error())
         try:
             value = sid.value
             if not value:

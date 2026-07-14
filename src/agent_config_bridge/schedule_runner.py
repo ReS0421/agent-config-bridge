@@ -322,7 +322,7 @@ class _TargetLock:
 
 
 def _lock_posix(stream: BinaryIO) -> bool:
-    import fcntl
+    fcntl: Any = importlib.import_module("fcntl")
 
     try:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -332,7 +332,7 @@ def _lock_posix(stream: BinaryIO) -> bool:
 
 
 def _unlock_posix(stream: BinaryIO) -> None:
-    import fcntl
+    fcntl: Any = importlib.import_module("fcntl")
 
     fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
