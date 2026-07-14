@@ -16,6 +16,7 @@ from agent_config_bridge.schedule_store import (
     remove_schedule_set,
     render_schedule_set,
     schedule_publish_path,
+    schedule_set_digest,
     schedule_set_is_current,
 )
 from agent_config_bridge.schedules import discover_schedules
@@ -70,6 +71,22 @@ def test_schedule_set_changes_after_canonical_prompt_change(tmp_path: Path) -> N
 
     assert second.digest != first.digest
     assert second.schedules[0].prompt == "Use the updated prompt.\n"
+
+
+def test_schedule_set_is_stable_across_source_line_endings(tmp_path: Path) -> None:
+    """A Windows checkout does not create a different immutable build."""
+
+    config, target, schedules = _schedule_context(tmp_path)
+    first = render_schedule_set(config, schedules, target)
+    prompt = config.catalog / "schedules/daily-review/PROMPT.md"
+    prompt.write_bytes(b"Run the daily-review workflow.\r\n")
+
+    rediscovered = discover_schedules(config)
+
+    assert rediscovered.schedules[0].prompt == "Run the daily-review workflow.\n"
+    assert schedule_set_digest(rediscovered, target) == first.digest
+    assert schedule_set_is_current(config, rediscovered, target)
+    assert render_schedule_set(config, rediscovered, target) == first
 
 
 def test_read_schedule_set_rejects_modified_snapshot(tmp_path: Path) -> None:

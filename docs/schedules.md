@@ -39,9 +39,11 @@ The fields are:
 | `working_directory` | Yes | Portable POSIX-style path relative to target `user_home` |
 | `timeout_seconds` | No | Integer `1..86400`; default `1800` |
 
-`PROMPT.md` must be non-empty UTF-8 text. The bridge passes that text to the
-product CLI on standard input; it is never inserted into a shell command or
-environment variable.
+`PROMPT.md` must be non-empty UTF-8 text. Discovery normalizes CRLF and lone CR
+line endings to LF so Git checkout settings do not change snapshot identity or
+vendor input across operating systems. The bridge passes the normalized text
+to the product CLI on standard input; it is never inserted into a shell command
+or environment variable.
 
 The cron parser accepts wildcards, numeric values, inclusive ranges,
 wildcard/range steps, and comma-separated lists. It rejects names and

@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecutionTimeLimit=PT0S`; canonical Schedule timeouts bound vendor processes.
 - Target identity cleanup with `components = []` now reconciles all five
   component classes before a target is renamed, moved, disabled, or deleted.
+- Schedule prompt discovery normalizes CRLF and lone CR line endings to LF so
+  equivalent Windows and POSIX checkouts produce the same immutable snapshot.
 
 ### Security
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -121,10 +122,7 @@ def test_linux_plan_is_read_only_and_apply_is_idempotent(tmp_path: Path) -> None
     assert backend.apply(spec, plan)
     assert runner.document is not None
     assert "* * * * * " in runner.document
-    assert (
-        f"{spec.agentbridge_executable} schedule tick --config {spec.config_path} --target {spec.target} "
-        f"--vendor-executable {spec.vendor_executable}" in runner.document
-    )
+    assert shlex.join(spec.argv).replace("%", r"\%") in runner.document
 
     noop = backend.plan(spec)
     write_count = sum(argv != ("crontab", "-l") for argv, _stdin in runner.calls)

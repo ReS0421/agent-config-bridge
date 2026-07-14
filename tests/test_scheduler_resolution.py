@@ -33,6 +33,12 @@ def _write_launcher(path: Path) -> Path:
     return path
 
 
+def _agentbridge_launcher_name() -> str:
+    """Return a host-native console launcher name for resolver tests."""
+
+    return "agentbridge.EXE" if os.name == "nt" else "agentbridge"
+
+
 def _os_with_access(*, allowed: bool) -> SimpleNamespace:
     return SimpleNamespace(path=os.path, fspath=os.fspath, X_OK=os.X_OK, access=lambda _path, _mode: allowed)
 
@@ -132,8 +138,9 @@ def test_agentbridge_resolver_prefers_validated_absolute_current_invocation(
 ) -> None:
     """The already-running console entry point wins over later PATH lookup."""
 
-    current = _write_launcher(tmp_path / "installed/bin/agentbridge")
-    malicious = _write_launcher(tmp_path / "checkout/agentbridge")
+    launcher_name = _agentbridge_launcher_name()
+    current = _write_launcher(tmp_path / "installed/bin" / launcher_name)
+    malicious = _write_launcher(tmp_path / "checkout" / launcher_name)
     monkeypatch.setattr(sys, "argv", [str(current)])
     monkeypatch.setenv("PATH", str(malicious.parent))
 
@@ -148,8 +155,9 @@ def test_agentbridge_path_fallback_excludes_current_directory(
 
     checkout = tmp_path / "checkout"
     checkout.mkdir()
-    _write_launcher(checkout / "agentbridge")
-    trusted = _write_launcher(tmp_path / "trusted/bin/agentbridge")
+    launcher_name = _agentbridge_launcher_name()
+    _write_launcher(checkout / launcher_name)
+    trusted = _write_launcher(tmp_path / "trusted/bin" / launcher_name)
     monkeypatch.chdir(checkout)
     monkeypatch.setattr(sys, "argv", ["pytest"])
     monkeypatch.setenv("PATH", os.pathsep.join((str(checkout), str(trusted.parent))))

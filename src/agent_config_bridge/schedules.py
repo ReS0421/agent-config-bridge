@@ -152,7 +152,7 @@ class CronExpression:
 
 @dataclass(frozen=True, slots=True)
 class ScheduleDefinition:
-    """A strict canonical schedule and its exact prompt text."""
+    """A strict canonical schedule and its LF-normalized prompt text."""
 
     name: str
     source: Path
@@ -554,7 +554,7 @@ def _load_schedule(root: Path, name: str) -> ScheduleDefinition:
     prompt_bytes = _read_bounded_file(prompt_path, _MAX_PROMPT_BYTES, "schedule prompt")
     try:
         document = tomllib.loads(schedule_bytes.decode("utf-8"))
-        prompt = prompt_bytes.decode("utf-8")
+        prompt = _normalize_prompt_newlines(prompt_bytes.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise ScheduleError(f"invalid schedule source in {root}: {error}") from error
 
@@ -609,6 +609,19 @@ def _parse_relative_working_directory(value: str, schedule_name: str) -> PurePos
         if part.rstrip(" .").partition(".")[0].casefold() in _WINDOWS_DEVICE_NAMES:
             raise ScheduleError(f"schedule {schedule_name!r} working_directory uses a Windows reserved name: {part!r}")
     return path
+
+
+def _normalize_prompt_newlines(prompt: str) -> str:
+    """Return one platform-independent representation of prompt line endings.
+
+    Git checkout settings and text editors commonly materialize the same
+    Markdown source with LF or CRLF line endings.  Schedule snapshots must not
+    change just because discovery runs on another operating system, so the
+    catalog boundary applies the same universal-newline semantics as Python's
+    text readers while the bounded source read remains byte based.
+    """
+
+    return prompt.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _parse_timeout(value: object, schedule_name: str) -> int:

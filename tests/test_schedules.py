@@ -110,6 +110,19 @@ def test_discover_schedules_loads_sorted_strict_definitions(tmp_path: Path) -> N
         alpha.name = "changed"  # type: ignore[misc]
 
 
+def test_discover_schedules_normalizes_prompt_line_endings(tmp_path: Path) -> None:
+    """Equivalent Windows and POSIX Markdown becomes one logical prompt."""
+
+    catalog = tmp_path / "catalog"
+    catalog.mkdir()
+    root = _write_schedule(catalog)
+    (root / "PROMPT.md").write_bytes(b"First line\r\n\r\nSecond line\rThird line\n")
+
+    inventory = discover_schedules(catalog)
+
+    assert inventory.schedules[0].prompt == "First line\n\nSecond line\nThird line\n"
+
+
 def test_discover_schedules_returns_empty_for_missing_group(tmp_path: Path) -> None:
     """Catalogs can omit the optional schedules component."""
 
