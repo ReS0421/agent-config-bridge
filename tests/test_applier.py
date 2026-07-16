@@ -13,6 +13,7 @@ from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.filesystem import MANAGED_MARKER
 from agent_config_bridge.models import Component, LinkMode, Platform
 from agent_config_bridge.planner import Disposition, build_plan
+from agent_config_bridge.provenance import read_skill_root_marker
 from agent_config_bridge.state import BridgeStateError, read_skill_state
 from tests.conftest import make_catalog, make_config, require_directory_symlink_support
 
@@ -270,3 +271,58 @@ def test_deselection_conflicts_with_modified_managed_copy(tmp_path: Path) -> Non
 
     assert plan.has_conflicts
     assert destination.is_dir()
+
+
+def test_apply_writes_visible_root_provenance_marker(tmp_path: Path) -> None:
+    """Every apply leaves a self-explanatory marker at the skill root."""
+
+    require_directory_symlink_support(tmp_path)
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog)
+    inventory = discover_catalog(config)
+
+    apply_plan(config, inventory, build_plan(config, inventory))
+
+    payload = read_skill_root_marker(config.targets[0])
+    assert payload is not None
+    assert payload["target"] == "target"
+    assert payload["mode"] == "symlink"
+    assert payload["skill_count"] == 1
+
+
+def test_deselection_apply_removes_root_provenance_marker(tmp_path: Path) -> None:
+    """A root that stops being bridge-managed stops claiming to be."""
+
+    require_directory_symlink_support(tmp_path)
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog)
+    inventory = discover_catalog(config)
+    apply_plan(config, inventory, build_plan(config, inventory))
+    assert read_skill_root_marker(config.targets[0]) is not None
+
+    target = replace(config.targets[0], components=frozenset())
+    deselected = replace(config, components=frozenset(), targets=(target,))
+    apply_plan(deselected, discover_catalog(deselected), build_plan(deselected, discover_catalog(deselected)))
+
+    assert read_skill_root_marker(target) is None
+
+
+def test_apply_survives_a_squatted_marker_path_with_a_warning(tmp_path: Path) -> None:
+    """A symlink squatting on the marker path degrades to a warning, not a failed apply."""
+
+    require_directory_symlink_support(tmp_path)
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog)
+    root = tmp_path / "home/.agents/skills"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}\n", encoding="utf-8")
+    (root / "AGENTBRIDGE-MANAGED.json").symlink_to(outside)
+    inventory = discover_catalog(config)
+
+    result = apply_plan(config, inventory, build_plan(config, inventory))
+
+    assert (root / "hello").is_symlink()
+    assert read_skill_state(config, config.targets[0])
+    assert len(result.warnings) == 1
+    assert "provenance marker was not updated" in result.warnings[0]

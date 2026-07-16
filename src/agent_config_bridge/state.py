@@ -22,6 +22,7 @@ __all__ = [
     "SettingsState",
     "SkillStateEntry",
     "desired_plugin_names",
+    "effective_link_mode",
     "find_orphaned_target_states",
     "read_registration_state",
     "read_scheduler_state",
@@ -32,6 +33,7 @@ __all__ = [
     "registration_marketplace_source",
     "scheduler_state_path",
     "settings_state_path",
+    "skill_root_for_target",
     "skill_state_path",
     "write_registered_plugins",
     "write_scheduler_state",
@@ -387,7 +389,7 @@ def write_skill_state(
 
     entries: list[dict[str, Any]] = []
     if Component.SKILLS in target.components:
-        mode = _effective_link_mode(config.link_mode, target.platform)
+        mode = effective_link_mode(config.link_mode, target.platform)
         for skill in inventory.skills:
             entries.append(
                 {
@@ -413,10 +415,20 @@ def write_skill_state(
     )
 
 
-def _effective_link_mode(mode: LinkMode, platform: Platform) -> LinkMode:
+def effective_link_mode(mode: LinkMode, platform: Platform) -> LinkMode:
+    """Resolve AUTO into the concrete installation mode used on one platform."""
+
     if mode is not LinkMode.AUTO:
         return mode
     return LinkMode.COPY if platform is Platform.WINDOWS else LinkMode.SYMLINK
+
+
+def skill_root_for_target(target: TargetConfig) -> Path:
+    """Return the standalone Skill discovery root one target deploys into."""
+
+    if target.product is Product.CODEX:
+        return target.user_home / ".agents" / "skills"
+    return target.config_home / "skills"
 
 
 def find_orphaned_target_states(config: BridgeConfig) -> tuple[str, ...]:
@@ -451,9 +463,7 @@ def find_orphaned_target_states(config: BridgeConfig) -> tuple[str, ...]:
 
 
 def _skill_identity(target: TargetConfig) -> dict[str, str]:
-    skill_root = (
-        target.user_home / ".agents" / "skills" if target.product is Product.CODEX else target.config_home / "skills"
-    )
+    skill_root = skill_root_for_target(target)
     return {
         "product": target.product.value,
         "platform": target.platform.value,
