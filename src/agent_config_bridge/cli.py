@@ -18,6 +18,15 @@ from agent_config_bridge.catalog import CatalogError, CatalogInventory, discover
 from agent_config_bridge.config import ConfigError, load_config
 from agent_config_bridge.doctor import CheckLevel, run_doctor
 from agent_config_bridge.filesystem import FilesystemError
+from agent_config_bridge.governance import (
+    GovernanceError,
+    GovernanceFinding,
+    GovernanceSeverity,
+    build_registry_payload,
+    registry_path,
+    run_governance,
+    serialize_registry,
+)
 from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key
 from agent_config_bridge.planner import CommandHint, SyncPlan, build_plan
@@ -73,6 +82,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             config = load_config(Path(args.config))
             return _command_schedule(config, args)
         config, inventory = _load_context(Path(args.config))
+        if args.command == "registry":
+            return _command_registry(inventory, args.registry_command, args.json)
         if args.command == "validate":
             return _command_validate(inventory, args.json)
         if args.command == "render":
@@ -92,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         CatalogError,
         ConfigError,
         FilesystemError,
+        GovernanceError,
         RenderError,
         BridgeStateError,
         ScheduleBackendError,
@@ -186,6 +198,19 @@ def _build_parser() -> argparse.ArgumentParser:
                 default=[],
                 help="register one configured target; repeat to select multiple",
             )
+
+    registry_parser = subparsers.add_parser(
+        "registry",
+        help="generate or drift-check the governed capability registry",
+    )
+    registry_subparsers = registry_parser.add_subparsers(dest="registry_command", required=True)
+    for registry_command, help_text in (
+        ("generate", "regenerate catalog/registry.json from governance manifests"),
+        ("check", "verify manifests and byte-compare the committed registry snapshot"),
+    ):
+        registry_command_parser = registry_subparsers.add_parser(registry_command, help=help_text)
+        registry_command_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+        registry_command_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser
 
 
@@ -193,6 +218,76 @@ def _load_context(config_path: Path) -> tuple[BridgeConfig, CatalogInventory]:
     config = load_config(config_path)
     inventory = discover_catalog(config)
     return config, inventory
+
+
+def _command_registry(inventory: CatalogInventory, registry_command: str, as_json: bool) -> int:
+    report = run_governance(inventory)
+    payload = build_registry_payload(report.manifests, inventory)
+    blob = serialize_registry(payload)
+    findings = list(report.findings)
+    snapshot = registry_path(inventory)
+
+    wrote = False
+    if registry_command == "check":
+        committed = snapshot.read_bytes() if snapshot.is_file() and not snapshot.is_symlink() else b""
+        if committed != blob:
+            findings.append(
+                GovernanceFinding(
+                    "GOV050",
+                    GovernanceSeverity.ERROR,
+                    detail=f"registry snapshot drift: {snapshot} does not match the regenerated payload",
+                )
+            )
+    elif not report.has_error:
+        if snapshot.is_symlink():
+            raise GovernanceError(f"refusing to write registry through a symlink: {snapshot}")
+        temporary = snapshot.with_name(f".{snapshot.name}.tmp")
+        try:
+            temporary.write_bytes(blob)
+            os.replace(temporary, snapshot)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise GovernanceError(f"could not write registry snapshot: {snapshot}: {exc}") from exc
+        wrote = True
+
+    errors = [finding for finding in findings if finding.severity is GovernanceSeverity.ERROR]
+    warnings = [finding for finding in findings if finding.severity is GovernanceSeverity.WARNING]
+    if as_json:
+        _print_json(
+            {
+                "mode": report.mode.value,
+                "manifests": len(report.manifests),
+                "capabilities": len(payload["capabilities"]),
+                "registry": str(snapshot),
+                "written": wrote,
+                "findings": [asdict(finding) for finding in findings],
+            }
+        )
+    else:
+        print(
+            f"mode={report.mode.value}  manifests={len(report.manifests)}  "
+            f"capabilities={len(payload['capabilities'])}  errors={len(errors)}  warnings={len(warnings)}"
+        )
+        for finding in sorted(errors, key=lambda item: (item.code, item.artifact_ref or "", item.capability_id or "")):
+            print(f"  ERROR   {finding.code} {finding.capability_id or finding.artifact_ref or '-'}: {finding.detail}")
+        coverage = [finding for finding in warnings if finding.code == "GOV030"]
+        for finding in sorted(
+            (finding for finding in warnings if finding.code != "GOV030"),
+            key=lambda item: (item.code, item.artifact_ref or ""),
+        ):
+            print(f"  WARN    {finding.code} {finding.artifact_ref or finding.capability_id or '-'}: {finding.detail}")
+        if coverage:
+            print(
+                f"  WARN    GOV030 x{len(coverage)}: artifacts without a governance manifest ({report.mode.value} mode)"
+            )
+        if registry_command == "check":
+            drifted = any(finding.code == "GOV050" for finding in errors)
+            print(f"registry check: {'DRIFT' if drifted else 'committed snapshot matches'} ({snapshot})")
+        elif wrote:
+            print(f"wrote registry: {snapshot} ({len(blob)} bytes)")
+        else:
+            print("registry not written: resolve manifest errors first")
+    return 1 if errors else 0
 
 
 def _command_migrate_skills(args: argparse.Namespace) -> int:

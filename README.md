@@ -45,6 +45,11 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   skill root, so humans and agents inspecting the directory can tell it is a
   managed projection of the catalog rather than an accidental duplicate
   (written by `apply`, checked by `doctor`)
+- A governance core (hand-authored `catalog/governance/*.toml` manifests as
+  source of truth, ADR-1 capability axes, `GovernanceFinding` diagnostics) with
+  `registry generate` writing a byte-deterministic committed
+  `catalog/registry.json` and `registry check` gating drift; the active mode is
+  the committed `catalog/governance/policy.toml` (audit implemented)
 - Canonical Codex Skill destination: `~/.agents/skills`
 - Claude Code Skill destination: `~/.claude/skills`
 - Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`
