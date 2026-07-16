@@ -88,11 +88,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _command_validate(inventory, args.json)
         if args.command == "render":
             return _command_render(config, inventory, args.json)
+        if args.command == "doctor":
+            # Doctor must stay usable when required-mode governance errors
+            # block planning; the governance.mode check reports the cause.
+            try:
+                plan = build_plan(config, inventory)
+            except GovernanceError:
+                plan = SyncPlan(actions=(), commands=(), reviews=(), warnings=())
+            return _command_doctor(config, inventory, plan, args.json)
         plan = build_plan(config, inventory)
         if args.command == "plan":
             return _command_plan(plan, args.json)
-        if args.command == "doctor":
-            return _command_doctor(config, inventory, plan, args.json)
         if args.command == "apply":
             return _command_apply(config, inventory, plan, args.yes, args.json)
         if args.command == "register":

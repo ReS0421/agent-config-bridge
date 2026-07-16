@@ -43,7 +43,7 @@ def test_skill_state_round_trip_uses_stable_source_ids(tmp_path: Path) -> None:
     config = make_config(tmp_path, catalog)
     target = config.targets[0]
 
-    write_skill_state(config, target, discover_catalog(config))
+    write_skill_state(config, target, discover_catalog(config).skills)
 
     entries = read_skill_state(config, target)
     assert entries[0].source_id == "skills/hello"
@@ -87,7 +87,7 @@ def test_skill_state_rejects_reused_name_with_different_root(tmp_path: Path) -> 
     catalog = make_catalog(tmp_path / "catalog")
     config = make_config(tmp_path, catalog)
     target = config.targets[0]
-    write_skill_state(config, target, discover_catalog(config))
+    write_skill_state(config, target, discover_catalog(config).skills)
     other_home = tmp_path / "other-home"
     other_home.mkdir()
     changed_target = replace(target, user_home=other_home)
@@ -102,7 +102,7 @@ def test_disabled_target_state_is_reported_as_orphaned(tmp_path: Path) -> None:
 
     catalog = make_catalog(tmp_path / "catalog")
     config = make_config(tmp_path, catalog)
-    write_skill_state(config, config.targets[0], discover_catalog(config))
+    write_skill_state(config, config.targets[0], discover_catalog(config).skills)
     disabled = replace(config.targets[0], enabled=False)
 
     assert find_orphaned_target_states(replace(config, targets=(disabled,))) == ("target",)
@@ -114,7 +114,7 @@ def test_empty_ownership_is_removed_before_target_identity_changes(tmp_path: Pat
     catalog = make_catalog(tmp_path / "catalog")
     config = make_config(tmp_path, catalog)
     target = config.targets[0]
-    write_skill_state(config, target, discover_catalog(config))
+    write_skill_state(config, target, discover_catalog(config).skills)
     write_registered_plugins(config, target, ("shared-plugin",))
 
     empty_target = replace(target, components=frozenset())

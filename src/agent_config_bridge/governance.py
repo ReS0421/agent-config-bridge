@@ -25,7 +25,8 @@ from typing import Any
 
 import yaml
 
-from agent_config_bridge.catalog import CatalogInventory
+from agent_config_bridge.catalog import Artifact, CatalogInventory
+from agent_config_bridge.models import TargetConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point
 
 __all__ = [
@@ -36,12 +37,14 @@ __all__ = [
     "GovernanceMode",
     "GovernanceReport",
     "GovernanceSeverity",
+    "ResolvedInventory",
     "build_registry_payload",
     "governance_root",
     "load_governance",
     "read_governance_mode",
     "registry_path",
     "resolve_artifact_refs",
+    "resolve_inventory",
     "run_governance",
     "serialize_registry",
     "validate_governance",
@@ -126,6 +129,109 @@ class GovernanceReport:
         """Return whether any finding is an error."""
 
         return any(finding.severity is GovernanceSeverity.ERROR for finding in self.findings)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedInventory:
+    """The governance-gated desired inventory (ADR-2 §3 runtime resolver).
+
+    Owned by the governance core so plan/apply consume one desired-state
+    definition instead of re-deriving it from raw catalog contents.
+    """
+
+    report: GovernanceReport
+    inventory: CatalogInventory
+
+    def skills_for_target(self, target: TargetConfig) -> tuple[Artifact, ...]:
+        """Return the standalone Skills this target should deploy.
+
+        Surface matching is any-overlap: standalone Skills share one
+        filesystem root per target, so a manifest cannot exclude one surface
+        of a target that has several — declaring ``surfaces = ["cli"]`` does
+        not hide the skill from Desktop on a cli+desktop target.
+        """
+
+        if self.report.mode is GovernanceMode.AUDIT:
+            return self.inventory.skills
+        desired: set[str] = set()
+        for manifest in self.report.manifests:
+            data = manifest.data
+            if data.get("lifecycle") not in _DEPLOYABLE_LIFECYCLES:
+                continue
+            if not _manifest_supports_target(data.get("targets", []), target):
+                continue
+            for artifact in data.get("artifacts", []):
+                if isinstance(artifact, dict):
+                    ref = artifact.get("ref", "")
+                    if isinstance(ref, str) and ref.startswith("skills/"):
+                        desired.add(ref.removeprefix("skills/"))
+        return tuple(skill for skill in self.inventory.skills if skill.name in desired)
+
+
+_TARGET_PRODUCTS = frozenset({"codex", "claude-code"})
+_TARGET_PLATFORMS = frozenset({"linux", "windows"})
+_TARGET_SURFACES = frozenset({"cli", "desktop"})
+
+
+def _check_target_blocks(
+    manifest: GovernanceManifest,
+    mode: GovernanceMode,
+) -> tuple[GovernanceFinding, ...]:
+    """Validate [[targets]] field values so a typo cannot silently match nothing.
+
+    A block with an unknown product/platform, or a missing/empty/unknown
+    surfaces list, would pass tomllib and GOV026 yet never match any
+    configured target — retracting the capability everywhere without a single
+    finding. That is exactly the silent failure required mode exists to
+    prevent, so it is an error there (warning in audit).
+    """
+
+    severity = GovernanceSeverity.ERROR if mode is GovernanceMode.REQUIRED else GovernanceSeverity.WARNING
+    findings: list[GovernanceFinding] = []
+    targets = manifest.data.get("targets", [])
+    if not isinstance(targets, list):
+        return (GovernanceFinding("GOV027", severity, manifest.id, detail="targets must be [[targets]] tables"),)
+    for index, block in enumerate(targets):
+        if not isinstance(block, dict):
+            findings.append(
+                GovernanceFinding("GOV027", severity, manifest.id, detail=f"targets[{index}] is not a table")
+            )
+            continue
+        problems: list[str] = []
+        if block.get("product") not in _TARGET_PRODUCTS:
+            problems.append(f"product={block.get('product')!r} not in {sorted(_TARGET_PRODUCTS)}")
+        if block.get("platform") not in _TARGET_PLATFORMS:
+            problems.append(f"platform={block.get('platform')!r} not in {sorted(_TARGET_PLATFORMS)}")
+        surfaces = block.get("surfaces")
+        if not isinstance(surfaces, list) or not surfaces or not set(surfaces) <= _TARGET_SURFACES:
+            problems.append(f"surfaces={surfaces!r} must be a non-empty subset of {sorted(_TARGET_SURFACES)}")
+        if problems:
+            findings.append(
+                GovernanceFinding(
+                    "GOV027",
+                    severity,
+                    manifest.id,
+                    detail=f"targets[{index}]: " + "; ".join(problems),
+                )
+            )
+    return tuple(findings)
+
+
+def _manifest_supports_target(targets: object, target: TargetConfig) -> bool:
+    if not isinstance(targets, list):
+        return False
+    for block in targets:
+        if not isinstance(block, dict):
+            continue
+        surfaces = block.get("surfaces", [])
+        if (
+            block.get("product") == target.product.value
+            and block.get("platform") == target.platform.value
+            and isinstance(surfaces, list)
+            and any(surface.value in surfaces for surface in target.surfaces)
+        ):
+            return True
+    return False
 
 
 def governance_root(inventory: CatalogInventory) -> Path:
@@ -278,7 +384,7 @@ def validate_governance(
     """Validate axis legality, reservations, coverage, and skill frontmatter."""
 
     findings: list[GovernanceFinding] = []
-    governed_refs: set[str] = set()
+    governed_by: dict[str, list[str]] = {}
     for manifest in manifests:
         data = manifest.data
         kind = data.get("capability_kind")
@@ -322,7 +428,7 @@ def validate_governance(
         artifacts = data.get("artifacts", [])
         for artifact in artifacts:
             if isinstance(artifact, dict):
-                governed_refs.add(artifact.get("ref", ""))
+                governed_by.setdefault(artifact.get("ref", ""), []).append(manifest.id)
                 if lifecycle == "active" and "provenance" not in artifact:
                     findings.append(
                         GovernanceFinding(
@@ -358,6 +464,18 @@ def validate_governance(
                             detail=f"active capability missing required field {required_field!r}",
                         )
                     )
+        if lifecycle in _DEPLOYABLE_LIFECYCLES and not data.get("targets"):
+            # In required mode a deployable manifest with no targets would be
+            # silently retracted everywhere; make that loud instead.
+            findings.append(
+                GovernanceFinding(
+                    "GOV026",
+                    GovernanceSeverity.ERROR if mode is GovernanceMode.REQUIRED else GovernanceSeverity.WARNING,
+                    manifest.id,
+                    detail="deployable capability declares no [[targets]]",
+                )
+            )
+        findings.extend(_check_target_blocks(manifest, mode))
         # Deferred ADR-2 §6 rule: per-target delivery mutual-exclusivity
         # (plugin XOR settings-fragment for one capability on one target) only
         # becomes checkable once event-handler manifests exist; it lands with
@@ -365,7 +483,7 @@ def validate_governance(
 
     coverage_severity = GovernanceSeverity.WARNING if mode is GovernanceMode.AUDIT else GovernanceSeverity.ERROR
     for ref in _inventory_refs(inventory):
-        if ref not in governed_refs:
+        if ref not in governed_by:
             findings.append(
                 GovernanceFinding(
                     "GOV030",
@@ -373,6 +491,17 @@ def validate_governance(
                     None,
                     ref,
                     detail="artifact has no governance manifest",
+                )
+            )
+    for ref, owners in governed_by.items():
+        if len(owners) > 1:
+            findings.append(
+                GovernanceFinding(
+                    "GOV031",
+                    GovernanceSeverity.WARNING,
+                    None,
+                    ref or None,
+                    detail=f"artifact is governed by multiple manifests: {sorted(owners)}",
                 )
             )
     for skill in inventory.skills:
@@ -391,14 +520,39 @@ def run_governance(inventory: CatalogInventory) -> GovernanceReport:
 
     root = governance_root(inventory)
     mode = read_governance_mode(root)
-    if mode is not GovernanceMode.AUDIT:
+    if mode is GovernanceMode.PUBLIC_EXPORT:
         raise GovernanceError(
-            f"governance mode {mode.value!r} is committed in policy but not implemented yet; "
-            "this Bridge version enforces audit only"
+            "governance mode 'public-export' is committed in policy but not implemented yet; "
+            "this Bridge version enforces audit and required only"
         )
     manifests, load_findings = load_governance(root)
     findings = load_findings + validate_governance(manifests, inventory, mode)
     return GovernanceReport(mode=mode, manifests=manifests, findings=findings)
+
+
+def resolve_inventory(inventory: CatalogInventory) -> ResolvedInventory:
+    """Resolve the governance-gated desired inventory for runtime consumers.
+
+    In ``audit`` mode governance never gates runtime selection, so the desired
+    set is the full catalog inventory. In ``required`` mode a standalone Skill
+    is desired only when a governing manifest exists, its ``lifecycle`` is
+    deployable (active/deprecated), and the consuming target matches one of
+    the manifest's ``[[targets]]`` blocks.
+
+    Raises:
+        GovernanceError: In ``required`` mode when governance findings contain
+            any error — a desired state derived from an invalid ledger would
+            silently deploy or retract the wrong artifacts.
+    """
+
+    report = run_governance(inventory)
+    if report.mode is GovernanceMode.REQUIRED and report.has_error:
+        errors = sorted({finding.code for finding in report.findings if finding.severity is GovernanceSeverity.ERROR})
+        raise GovernanceError(
+            "governance mode is 'required' but the ledger has errors "
+            f"({', '.join(errors)}); run `agentbridge registry check` and fix them before planning"
+        )
+    return ResolvedInventory(report=report, inventory=inventory)
 
 
 def build_registry_payload(

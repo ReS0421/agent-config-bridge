@@ -10,6 +10,7 @@ from pathlib import Path
 
 from agent_config_bridge.catalog import Artifact, CatalogInventory
 from agent_config_bridge.filesystem import read_managed_marker, tree_digest
+from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key, paths_overlap, read_symlink_target
 from agent_config_bridge.platforms import (
@@ -136,13 +137,24 @@ class SyncPlan:
         )
 
 
-def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
-    """Build a synchronization plan without writing to disk."""
+def build_plan(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    *,
+    resolved: ResolvedInventory | None = None,
+) -> SyncPlan:
+    """Build a synchronization plan without writing to disk.
+
+    ``resolved`` lets apply reuse one governance read for plan verification
+    and ownership writes instead of re-reading governance files per call.
+    """
 
     actions: list[Action] = []
     reviews: list[str] = []
     warnings: list[str] = []
     enabled_targets = tuple(target for target in config.targets if target.enabled)
+    if resolved is None:
+        resolved = resolve_inventory(inventory)
     host_platform = current_platform()
     previous_skills_by_target = {target.name: read_skill_state(config, target) for target in enabled_targets}
     _validate_skill_root_reservations(enabled_targets, previous_skills_by_target)
@@ -192,7 +204,7 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
         if Component.SKILLS in target.components:
             destination_root = _skill_destination(target)
             mode = effective_link_mode(config.link_mode, target.platform)
-            for skill in inventory.skills:
+            for skill in resolved.skills_for_target(target):
                 selected_skill_names.add(skill.name)
                 actions.append(
                     _plan_skill(

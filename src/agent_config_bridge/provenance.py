@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_config_bridge.catalog import CatalogInventory
+from agent_config_bridge.catalog import Artifact
 from agent_config_bridge.models import BridgeConfig, Component, TargetConfig
 from agent_config_bridge.state import BridgeStateError, effective_link_mode, skill_root_for_target
 
@@ -45,7 +45,7 @@ _NOTICE = (
 def write_skill_root_marker(
     config: BridgeConfig,
     target: TargetConfig,
-    inventory: CatalogInventory,
+    skills: tuple[Artifact, ...],
 ) -> Path | None:
     """Write or refresh the visible marker at one target's skill root.
 
@@ -57,7 +57,7 @@ def write_skill_root_marker(
         BridgeStateError: If a symlink squats on the marker path or the write fails.
     """
 
-    if Component.SKILLS not in target.components or not inventory.skills:
+    if Component.SKILLS not in target.components or not skills:
         _remove_marker_if_owned(target)
         return None
     root = skill_root_for_target(target)
@@ -77,7 +77,7 @@ def write_skill_root_marker(
         "mode": effective_link_mode(config.link_mode, target.platform).value,
         "catalog_root": str(config.catalog.resolve()),
         "state_dir": str(config.state_dir.resolve()),
-        "skill_count": len(inventory.skills),
+        "skill_count": len(skills),
         "applied_at": datetime.now(UTC).astimezone().isoformat(timespec="seconds"),
     }
     temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")

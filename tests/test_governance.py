@@ -136,17 +136,6 @@ def test_policy_file_sets_mode_and_is_never_a_manifest(tmp_path: Path) -> None:
     assert not report.has_error
 
 
-def test_unenforceable_committed_mode_refuses_to_pass(tmp_path: Path) -> None:
-    """A committed required/public-export mode must not silently run as audit."""
-
-    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
-    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
-    config = make_config(tmp_path, catalog)
-
-    with pytest.raises(GovernanceError):
-        run_governance(discover_catalog(config))
-
-
 def test_invalid_policy_is_an_error_not_a_default(tmp_path: Path) -> None:
     """Malformed or unknown policy content raises instead of degrading."""
 
@@ -381,3 +370,231 @@ def test_symlinked_governance_dir_and_manifest_are_refused(tmp_path: Path) -> No
     (governance / "sneaky.toml").symlink_to(outside / "sneaky.toml")
     with pytest.raises(GovernanceError):
         load_governance(governance)
+
+
+def _required_manifest(identifier: str, *, lifecycle: str = "active", targets: str | None = None) -> str:
+    """A manifest with provenance and explicit codex/linux target blocks."""
+
+    target_blocks = (
+        targets
+        if targets is not None
+        else '[[targets]]\nproduct = "codex"\nplatform = "linux"\nsurfaces = ["cli", "desktop"]\n'
+    )
+    return (
+        f'id = "{identifier}"\n'
+        'capability_kind = "skill"\n'
+        'delivery = "standalone"\n'
+        f'lifecycle = "{lifecycle}"\n'
+        'failure_policy = "advisory"\n'
+        'owner = "test"\n'
+        'last_reviewed = "2026-07-16"\n'
+        f"{target_blocks}"
+        "[[artifacts]]\n"
+        f'ref = "skills/{identifier}"\n'
+        "[artifacts.provenance]\n"
+        'origin = "local-original"\n'
+    )
+
+
+def _required_catalog(tmp_path: Path, *skills: str) -> Path:
+    catalog = make_catalog(tmp_path / "catalog", skills=skills)
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    return catalog
+
+
+def test_required_mode_escalates_coverage_to_error(tmp_path: Path) -> None:
+    """GOV030 is an error under required, so resolution refuses to run."""
+
+    from agent_config_bridge.governance import resolve_inventory
+
+    catalog = _required_catalog(tmp_path, "good")
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+    gov030 = [finding for finding in report.findings if finding.code == "GOV030"]
+    assert gov030 and all(finding.severity is GovernanceSeverity.ERROR for finding in gov030)
+
+    with pytest.raises(GovernanceError, match="GOV030"):
+        resolve_inventory(discover_catalog(config))
+
+
+def test_resolved_inventory_gates_by_lifecycle_and_target(tmp_path: Path) -> None:
+    """Only deployable manifests matching the target's product/platform deploy."""
+
+    from agent_config_bridge.governance import resolve_inventory
+
+    catalog = _required_catalog(tmp_path, "active-one", "quarantined-one", "other-product")
+    _write(catalog / "governance" / "active-one.toml", _required_manifest("active-one"))
+    _write(
+        catalog / "governance" / "quarantined-one.toml", _required_manifest("quarantined-one", lifecycle="quarantined")
+    )
+    _write(
+        catalog / "governance" / "other-product.toml",
+        _required_manifest(
+            "other-product",
+            targets='[[targets]]\nproduct = "claude-code"\nplatform = "windows"\nsurfaces = ["cli"]\n',
+        ),
+    )
+    config = make_config(tmp_path, catalog)
+
+    resolved = resolve_inventory(discover_catalog(config))
+    names = [skill.name for skill in resolved.skills_for_target(config.targets[0])]
+
+    assert names == ["active-one"]
+
+
+def test_audit_mode_resolution_never_gates(tmp_path: Path) -> None:
+    """Audit mode resolves the full inventory even without manifests."""
+
+    from agent_config_bridge.governance import resolve_inventory
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    config = make_config(tmp_path, catalog)
+
+    resolved = resolve_inventory(discover_catalog(config))
+
+    assert [skill.name for skill in resolved.skills_for_target(config.targets[0])] == ["good"]
+
+
+def test_required_plan_deploys_gated_set_and_retracts_quarantined(tmp_path: Path) -> None:
+    """The planner consumes ResolvedInventory: quarantine retracts a deployed skill."""
+
+    from agent_config_bridge.applier import apply_plan
+    from agent_config_bridge.planner import Disposition, build_plan
+    from tests.conftest import require_directory_symlink_support
+
+    require_directory_symlink_support(tmp_path)
+    catalog = _required_catalog(tmp_path, "keeper", "victim")
+    _write(catalog / "governance" / "keeper.toml", _required_manifest("keeper"))
+    _write(catalog / "governance" / "victim.toml", _required_manifest("victim"))
+    config = make_config(tmp_path, catalog)
+    inventory = discover_catalog(config)
+    apply_plan(config, inventory, build_plan(config, inventory))
+    root = tmp_path / "home/.agents/skills"
+    assert (root / "keeper").is_symlink() and (root / "victim").is_symlink()
+
+    _write(catalog / "governance" / "victim.toml", _required_manifest("victim", lifecycle="quarantined"))
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    removals = [action for action in plan.actions if action.disposition is Disposition.REMOVE]
+    assert [action.name for action in removals] == ["victim"]
+
+    apply_plan(config, inventory, plan)
+    assert (root / "keeper").is_symlink()
+    assert not (root / "victim").exists()
+
+    from agent_config_bridge.state import read_skill_state
+
+    assert [entry.name for entry in read_skill_state(config, config.targets[0])] == ["keeper"]
+    followup = build_plan(config, discover_catalog(config))
+    assert all(action.disposition.value == "noop" for action in followup.actions)
+
+
+def test_deployable_manifest_without_targets_is_loud(tmp_path: Path) -> None:
+    """GOV026: silent everywhere-retraction is surfaced as a finding."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(catalog / "governance" / "good.toml", _manifest("good", lifecycle="active", provenance=True))
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+    gov026 = [finding for finding in report.findings if finding.code == "GOV026"]
+    assert len(gov026) == 1
+    assert gov026[0].severity is GovernanceSeverity.WARNING
+
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    report = run_governance(discover_catalog(config))
+    gov026 = [finding for finding in report.findings if finding.code == "GOV026"]
+    assert gov026[0].severity is GovernanceSeverity.ERROR
+
+
+def test_public_export_mode_still_refuses(tmp_path: Path) -> None:
+    """public-export remains unimplemented and must not run."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "public-export"\n')
+    config = make_config(tmp_path, catalog)
+
+    with pytest.raises(GovernanceError):
+        run_governance(discover_catalog(config))
+
+
+def test_typoed_target_block_is_loud_not_silently_unmatched(tmp_path: Path) -> None:
+    """GOV027: a product typo or missing surfaces cannot silently retract."""
+
+    from agent_config_bridge.governance import resolve_inventory
+
+    catalog = _required_catalog(tmp_path, "good")
+    _write(
+        catalog / "governance" / "good.toml",
+        _required_manifest(
+            "good",
+            targets='[[targets]]\nproduct = "claude"\nplatform = "linux"\nsurfaces = ["cli"]\n',
+        ),
+    )
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+    gov027 = [finding for finding in report.findings if finding.code == "GOV027"]
+    assert len(gov027) == 1
+    assert gov027[0].severity is GovernanceSeverity.ERROR
+    assert "product='claude'" in gov027[0].detail
+    with pytest.raises(GovernanceError, match="GOV027"):
+        resolve_inventory(discover_catalog(config))
+
+    _write(
+        catalog / "governance" / "good.toml",
+        _required_manifest("good", targets='[[targets]]\nproduct = "codex"\nplatform = "linux"\n'),
+    )
+    report = run_governance(discover_catalog(config))
+    gov027 = [finding for finding in report.findings if finding.code == "GOV027"]
+    assert gov027 and "surfaces=None" in gov027[0].detail
+
+
+def test_target_block_typo_is_only_a_warning_in_audit(tmp_path: Path) -> None:
+    """The same GOV027 finding stays advisory while migrating in audit mode."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(
+        catalog / "governance" / "good.toml",
+        _required_manifest(
+            "good",
+            targets='[[targets]]\nproduct = "claude"\nplatform = "linux"\nsurfaces = ["cli"]\n',
+        ),
+    )
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+    gov027 = [finding for finding in report.findings if finding.code == "GOV027"]
+
+    assert gov027 and gov027[0].severity is GovernanceSeverity.WARNING
+
+
+def test_resolve_refuses_on_gov026_alone(tmp_path: Path) -> None:
+    """A deployable manifest without targets blocks required-mode resolution."""
+
+    from agent_config_bridge.governance import resolve_inventory
+
+    catalog = _required_catalog(tmp_path, "good")
+    manifest = _manifest("good", lifecycle="active", provenance=True)
+    _write(catalog / "governance" / "good.toml", manifest)
+    config = make_config(tmp_path, catalog)
+
+    with pytest.raises(GovernanceError, match="GOV026"):
+        resolve_inventory(discover_catalog(config))
+
+
+def test_multiple_manifests_governing_one_artifact_warn(tmp_path: Path) -> None:
+    """GOV031 flags accidental duplicate governance of one artifact ref."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(catalog / "governance" / "one.toml", _manifest("one", ref="skills/good"))
+    _write(catalog / "governance" / "two.toml", _manifest("two", ref="skills/good"))
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+    gov031 = [finding for finding in report.findings if finding.code == "GOV031"]
+
+    assert len(gov031) == 1
+    assert gov031[0].artifact_ref == "skills/good"
+    assert "['one', 'two']" in gov031[0].detail

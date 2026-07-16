@@ -428,7 +428,7 @@ def test_doctor_warns_about_orphaned_disabled_target_state(tmp_path: Path) -> No
     catalog = make_catalog(tmp_path / "catalog")
     config = make_config(tmp_path, catalog)
     inventory = discover_catalog(config)
-    write_skill_state(config, config.targets[0], inventory)
+    write_skill_state(config, config.targets[0], inventory.skills)
     disabled = replace(config.targets[0], enabled=False)
     disabled_config = replace(config, targets=(disabled,))
     plan = build_plan(disabled_config, inventory)
@@ -468,7 +468,7 @@ def test_doctor_accepts_a_marker_written_by_apply(tmp_path: Path) -> None:
     target = config.targets[0]
     (target.user_home / ".agents" / "skills").mkdir(parents=True)
     inventory = discover_catalog(config)
-    write_skill_root_marker(config, target, inventory)
+    write_skill_root_marker(config, target, inventory.skills)
     plan = build_plan(config, inventory)
 
     checks = run_doctor(config, inventory, plan)
@@ -501,7 +501,7 @@ def test_doctor_warns_on_stale_marker_when_catalog_becomes_empty(tmp_path: Path)
     config = make_config(tmp_path, catalog, platform=current_platform())
     target = config.targets[0]
     (target.user_home / ".agents" / "skills").mkdir(parents=True)
-    write_skill_root_marker(config, target, discover_catalog(config))
+    write_skill_root_marker(config, target, discover_catalog(config).skills)
     import shutil as _shutil
 
     _shutil.rmtree(catalog / "skills" / "hello")
@@ -534,7 +534,7 @@ def test_doctor_warns_on_malformed_and_mismatched_markers(tmp_path: Path) -> Non
     assert malformed[0].level is CheckLevel.WARNING
     assert "invalid" in malformed[0].message
 
-    write_skill_root_marker(config, replace(target, name="other"), inventory)
+    write_skill_root_marker(config, replace(target, name="other"), inventory.skills)
     mismatched = [check for check in run_doctor(config, inventory, plan) if check.code == "skills.provenance"]
     assert mismatched[0].level is CheckLevel.WARNING
     assert "expected" in mismatched[0].message
