@@ -301,7 +301,7 @@ def test_plan_warns_about_disabled_target_ownership_state(tmp_path: Path) -> Non
     catalog = make_catalog(tmp_path / "catalog")
     config = make_config(tmp_path, catalog)
     inventory = discover_catalog(config)
-    write_skill_state(config, config.targets[0], inventory)
+    write_skill_state(config, config.targets[0], inventory.skills)
     disabled = replace(config.targets[0], enabled=False)
 
     plan = build_plan(replace(config, targets=(disabled,)), inventory)
@@ -335,7 +335,7 @@ def test_plan_allows_retained_skill_owner_with_passive_shared_consumer(tmp_path:
     config = make_config(tmp_path, catalog, target_name="owner")
     inventory = discover_catalog(config)
     owner = config.targets[0]
-    write_skill_state(config, owner, inventory)
+    write_skill_state(config, owner, inventory.skills)
     cleanup_owner = replace(owner, components=frozenset())
     passive = replace(
         owner,
@@ -375,7 +375,7 @@ def test_plan_rejects_skill_handoff_until_previous_owner_is_reconciled(tmp_path:
     config = make_config(tmp_path, catalog, target_name="old")
     inventory = discover_catalog(config)
     old = config.targets[0]
-    write_skill_state(config, old, inventory)
+    write_skill_state(config, old, inventory.skills)
     cleanup_old = replace(old, components=frozenset())
     new = replace(
         old,
@@ -394,7 +394,7 @@ def test_plan_reserves_skill_root_through_physical_directory_alias(tmp_path: Pat
     config = make_config(tmp_path, catalog, target_name="old")
     inventory = discover_catalog(config)
     old_target = config.targets[0]
-    write_skill_state(config, old_target, inventory)
+    write_skill_state(config, old_target, inventory.skills)
     alias_home = tmp_path / "home-alias"
     symlink_directory_or_skip(alias_home, old_target.user_home)
     cleanup_target = replace(old_target, components=frozenset())
@@ -418,7 +418,7 @@ def test_plan_reserves_windows_skill_root_case_insensitively(tmp_path: Path) -> 
     )
     inventory = discover_catalog(config)
     old_target = config.targets[0]
-    write_skill_state(config, old_target, inventory)
+    write_skill_state(config, old_target, inventory.skills)
     cleanup_target = replace(old_target, components=frozenset())
     case_variant_home = Path(str(old_target.user_home).upper())
     new_target = replace(old_target, name="new", user_home=case_variant_home)
@@ -435,7 +435,7 @@ def test_plan_reserves_skill_root_against_nested_discovery_root(tmp_path: Path) 
     config = make_config(tmp_path, catalog, target_name="old")
     inventory = discover_catalog(config)
     old_target = config.targets[0]
-    write_skill_state(config, old_target, inventory)
+    write_skill_state(config, old_target, inventory.skills)
     cleanup_target = replace(old_target, components=frozenset())
     old_root = old_target.user_home / ".agents/skills"
     nested_target = replace(
@@ -458,7 +458,7 @@ def test_plan_reserves_skill_root_against_other_config_home(tmp_path: Path) -> N
     config = make_config(tmp_path, catalog, target_name="old")
     inventory = discover_catalog(config)
     old_target = config.targets[0]
-    write_skill_state(config, old_target, inventory)
+    write_skill_state(config, old_target, inventory.skills)
     cleanup_target = replace(old_target, components=frozenset())
     second_home = tmp_path / "second-home"
     second_home.mkdir()

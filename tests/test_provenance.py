@@ -29,7 +29,7 @@ def test_marker_round_trip_describes_the_projection(tmp_path: Path) -> None:
     inventory = discover_catalog(config)
     skill_root_for_target(target).mkdir(parents=True)
 
-    marker = write_skill_root_marker(config, target, inventory)
+    marker = write_skill_root_marker(config, target, inventory.skills)
 
     assert marker == skill_root_for_target(target) / ROOT_MARKER_FILENAME
     payload = read_skill_root_marker(target)
@@ -54,7 +54,7 @@ def test_marker_reports_copy_mode_for_windows_auto(tmp_path: Path) -> None:
     inventory = discover_catalog(config)
     skill_root_for_target(target).mkdir(parents=True)
 
-    write_skill_root_marker(config, target, inventory)
+    write_skill_root_marker(config, target, inventory.skills)
 
     payload = read_skill_root_marker(target)
     assert payload is not None
@@ -69,7 +69,7 @@ def test_marker_is_skipped_when_root_does_not_exist(tmp_path: Path) -> None:
     target = config.targets[0]
     inventory = discover_catalog(config)
 
-    assert write_skill_root_marker(config, target, inventory) is None
+    assert write_skill_root_marker(config, target, inventory.skills) is None
     assert not skill_root_for_target(target).exists()
     assert read_skill_root_marker(target) is None
 
@@ -82,10 +82,10 @@ def test_marker_is_removed_when_skills_are_deselected(tmp_path: Path) -> None:
     target = config.targets[0]
     inventory = discover_catalog(config)
     skill_root_for_target(target).mkdir(parents=True)
-    write_skill_root_marker(config, target, inventory)
+    write_skill_root_marker(config, target, inventory.skills)
 
     deselected = replace(target, components=frozenset())
-    assert write_skill_root_marker(config, deselected, inventory) is None
+    assert write_skill_root_marker(config, deselected, inventory.skills) is None
     assert read_skill_root_marker(target) is None
 
 
@@ -106,7 +106,7 @@ def test_marker_refuses_to_write_through_a_symlink(tmp_path: Path) -> None:
         pytest.skip(f"file symlinks are unavailable in this test environment: {exc}")
 
     with pytest.raises(BridgeStateError):
-        write_skill_root_marker(config, target, inventory)
+        write_skill_root_marker(config, target, inventory.skills)
     with pytest.raises(BridgeStateError):
         read_skill_root_marker(target)
 
@@ -162,10 +162,10 @@ def test_deselected_target_leaves_another_targets_marker_alone(tmp_path: Path) -
     owner = config.targets[0]
     inventory = discover_catalog(config)
     skill_root_for_target(owner).mkdir(parents=True)
-    write_skill_root_marker(config, owner, inventory)
+    write_skill_root_marker(config, owner, inventory.skills)
 
     sibling = replace(owner, name="sibling", components=frozenset({Component.SETTINGS}))
-    assert write_skill_root_marker(config, sibling, inventory) is None
+    assert write_skill_root_marker(config, sibling, inventory.skills) is None
 
     payload = read_skill_root_marker(owner)
     assert payload is not None
@@ -180,9 +180,9 @@ def test_deselection_still_removes_this_targets_own_marker(tmp_path: Path) -> No
     target = config.targets[0]
     inventory = discover_catalog(config)
     skill_root_for_target(target).mkdir(parents=True)
-    write_skill_root_marker(config, target, inventory)
+    write_skill_root_marker(config, target, inventory.skills)
 
     deselected = replace(target, components=frozenset())
-    write_skill_root_marker(config, deselected, inventory)
+    write_skill_root_marker(config, deselected, inventory.skills)
 
     assert read_skill_root_marker(target) is None

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_config_bridge.catalog import CatalogInventory
+from agent_config_bridge.catalog import Artifact, CatalogInventory
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key
 
@@ -383,14 +383,19 @@ def write_scheduler_state(
 def write_skill_state(
     config: BridgeConfig,
     target: TargetConfig,
-    inventory: CatalogInventory,
+    skills: tuple[Artifact, ...],
 ) -> None:
-    """Atomically record the desired standalone Skills for one target."""
+    """Atomically record the desired standalone Skills for one target.
+
+    ``skills`` must be the governance-gated desired set for this target, not
+    the raw catalog inventory — recording gated-out skills would make the next
+    plan retract them again forever.
+    """
 
     entries: list[dict[str, Any]] = []
     if Component.SKILLS in target.components:
         mode = effective_link_mode(config.link_mode, target.platform)
-        for skill in inventory.skills:
+        for skill in skills:
             entries.append(
                 {
                     "name": skill.name,

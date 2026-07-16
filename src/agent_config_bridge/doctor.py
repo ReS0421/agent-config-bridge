@@ -13,6 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.catalog import CatalogInventory
+from agent_config_bridge.governance import (
+    GovernanceError,
+    GovernanceMode,
+    GovernanceSeverity,
+    run_governance,
+)
 from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key
 from agent_config_bridge.planner import Disposition, SyncPlan
@@ -66,6 +72,8 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
             f"plan contains {conflict_count} conflicts",
         )
     )
+
+    checks.append(_governance_check(inventory))
 
     for target_name in find_orphaned_target_states(config):
         checks.append(
@@ -328,6 +336,32 @@ def _config_home_check(target: str, path: Path) -> DoctorCheck:
         "target.config-home",
         f"config home does not exist but can be created below writable parent: {parent}",
         target,
+    )
+
+
+def _governance_check(inventory: CatalogInventory) -> DoctorCheck:
+    """Report the governance mode and whether the ledger currently gates runtime."""
+
+    try:
+        report = run_governance(inventory)
+    except GovernanceError as exc:
+        return DoctorCheck(CheckLevel.ERROR, "governance.mode", str(exc))
+    errors = sum(finding.severity is GovernanceSeverity.ERROR for finding in report.findings)
+    warnings = sum(finding.severity is GovernanceSeverity.WARNING for finding in report.findings)
+    if report.mode is GovernanceMode.REQUIRED and errors:
+        return DoctorCheck(
+            CheckLevel.ERROR,
+            "governance.mode",
+            (
+                f"governance mode is 'required' with {errors} errors; plan/apply are blocked until "
+                "`agentbridge registry check` passes"
+            ),
+        )
+    gating = "gates skill deployment" if report.mode is GovernanceMode.REQUIRED else "does not gate runtime selection"
+    return DoctorCheck(
+        CheckLevel.WARNING if errors else CheckLevel.OK,
+        "governance.mode",
+        f"governance mode {report.mode.value!r} ({gating}); {errors} errors, {warnings} warnings",
     )
 
 

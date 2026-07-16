@@ -7,6 +7,7 @@ from pathlib import Path
 
 from agent_config_bridge.catalog import CatalogInventory, discover_catalog
 from agent_config_bridge.filesystem import apply_copy, apply_link, apply_remove, tree_digest
+from agent_config_bridge.governance import resolve_inventory
 from agent_config_bridge.models import BridgeConfig, Component, Platform, TargetConfig
 from agent_config_bridge.planner import Action, Disposition, Operation, SyncPlan, build_plan
 from agent_config_bridge.platforms import current_platform
@@ -72,7 +73,11 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
         )
 
     fresh_inventory = discover_catalog(config)
-    fresh_plan = build_plan(config, fresh_inventory)
+    # One governance read serves both plan verification and the ownership
+    # writes below; independent re-reads would open a window where governance
+    # edits during apply desync the recorded state from the applied actions.
+    resolved = resolve_inventory(fresh_inventory)
+    fresh_plan = build_plan(config, fresh_inventory, resolved=resolved)
     if fresh_plan != plan:
         raise ApplyError("catalog or destination state changed after planning; review a fresh plan")
     inventory = fresh_inventory
@@ -202,12 +207,13 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
     warnings: list[str] = []
     for target in config.targets:
         if target.enabled:
-            write_skill_state(config, target, inventory)
+            desired_skills = resolved.skills_for_target(target)
+            write_skill_state(config, target, desired_skills)
             # The marker is legibility metadata, not sync state: a squatted or
             # unwritable marker path must not abort an apply whose real actions
             # and ownership records already succeeded.
             try:
-                write_skill_root_marker(config, target, inventory)
+                write_skill_root_marker(config, target, desired_skills)
             except BridgeStateError as exc:
                 warnings.append(f"{target.name}: provenance marker was not updated: {exc}")
 
