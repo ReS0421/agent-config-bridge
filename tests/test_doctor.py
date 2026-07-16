@@ -438,3 +438,103 @@ def test_doctor_warns_about_orphaned_disabled_target_state(tmp_path: Path) -> No
     orphan = next(check for check in checks if check.code == "state.orphaned-target")
     assert orphan.level is CheckLevel.ERROR
     assert orphan.target == disabled.name
+
+
+def test_doctor_warns_when_skill_root_lacks_provenance_marker(tmp_path: Path) -> None:
+    """A deployed root without a marker is flagged as observer-illegible."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, platform=current_platform())
+    target = config.targets[0]
+    (target.user_home / ".agents" / "skills").mkdir(parents=True)
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+
+    checks = run_doctor(config, inventory, plan)
+    provenance = [check for check in checks if check.code == "skills.provenance"]
+
+    assert len(provenance) == 1
+    assert provenance[0].level is CheckLevel.WARNING
+    assert "no provenance marker" in provenance[0].message
+
+
+def test_doctor_accepts_a_marker_written_by_apply(tmp_path: Path) -> None:
+    """Doctor reports OK once apply has stamped the root."""
+
+    from agent_config_bridge.provenance import write_skill_root_marker
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, platform=current_platform())
+    target = config.targets[0]
+    (target.user_home / ".agents" / "skills").mkdir(parents=True)
+    inventory = discover_catalog(config)
+    write_skill_root_marker(config, target, inventory)
+    plan = build_plan(config, inventory)
+
+    checks = run_doctor(config, inventory, plan)
+    provenance = [check for check in checks if check.code == "skills.provenance"]
+
+    assert len(provenance) == 1
+    assert provenance[0].level is CheckLevel.OK
+
+
+def test_doctor_does_not_warn_on_marker_absence_with_empty_catalog(tmp_path: Path) -> None:
+    """An empty catalog means an intentionally absent marker — never a warning."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=())
+    config = make_config(tmp_path, catalog, platform=current_platform())
+    (config.targets[0].user_home / ".agents" / "skills").mkdir(parents=True)
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+
+    checks = run_doctor(config, inventory, plan)
+
+    assert not [check for check in checks if check.code == "skills.provenance"]
+
+
+def test_doctor_warns_on_stale_marker_when_catalog_becomes_empty(tmp_path: Path) -> None:
+    """A leftover marker with no skills in the catalog is reported as stale."""
+
+    from agent_config_bridge.provenance import write_skill_root_marker
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, platform=current_platform())
+    target = config.targets[0]
+    (target.user_home / ".agents" / "skills").mkdir(parents=True)
+    write_skill_root_marker(config, target, discover_catalog(config))
+    import shutil as _shutil
+
+    _shutil.rmtree(catalog / "skills" / "hello")
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+
+    checks = run_doctor(config, inventory, plan)
+    provenance = [check for check in checks if check.code == "skills.provenance"]
+
+    assert len(provenance) == 1
+    assert provenance[0].level is CheckLevel.WARNING
+    assert "stale" in provenance[0].message
+
+
+def test_doctor_warns_on_malformed_and_mismatched_markers(tmp_path: Path) -> None:
+    """Unreadable markers and markers naming another target both warn."""
+
+    from agent_config_bridge.provenance import ROOT_MARKER_FILENAME, write_skill_root_marker
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, platform=current_platform())
+    target = config.targets[0]
+    root = target.user_home / ".agents" / "skills"
+    root.mkdir(parents=True)
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+
+    (root / ROOT_MARKER_FILENAME).write_text("not json\n", encoding="utf-8")
+    malformed = [check for check in run_doctor(config, inventory, plan) if check.code == "skills.provenance"]
+    assert malformed[0].level is CheckLevel.WARNING
+    assert "invalid" in malformed[0].message
+
+    write_skill_root_marker(config, replace(target, name="other"), inventory)
+    mismatched = [check for check in run_doctor(config, inventory, plan) if check.code == "skills.provenance"]
+    assert mismatched[0].level is CheckLevel.WARNING
+    assert "expected" in mismatched[0].message

@@ -41,6 +41,10 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   bridge-registered Plugins/Hooks, and host scheduler heartbeats
 - Drift detection, deselection reconciliation, and retained backups for managed
   Skill copy updates/removals
+- A visible `AGENTBRIDGE-MANAGED.json` provenance marker at every deployed
+  skill root, so humans and agents inspecting the directory can tell it is a
+  managed projection of the catalog rather than an accidental duplicate
+  (written by `apply`, checked by `doctor`)
 - Canonical Codex Skill destination: `~/.agents/skills`
 - Claude Code Skill destination: `~/.claude/skills`
 - Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`

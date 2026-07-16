@@ -17,8 +17,9 @@ from agent_config_bridge.models import BridgeConfig, Component, Platform, Produc
 from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key
 from agent_config_bridge.planner import Disposition, SyncPlan
 from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.provenance import ROOT_MARKER_FILENAME, read_skill_root_marker
 from agent_config_bridge.scheduler_registration import SchedulerRegistrationError, validate_vendor_executable
-from agent_config_bridge.state import find_orphaned_target_states
+from agent_config_bridge.state import BridgeStateError, find_orphaned_target_states, skill_root_for_target
 
 __all__ = ["CheckLevel", "DoctorCheck", "run_doctor"]
 
@@ -104,6 +105,10 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
         skill_root_redirect = _skill_discovery_root_redirect_check(target)
         if skill_root_redirect is not None:
             checks.append(skill_root_redirect)
+        if Component.SKILLS in target.components:
+            provenance = _skill_provenance_check(target, inventory)
+            if provenance is not None:
+                checks.append(provenance)
 
         same_platform = target.platform is host_platform
         if not same_platform:
@@ -326,6 +331,71 @@ def _config_home_check(target: str, path: Path) -> DoctorCheck:
     )
 
 
+def _skill_provenance_check(target: TargetConfig, inventory: CatalogInventory) -> DoctorCheck | None:
+    """Report whether the deployed skill root advertises its bridge provenance.
+
+    Mirrors ``write_skill_root_marker``'s own conditions exactly: with an empty
+    skill catalog the marker is intentionally absent, so its absence must never
+    warn (apply could not resolve such a warning).
+    """
+
+    root = skill_root_for_target(target)
+    has_skills = bool(inventory.skills)
+    if not root.is_dir():
+        if not has_skills:
+            return None
+        return DoctorCheck(
+            CheckLevel.INFO,
+            "skills.provenance",
+            f"skill root does not exist yet; apply writes the provenance marker: {root}",
+            target.name,
+        )
+    try:
+        payload = read_skill_root_marker(target)
+    except BridgeStateError as exc:
+        return DoctorCheck(
+            CheckLevel.WARNING,
+            "skills.provenance",
+            f"provenance marker is invalid; rewrite it with apply: {exc}",
+            target.name,
+        )
+    if payload is None:
+        if not has_skills:
+            return None
+        return DoctorCheck(
+            CheckLevel.WARNING,
+            "skills.provenance",
+            (
+                f"skill root has no provenance marker, so observers cannot tell it is a managed "
+                f"projection; run apply to write it: {root}"
+            ),
+            target.name,
+        )
+    if not has_skills:
+        return DoctorCheck(
+            CheckLevel.WARNING,
+            "skills.provenance",
+            f"provenance marker is stale (catalog has no skills); apply removes it: {root / ROOT_MARKER_FILENAME}",
+            target.name,
+        )
+    if payload["target"] != target.name:
+        return DoctorCheck(
+            CheckLevel.WARNING,
+            "skills.provenance",
+            (
+                f"provenance marker names target {payload['target']!r}, expected {target.name!r}; "
+                "run apply to refresh it"
+            ),
+            target.name,
+        )
+    return DoctorCheck(
+        CheckLevel.OK,
+        "skills.provenance",
+        f"skill root advertises bridge provenance: {root / ROOT_MARKER_FILENAME}",
+        target.name,
+    )
+
+
 def _skill_discovery_root_redirect_check(target: TargetConfig) -> DoctorCheck | None:
     """Report a discovery root redirected by an existing symlink or junction.
 
@@ -334,7 +404,7 @@ def _skill_discovery_root_redirect_check(target: TargetConfig) -> DoctorCheck | 
     this diagnostic.
     """
 
-    root = target.user_home / ".agents" / "skills" if target.product is Product.CODEX else target.config_home / "skills"
+    root = skill_root_for_target(target)
     absolute_root = Path(os.path.abspath(root))
     redirected_components: list[Path] = []
     for candidate in reversed((absolute_root, *absolute_root.parents)):

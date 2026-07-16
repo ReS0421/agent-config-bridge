@@ -452,6 +452,7 @@ def _command_apply(
         "marketplace": str(result.marketplace.root) if result.marketplace else None,
         "schedule_snapshots": [str(rendered.published_file) for rendered in result.schedules],
         "registration_commands": [_command_payload(command) for command in plan.commands],
+        "warnings": list(result.warnings),
     }
     if as_json:
         _print_json(payload)
@@ -463,6 +464,8 @@ def _command_apply(
             print(f"schedule snapshot [{rendered.target}]: {rendered.published_file}")
         for backup in result.backups:
             print(f"backup: {backup}")
+        for warning in result.warnings:
+            print(f"warning: {warning}", file=sys.stderr)
         if plan.commands:
             print("plugin and schedule registration remains explicit; review and run:")
             for command in plan.commands:

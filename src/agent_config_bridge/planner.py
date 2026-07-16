@@ -43,11 +43,13 @@ from agent_config_bridge.state import (
     SettingsState,
     SkillStateEntry,
     desired_plugin_names,
+    effective_link_mode,
     find_orphaned_target_states,
     read_registration_state,
     read_settings_state,
     read_skill_state,
     registration_marketplace_source,
+    skill_root_for_target,
 )
 
 __all__ = [
@@ -189,7 +191,7 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
         previous_skills_by_name = {entry.name: entry for entry in previous_skills}
         if Component.SKILLS in target.components:
             destination_root = _skill_destination(target)
-            mode = _effective_link_mode(config.link_mode, target.platform)
+            mode = effective_link_mode(config.link_mode, target.platform)
             for skill in inventory.skills:
                 selected_skill_names.add(skill.name)
                 actions.append(
@@ -321,9 +323,7 @@ def build_plan(config: BridgeConfig, inventory: CatalogInventory) -> SyncPlan:
 
 
 def _skill_destination(target: TargetConfig) -> Path:
-    if target.product is Product.CODEX:
-        return target.user_home / ".agents" / "skills"
-    return target.config_home / "skills"
+    return skill_root_for_target(target)
 
 
 def _settings_destination(target: TargetConfig) -> Path:
@@ -468,12 +468,6 @@ def _paths_overlap_for_targets(
             f"could not physically resolve paths for targets {left_target.name!r} and "
             f"{right_target.name!r} during overlap validation"
         ) from error
-
-
-def _effective_link_mode(mode: LinkMode, platform: Platform) -> LinkMode:
-    if mode is not LinkMode.AUTO:
-        return mode
-    return LinkMode.COPY if platform is Platform.WINDOWS else LinkMode.SYMLINK
 
 
 def _plan_skill(

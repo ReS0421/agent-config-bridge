@@ -10,6 +10,7 @@ from agent_config_bridge.filesystem import apply_copy, apply_link, apply_remove,
 from agent_config_bridge.models import BridgeConfig, Component, Platform, TargetConfig
 from agent_config_bridge.planner import Action, Disposition, Operation, SyncPlan, build_plan
 from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.provenance import write_skill_root_marker
 from agent_config_bridge.renderer import RenderedMarketplace, render_marketplace
 from agent_config_bridge.schedule_store import RenderedScheduleSet, remove_schedule_set, render_schedule_set
 from agent_config_bridge.schedules import discover_schedules
@@ -22,6 +23,7 @@ from agent_config_bridge.settings import (
     settings_patch_digest,
 )
 from agent_config_bridge.state import (
+    BridgeStateError,
     SettingsState,
     SettingStateEntry,
     find_orphaned_target_states,
@@ -39,12 +41,13 @@ class ApplyError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ApplyResult:
-    """Summary of applied actions and retained backups."""
+    """Summary of applied actions, retained backups, and non-fatal warnings."""
 
     applied: tuple[Action, ...]
     backups: tuple[Path, ...]
     marketplace: RenderedMarketplace | None
     schedules: tuple[RenderedScheduleSet, ...]
+    warnings: tuple[str, ...] = ()
 
 
 def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan) -> ApplyResult:
@@ -196,15 +199,24 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
             raise ApplyError(f"unsupported plan operation: {action.operation}")
         applied.append(action)
 
+    warnings: list[str] = []
     for target in config.targets:
         if target.enabled:
             write_skill_state(config, target, inventory)
+            # The marker is legibility metadata, not sync state: a squatted or
+            # unwritable marker path must not abort an apply whose real actions
+            # and ownership records already succeeded.
+            try:
+                write_skill_root_marker(config, target, inventory)
+            except BridgeStateError as exc:
+                warnings.append(f"{target.name}: provenance marker was not updated: {exc}")
 
     return ApplyResult(
         applied=tuple(applied),
         backups=tuple(backups),
         marketplace=marketplace,
         schedules=tuple(schedules),
+        warnings=tuple(warnings),
     )
 
 
