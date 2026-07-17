@@ -24,6 +24,7 @@ from agent_config_bridge.governance import (
     GovernanceSeverity,
     build_registry_payload,
     registry_path,
+    resolve_inventory,
     run_governance,
     serialize_registry,
 )
@@ -643,7 +644,12 @@ def _command_register(
         return 2
 
     fresh_inventory = discover_catalog(config)
-    fresh_plan = build_plan(config, fresh_inventory)
+    # One governance read for the whole registration flow: the staleness
+    # check, the render, and the ownership write must all reflect the same
+    # resolved state, or a governance edit landing mid-register desyncs the
+    # recorded plugin set from what was verified (the apply_plan TOCTOU class).
+    fresh_resolved = resolve_inventory(fresh_inventory)
+    fresh_plan = build_plan(config, fresh_inventory, resolved=fresh_resolved)
     if fresh_plan != plan:
         raise ConfigError("catalog, generated state, or destinations changed; review a fresh plan")
     fresh_scheduler_registrations = _build_scheduler_registrations(
@@ -655,7 +661,7 @@ def _command_register(
     if _scheduler_review_keys(fresh_scheduler_registrations) != _scheduler_review_keys(scheduler_registrations):
         raise ConfigError("host scheduler state changed; review a fresh registration plan")
     if commands:
-        render_marketplace(config, fresh_inventory)
+        render_marketplace(config, fresh_inventory, resolved=fresh_resolved)
 
     commands_by_target: dict[str, tuple[CommandHint, ...]] = {}
     for name in sorted(target_names):
@@ -676,7 +682,9 @@ def _command_register(
             scope_product_home_environment(command_environment, target)
             _scope_command_environment(command_environment, command)
             _run_registration_command(command, command_environment, target.product)
-        write_registered_plugins(config, target, desired_plugin_names(target, fresh_inventory))
+        write_registered_plugins(
+            config, target, desired_plugin_names(target, fresh_inventory, fresh_resolved.hooks_for_target(target))
+        )
     apply_scheduler_registrations(config, fresh_inventory, fresh_scheduler_registrations)
     return 0
 

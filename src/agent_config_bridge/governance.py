@@ -26,7 +26,7 @@ from typing import Any
 import yaml
 
 from agent_config_bridge.catalog import Artifact, CatalogInventory
-from agent_config_bridge.models import TargetConfig
+from agent_config_bridge.models import BridgeConfig, Component, Product, TargetConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point
 
 __all__ = [
@@ -151,8 +151,45 @@ class ResolvedInventory:
         not hide the skill from Desktop on a cli+desktop target.
         """
 
+        return self._artifacts_for_target("skills", self.inventory.skills, target)
+
+    def hooks_for_target(self, target: TargetConfig) -> tuple[Artifact, ...]:
+        """Return the hook bundles governance gates in for this single target.
+
+        Note this is the target's *own* gated set. What actually renders into a
+        product's shared hook plugin is the product-wide union
+        (:meth:`hooks_for_product`), because one plugin serves every enabled
+        target of a product on a host. Surface matching is any-overlap like
+        skills.
+        """
+
+        return self._artifacts_for_target("hooks", self.inventory.hooks, target)
+
+    def hooks_for_product(self, config: BridgeConfig, product: Product) -> tuple[Artifact, ...]:
+        """Return the hooks actually delivered to every target of ``product``.
+
+        Hooks render into one plugin per product per host, so the delivered
+        set is the union of :meth:`hooks_for_target` over that product's
+        enabled hook targets. This is what installs on each such target, so it
+        is the correct basis for both rendering and security review.
+        """
+
+        included: dict[str, Artifact] = {}
+        for target in config.targets:
+            if target.enabled and target.product is product and Component.HOOKS in target.components:
+                for hook in self.hooks_for_target(target):
+                    included[hook.name] = hook
+        return tuple(included[name] for name in sorted(included))
+
+    def _artifacts_for_target(
+        self,
+        component: str,
+        artifacts: tuple[Artifact, ...],
+        target: TargetConfig,
+    ) -> tuple[Artifact, ...]:
         if self.report.mode is GovernanceMode.AUDIT:
-            return self.inventory.skills
+            return artifacts
+        prefix = f"{component}/"
         desired: set[str] = set()
         for manifest in self.report.manifests:
             data = manifest.data
@@ -163,9 +200,9 @@ class ResolvedInventory:
             for artifact in data.get("artifacts", []):
                 if isinstance(artifact, dict):
                     ref = artifact.get("ref", "")
-                    if isinstance(ref, str) and ref.startswith("skills/"):
-                        desired.add(ref.removeprefix("skills/"))
-        return tuple(skill for skill in self.inventory.skills if skill.name in desired)
+                    if isinstance(ref, str) and ref.startswith(prefix):
+                        desired.add(ref.removeprefix(prefix))
+        return tuple(artifact for artifact in artifacts if artifact.name in desired)
 
 
 _TARGET_PRODUCTS = frozenset({"codex", "claude-code"})
