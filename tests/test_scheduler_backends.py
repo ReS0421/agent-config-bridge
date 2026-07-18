@@ -490,12 +490,13 @@ def test_windows_query_error_fails_closed(tmp_path: Path) -> None:
         backend.plan(_spec(tmp_path))
 
 
-def test_windows_hresult_detects_missing_task_without_localized_text(tmp_path: Path) -> None:
+@pytest.mark.parametrize("hresult", [0x80070002, 0x80070003, -2147024893])
+def test_windows_hresult_detects_missing_task_without_localized_text(tmp_path: Path, hresult: int) -> None:
     """Task absence uses the HRESULT instead of an English diagnostic."""
 
     def missing(argv: tuple[str, ...], stdin: str | None) -> subprocess.CompletedProcess[str]:
         assert "/HResult" in argv
-        return subprocess.CompletedProcess(argv, 0x80070002, stdout="", stderr="localized diagnostic")
+        return subprocess.CompletedProcess(argv, hresult, stdout="", stderr="localized diagnostic")
 
     backend = WindowsTaskSchedulerBackend(runner=missing, principal_user="test")
 
