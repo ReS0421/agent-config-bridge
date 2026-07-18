@@ -94,13 +94,22 @@ class SchedulerState:
     config_path: str
 
 
-def desired_plugin_names(target: TargetConfig, inventory: CatalogInventory) -> tuple[str, ...]:
-    """Return the ordered plugin IDs selected for one target."""
+def desired_plugin_names(
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    hooks_for_target: tuple[Artifact, ...],
+) -> tuple[str, ...]:
+    """Return the ordered plugin IDs selected for one target.
+
+    ``hooks_for_target`` must be the governance-gated hook set for this
+    target; the synthetic hook plugin is desired only when that set is
+    non-empty, so a fully gated-out target deregisters it on reconcile.
+    """
 
     names: list[str] = []
     if Component.PLUGINS in target.components:
         names.extend(artifact.name for artifact in inventory.plugins)
-    if Component.HOOKS in target.components and inventory.hooks:
+    if Component.HOOKS in target.components and hooks_for_target:
         names.append("agent-config-bridge-hooks")
     return tuple(names)
 

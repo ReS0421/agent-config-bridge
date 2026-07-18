@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Governance core (`catalog/governance/*.toml` manifests as source of truth,
+  ADR-1 capability axes, `GovernanceFinding` diagnostics) with `registry
+  generate` writing a byte-deterministic `catalog/registry.json` and `registry
+  check` gating drift. The active mode is the committed
+  `catalog/governance/policy.toml` (`audit` and `required` implemented).
+- `required` governance mode: a `ResolvedInventory` derived from the manifests
+  gates which Skills deploy and which hooks render into each product's plugin,
+  by deployable lifecycle and matching `[[targets]]`. Quarantining or removing
+  a capability in the ledger retracts it on the next reconcile.
 - `migrate-skills` dry-run/apply workflow for importing multiple existing Skill
   roots by priority, deduplicating portable text line endings, retaining
   divergent variants, repairing explicitly approved legacy frontmatter, and

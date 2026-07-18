@@ -126,7 +126,7 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                         )
                     )
                 else:
-                    marketplace = render_marketplace(config, inventory)
+                    marketplace = render_marketplace(config, inventory, resolved=resolved)
             continue
         if action.disposition not in {Disposition.CREATE, Disposition.UPDATE, Disposition.REMOVE}:
             continue
@@ -147,7 +147,7 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     )
                 )
             else:
-                marketplace = render_marketplace(config, inventory)
+                marketplace = render_marketplace(config, inventory, resolved=resolved)
         elif action.operation is Operation.PATCH:
             if action.component is not Component.SETTINGS:
                 raise ApplyError(f"unsupported patch component: {action.component.value}")

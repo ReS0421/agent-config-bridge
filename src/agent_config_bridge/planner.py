@@ -170,12 +170,14 @@ def build_plan(
     if any(
         Component.PLUGINS in target.components or Component.HOOKS in target.components for target in enabled_targets
     ):
-        build_path = marketplace_build_path(config, inventory)
+        build_path = marketplace_build_path(config, inventory, resolved=resolved)
         publish_path = marketplace_publish_path(config)
         if not os.path.lexists(publish_path):
             disposition = Disposition.CREATE
         else:
-            disposition = Disposition.NOOP if marketplace_is_current(config, inventory) else Disposition.UPDATE
+            disposition = (
+                Disposition.NOOP if marketplace_is_current(config, inventory, resolved=resolved) else Disposition.UPDATE
+            )
         rendered_component = (
             Component.PLUGINS
             if any(Component.PLUGINS in target.components for target in enabled_targets)
@@ -301,7 +303,10 @@ def build_plan(
             )
 
         if Component.HOOKS in target.components:
-            reviews.extend(_hook_reviews(target, inventory))
+            # Review the product-wide union actually delivered to this target,
+            # not just its own gated set — a same-product sibling target can
+            # pull additional hooks into the shared plugin.
+            reviews.extend(_hook_reviews(target, resolved.hooks_for_product(config, target.product)))
         if Component.PLUGINS in target.components:
             reviews.extend(_plugin_reviews(target, inventory))
 
@@ -325,7 +330,7 @@ def build_plan(
                 f"run plan/register from the configured {target.platform.value} platform with native paths"
             )
 
-    commands = _registration_hints(config, inventory, host_platform)
+    commands = _registration_hints(config, inventory, resolved, host_platform)
     return SyncPlan(
         actions=tuple(actions),
         commands=commands,
@@ -731,9 +736,9 @@ def _skill_source_id(skill: Artifact) -> str:
     return f"skills/{skill.name}"
 
 
-def _hook_reviews(target: TargetConfig, inventory: CatalogInventory) -> list[str]:
+def _hook_reviews(target: TargetConfig, hooks: tuple[Artifact, ...]) -> list[str]:
     reviews: list[str] = []
-    for artifact in inventory.hooks:
+    for artifact in hooks:
         for overlay in ("common", target.product.value):
             path = artifact.path / overlay / "hooks.json"
             if path.is_file():
@@ -904,6 +909,7 @@ def _plan_skill_removal(
 def _registration_hints(
     config: BridgeConfig,
     inventory: CatalogInventory,
+    resolved: ResolvedInventory,
     host_platform: Platform,
 ) -> tuple[CommandHint, ...]:
     hints: list[CommandHint] = []
@@ -911,7 +917,7 @@ def _registration_hints(
     for target in config.targets:
         if not target.enabled or target.platform is not host_platform:
             continue
-        selected_names = desired_plugin_names(target, inventory)
+        selected_names = desired_plugin_names(target, inventory, resolved.hooks_for_target(target))
         registration = read_registration_state(config, target)
         previous_names = registration.plugins
         current_marketplace_source = registration_marketplace_source(config, target)

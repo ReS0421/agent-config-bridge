@@ -749,3 +749,43 @@ def test_register_preflights_every_target_before_any_product_mutation(
         ("codex", "plugin", "marketplace", "list", "--json"),
         ("codex", "plugin", "marketplace", "list", "--json"),
     ]
+
+
+def test_register_scheduler_only_does_not_crash_on_governed_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Register with scheduler changes but no plugin commands still records ownership.
+
+    Regression: the governance-gated ownership write dereferenced a resolved
+    inventory that was only computed when plugin commands existed, so a
+    scheduler-only registration raised UnboundLocalError before it could run.
+    """
+
+    from types import SimpleNamespace
+
+    make_catalog(tmp_path / "catalog", skills=(), schedules=("daily",))
+    config_path = _write_config(tmp_path, components=("schedules",))
+    config = load_config(config_path)
+    target = config.targets[0]
+
+    plan = SimpleNamespace(
+        target=target,
+        spec=SimpleNamespace(agentbridge_executable="ab", vendor_executable="v", config_path="c"),
+        plan=SimpleNamespace(
+            disposition=SimpleNamespace(value="create"), backend=SimpleNamespace(value="cron"), detail="d"
+        ),
+        desired="desired",
+        previous_state=None,
+        has_conflict=False,
+        has_changes=True,
+    )
+    monkeypatch.setattr(cli, "_build_scheduler_registrations", lambda *args, **kwargs: (plan,))
+    applied: list[object] = []
+    monkeypatch.setattr(cli, "apply_scheduler_registrations", lambda *args: applied.append(args))
+
+    exit_code = cli.main(["register", "--config", str(config_path), "--target", "local", "--yes"])
+
+    assert exit_code == 0
+    assert applied  # the scheduler path ran instead of crashing
+    assert read_registered_plugins(config, target) == ()

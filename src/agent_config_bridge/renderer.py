@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.catalog import Artifact, CatalogInventory, discover_catalog
+from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
 from agent_config_bridge.models import BridgeConfig, Component, Product
 from agent_config_bridge.path_safety import is_directory_reparse_point
 
@@ -112,7 +113,12 @@ class _PortableOutputRegistry:
         )
 
 
-def render_marketplace(config: BridgeConfig, inventory: CatalogInventory) -> RenderedMarketplace:
+def render_marketplace(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    *,
+    resolved: ResolvedInventory | None = None,
+) -> RenderedMarketplace:
     """Render selected plugin and hook artifacts into an immutable dual marketplace.
 
     The build is content-addressed. Existing builds are reused, while a new build is
@@ -121,6 +127,9 @@ def render_marketplace(config: BridgeConfig, inventory: CatalogInventory) -> Ren
     Args:
         config: Loaded bridge configuration.
         inventory: Validated catalog inventory.
+        resolved: Governance-gated inventory to reuse; resolved internally when
+            omitted. Callers in one operation should thread a single resolved
+            object so render and ownership writes reflect the same read.
 
     Returns:
         Metadata for the rendered marketplace.
@@ -129,7 +138,9 @@ def render_marketplace(config: BridgeConfig, inventory: CatalogInventory) -> Ren
         RenderError: If overlays conflict or a source escapes its artifact root.
     """
 
-    digest = marketplace_digest(config, inventory)
+    if resolved is None:
+        resolved = resolve_inventory(inventory)
+    digest = marketplace_digest(config, inventory, resolved=resolved)
     builds_dir = config.state_dir / "builds"
     build_root = builds_dir / digest
     _validate_state_directory(config, builds_dir, "marketplace builds directory")
@@ -152,9 +163,10 @@ def render_marketplace(config: BridgeConfig, inventory: CatalogInventory) -> Ren
                     for plugin in inventory.plugins:
                         _render_plugin(plugin, product, product_root / plugin.name)
                         plugin_names.append(plugin.name)
-                if _product_has_component(config, product, Component.HOOKS) and inventory.hooks:
+                gated_hooks = resolved.hooks_for_product(config, product)
+                if _product_has_component(config, product, Component.HOOKS) and gated_hooks:
                     _render_hook_plugin(
-                        inventory.hooks,
+                        gated_hooks,
                         product,
                         product_root / _HOOK_PLUGIN_NAME,
                         inventory.hook_version,
@@ -182,7 +194,7 @@ def render_marketplace(config: BridgeConfig, inventory: CatalogInventory) -> Ren
             raise
 
     fresh_inventory = discover_catalog(config)
-    if marketplace_digest(config, fresh_inventory) != digest:
+    if marketplace_digest(config, fresh_inventory, resolved=resolve_inventory(fresh_inventory)) != digest:
         raise RenderError("catalog changed while the marketplace was being rendered; retry")
     published_root = _publish_marketplace(config, build_root, digest)
 
@@ -195,16 +207,28 @@ def render_marketplace(config: BridgeConfig, inventory: CatalogInventory) -> Ren
     )
 
 
-def marketplace_digest(config: BridgeConfig, inventory: CatalogInventory) -> str:
+def marketplace_digest(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    *,
+    resolved: ResolvedInventory | None = None,
+) -> str:
     """Return the deterministic digest for the selected marketplace inputs."""
 
-    return _build_digest(config, inventory)
+    if resolved is None:
+        resolved = resolve_inventory(inventory)
+    return _build_digest(config, inventory, resolved)
 
 
-def marketplace_build_path(config: BridgeConfig, inventory: CatalogInventory) -> Path:
+def marketplace_build_path(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    *,
+    resolved: ResolvedInventory | None = None,
+) -> Path:
     """Return the immutable build path without creating it."""
 
-    return config.state_dir / "builds" / marketplace_digest(config, inventory)
+    return config.state_dir / "builds" / marketplace_digest(config, inventory, resolved=resolved)
 
 
 def marketplace_publish_path(config: BridgeConfig) -> Path:
@@ -213,7 +237,12 @@ def marketplace_publish_path(config: BridgeConfig) -> Path:
     return config.state_dir / "marketplace"
 
 
-def marketplace_is_current(config: BridgeConfig, inventory: CatalogInventory) -> bool:
+def marketplace_is_current(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    *,
+    resolved: ResolvedInventory | None = None,
+) -> bool:
     """Return whether the validated stable marketplace matches current inputs."""
 
     published_root = marketplace_publish_path(config)
@@ -222,7 +251,7 @@ def marketplace_is_current(config: BridgeConfig, inventory: CatalogInventory) ->
     _validate_state_directory(config, published_root, "published marketplace")
     marker_digest = _marker_digest(published_root)
     _read_rendered_marketplace(published_root, marker_digest)
-    return marker_digest == marketplace_digest(config, inventory)
+    return marker_digest == marketplace_digest(config, inventory, resolved=resolved)
 
 
 def _selected_products(config: BridgeConfig) -> frozenset[Product]:
@@ -239,21 +268,25 @@ def _product_has_component(config: BridgeConfig, product: Product, component: Co
     )
 
 
-def _build_digest(config: BridgeConfig, inventory: CatalogInventory) -> str:
+def _build_digest(config: BridgeConfig, inventory: CatalogInventory, resolved: ResolvedInventory) -> str:
     digest = hashlib.sha256()
-    digest.update(b"agent-config-bridge-render-v5\0")
+    digest.update(b"agent-config-bridge-render-v6\0")
     for product in sorted(_selected_products(config), key=lambda item: item.value):
         digest.update(product.value.encode())
         digest.update(b"\0")
         for component, artifacts in (
             (Component.PLUGINS, inventory.plugins),
-            (Component.HOOKS, inventory.hooks),
+            (Component.HOOKS, resolved.hooks_for_product(config, product)),
         ):
             if not _product_has_component(config, product, component):
                 continue
             digest.update(component.value.encode())
             digest.update(b"\0")
-            if component is Component.HOOKS:
+            # Fold the hook version only when this product actually renders a
+            # hook plugin (its gated set is non-empty); otherwise bumping the
+            # version for a hook scoped to another product would force a
+            # byte-identical rebuild here.
+            if component is Component.HOOKS and artifacts:
                 digest.update((inventory.hook_version or "").encode())
                 digest.update(b"\0")
             for artifact in artifacts:
@@ -608,7 +641,9 @@ def _validate_package_version_changes(previous_root: Path, next_root: Path) -> N
             if not _semver_is_newer(next_version, previous_version):
                 raise RenderError(
                     f"rendered {product.value} plugin {name!r} changed, but version {next_version} "
-                    f"does not increase {previous_version}; update both canonical manifests or hooks/.version"
+                    f"does not increase {previous_version}; update both canonical manifests or hooks/.version. "
+                    "A governance-only change (quarantining or re-scoping a hook that leaves other hooks in the "
+                    "plugin) still changes the plugin content, so it also requires a version bump to publish."
                 )
 
 

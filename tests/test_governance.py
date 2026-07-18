@@ -598,3 +598,233 @@ def test_multiple_manifests_governing_one_artifact_warn(tmp_path: Path) -> None:
     assert len(gov031) == 1
     assert gov031[0].artifact_ref == "skills/good"
     assert "['one', 'two']" in gov031[0].detail
+
+
+def _hook_manifest(identifier: str, *, lifecycle: str = "active", products: tuple[str, ...] = ("claude-code",)) -> str:
+    target_blocks = "".join(
+        f'[[targets]]\nproduct = "{product}"\nplatform = "linux"\nsurfaces = ["cli", "desktop"]\n'
+        for product in products
+    )
+    return (
+        f'id = "{identifier}"\n'
+        'capability_kind = "event-handler"\n'
+        'delivery = "plugin"\n'
+        f'lifecycle = "{lifecycle}"\n'
+        'failure_policy = "advisory"\n'
+        'owner = "test"\n'
+        'last_reviewed = "2026-07-18"\n'
+        f"{target_blocks}"
+        "[[artifacts]]\n"
+        f'ref = "hooks/{identifier}"\n'
+        "[artifacts.provenance]\n"
+        'origin = "local-original"\n'
+    )
+
+
+def _two_product_config(tmp_path: Path, catalog: Path):
+    from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, Surface, TargetConfig
+
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    components = frozenset({Component.HOOKS})
+
+    def target(name: str, product: Product) -> TargetConfig:
+        return TargetConfig(
+            name=name,
+            product=product,
+            platform=Platform.LINUX,
+            user_home=home,
+            config_home=home / (".codex" if product is Product.CODEX else ".claude"),
+            components=components,
+            surfaces=frozenset({Surface.CLI}),
+            enabled=True,
+        )
+
+    from agent_config_bridge.models import LinkMode
+
+    return BridgeConfig(
+        schema_version=1,
+        catalog=catalog,
+        state_dir=tmp_path / "state",
+        link_mode=LinkMode.SYMLINK,
+        components=components,
+        targets=(target("claude", Product.CLAUDE_CODE), target("codex", Product.CODEX)),
+    )
+
+
+def test_required_mode_gates_hooks_per_product(tmp_path: Path) -> None:
+    """A claude-only hook manifest keeps the hook out of the codex plugin."""
+
+    from agent_config_bridge.renderer import render_marketplace
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("guard",))
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    _write(catalog / "governance" / "guard.toml", _hook_manifest("guard"))
+    config = _two_product_config(tmp_path, catalog)
+    inventory = discover_catalog(config)
+
+    from agent_config_bridge.governance import resolve_inventory
+
+    resolved = resolve_inventory(inventory)
+    claude_target, codex_target = config.targets
+    assert [hook.name for hook in resolved.hooks_for_target(claude_target)] == ["guard"]
+    assert resolved.hooks_for_target(codex_target) == ()
+
+    rendered = render_marketplace(config, inventory, resolved=resolved)
+    assert rendered.claude_plugins == ("agent-config-bridge-hooks",)
+    assert rendered.codex_plugins == ()
+    assert (rendered.root / "plugins" / "claude-code" / "agent-config-bridge-hooks").is_dir()
+    assert not (rendered.root / "plugins" / "codex" / "agent-config-bridge-hooks").exists()
+
+
+def test_governance_changes_invalidate_the_marketplace_digest(tmp_path: Path) -> None:
+    """Quarantining a hook must change the digest, or renders go stale."""
+
+    from agent_config_bridge.renderer import marketplace_digest
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("guard",))
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    _write(catalog / "governance" / "guard.toml", _hook_manifest("guard"))
+    config = _two_product_config(tmp_path, catalog)
+
+    active_digest = marketplace_digest(config, discover_catalog(config))
+    _write(catalog / "governance" / "guard.toml", _hook_manifest("guard", lifecycle="quarantined"))
+    quarantined_digest = marketplace_digest(config, discover_catalog(config))
+
+    assert active_digest != quarantined_digest
+
+
+def test_audit_mode_hooks_render_ungated(tmp_path: Path) -> None:
+    """Without a required policy, every hook renders for every product."""
+
+    from agent_config_bridge.governance import resolve_inventory
+    from agent_config_bridge.renderer import render_marketplace
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("guard",))
+    config = _two_product_config(tmp_path, catalog)
+    inventory = discover_catalog(config)
+
+    rendered = render_marketplace(config, inventory, resolved=resolve_inventory(inventory))
+
+    assert rendered.claude_plugins == ("agent-config-bridge-hooks",)
+    assert rendered.codex_plugins == ("agent-config-bridge-hooks",)
+
+
+def test_desired_plugin_names_drop_hook_plugin_when_fully_gated(tmp_path: Path) -> None:
+    """A target whose gated hook set is empty stops desiring the hook plugin."""
+
+    from agent_config_bridge.governance import resolve_inventory
+    from agent_config_bridge.state import desired_plugin_names
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("guard",))
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    _write(catalog / "governance" / "guard.toml", _hook_manifest("guard"))
+    config = _two_product_config(tmp_path, catalog)
+    inventory = discover_catalog(config)
+    resolved = resolve_inventory(inventory)
+    claude_target, codex_target = config.targets
+
+    assert desired_plugin_names(claude_target, inventory, resolved.hooks_for_target(claude_target)) == (
+        "agent-config-bridge-hooks",
+    )
+    assert desired_plugin_names(codex_target, inventory, resolved.hooks_for_target(codex_target)) == ()
+
+
+def test_hook_version_bump_does_not_rebuild_product_without_gated_hooks(tmp_path: Path) -> None:
+    """Bumping hooks/.version must not change the digest of a hook-free product."""
+
+    from agent_config_bridge.renderer import marketplace_digest
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("guard",))
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    _write(catalog / "governance" / "guard.toml", _hook_manifest("guard"))  # claude-code only
+    # Codex-only config: no gated hook renders for it, so a version bump is inert.
+    from agent_config_bridge.models import (
+        BridgeConfig,
+        Component,
+        LinkMode,
+        Platform,
+        Product,
+        Surface,
+        TargetConfig,
+    )
+
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    codex_target = TargetConfig(
+        name="codex",
+        product=Product.CODEX,
+        platform=Platform.LINUX,
+        user_home=home,
+        config_home=home / ".codex",
+        components=frozenset({Component.HOOKS}),
+        surfaces=frozenset({Surface.CLI}),
+        enabled=True,
+    )
+    config = BridgeConfig(
+        schema_version=1,
+        catalog=catalog,
+        state_dir=tmp_path / "state",
+        link_mode=LinkMode.SYMLINK,
+        components=frozenset({Component.HOOKS}),
+        targets=(codex_target,),
+    )
+
+    before = marketplace_digest(config, discover_catalog(config))
+    (catalog / "hooks" / ".version").write_text("0.2.0\n", encoding="utf-8")
+    after = marketplace_digest(config, discover_catalog(config))
+
+    assert before == after
+
+
+def test_hooks_for_product_unions_same_product_targets(tmp_path: Path) -> None:
+    """A hook gated in for one target of a product delivers to all of them."""
+
+    from agent_config_bridge.governance import resolve_inventory
+    from agent_config_bridge.models import (
+        BridgeConfig,
+        Component,
+        LinkMode,
+        Platform,
+        Product,
+        Surface,
+        TargetConfig,
+    )
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("desktop-only",))
+    _write(catalog / "governance" / "policy.toml", 'schema_version = 1\nmode = "required"\n')
+    _write(
+        catalog / "governance" / "desktop-only.toml",
+        _hook_manifest("desktop-only").replace('surfaces = ["cli", "desktop"]', 'surfaces = ["desktop"]'),
+    )
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+
+    def claude(name: str, surface: Surface) -> TargetConfig:
+        return TargetConfig(
+            name=name,
+            product=Product.CLAUDE_CODE,
+            platform=Platform.LINUX,
+            user_home=home,
+            config_home=home / f".claude-{name}",
+            components=frozenset({Component.HOOKS}),
+            surfaces=frozenset({surface}),
+            enabled=True,
+        )
+
+    cli_target = claude("cli", Surface.CLI)
+    desktop_target = claude("desktop", Surface.DESKTOP)
+    config = BridgeConfig(
+        schema_version=1,
+        catalog=catalog,
+        state_dir=tmp_path / "state",
+        link_mode=LinkMode.SYMLINK,
+        components=frozenset({Component.HOOKS}),
+        targets=(cli_target, desktop_target),
+    )
+    resolved = resolve_inventory(discover_catalog(config))
+
+    # The cli-only target does not match the desktop-scoped manifest on its own,
+    assert resolved.hooks_for_target(cli_target) == ()
+    # but the product union (what actually installs) includes the hook.
+    assert [hook.name for hook in resolved.hooks_for_product(config, Product.CLAUDE_CODE)] == ["desktop-only"]
