@@ -63,7 +63,9 @@ _TASK_STOP_AT_DURATION_END = "false"
 _TASK_DISALLOW_ON_BATTERIES = "false"
 _TASK_STOP_ON_BATTERIES = "false"
 _TASK_START_WHEN_AVAILABLE = "true"
-_WINDOWS_FILE_NOT_FOUND_HRESULT = 0x80070002
+# schtasks reports an absent task as ERROR_FILE_NOT_FOUND or, on some hosts,
+# ERROR_PATH_NOT_FOUND; both HRESULTs mean the queried task does not exist.
+_WINDOWS_ABSENT_TASK_HRESULTS = frozenset({0x80070002, 0x80070003})
 _WINDOWS_SID = re.compile(r"^S-\d-(?:\d+-)+\d+$")
 _MAX_TASK_XML_CHARACTERS = 1_000_000
 
@@ -591,7 +593,7 @@ class WindowsTaskSchedulerBackend:
             if not (result.stdout or "").strip():
                 raise ScheduleBackendError("Task Scheduler returned an empty XML document for an existing task")
             return result.stdout
-        if result.returncode & 0xFFFFFFFF == _WINDOWS_FILE_NOT_FOUND_HRESULT:
+        if result.returncode & 0xFFFFFFFF in _WINDOWS_ABSENT_TASK_HRESULTS:
             return None
         diagnostic = f"{result.stdout or ''}\n{result.stderr or ''}".casefold()
         missing_messages = (
