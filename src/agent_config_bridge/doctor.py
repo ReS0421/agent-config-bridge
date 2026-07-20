@@ -59,7 +59,7 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
             (
                 f"catalog contains {len(inventory.skills)} skills, {len(inventory.plugins)} plugins, "
                 f"{len(inventory.hooks)} hook bundles, {len(inventory.settings)} settings bundles, "
-                f"and {len(inventory.schedules)} schedules"
+                f"{len(inventory.schedules)} schedules, and {len(inventory.instructions)} instruction bundles"
             ),
         )
     ]

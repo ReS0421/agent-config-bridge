@@ -1,6 +1,7 @@
 # Agent Config Bridge
 
-One canonical catalog for Skills, Plugins, Hooks, Settings, and Schedules across:
+One canonical catalog for Skills, Plugins, Hooks, Settings, Schedules, and
+Instructions across:
 
 - Codex CLI and Codex Desktop
 - Claude Code CLI and Claude Code Desktop
@@ -9,8 +10,10 @@ One canonical catalog for Skills, Plugins, Hooks, Settings, and Schedules across
 Agent Config Bridge does not pretend the products use identical formats. Skills
 can usually be shared directly. Plugins and Hooks are rendered into
 product-specific packages, Settings are merged into public product files by
-owned leaf, and Schedules are executed through host schedulers and product CLIs.
-All five component classes still come from one version-controlled catalog.
+owned leaf, Schedules are executed through host schedulers and product CLIs,
+and Instructions are per-product policy files linked or copied file-by-file
+into the product configuration home. All six component classes still come from
+one version-controlled catalog.
 
 > **Status: alpha.** The safety model and core workflow are implemented, but product schemas continue to evolve. Always review `agentbridge plan` before applying or registering anything.
 
@@ -50,6 +53,12 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   `registry generate` writing a byte-deterministic committed
   `catalog/registry.json` and `registry check` gating drift; the active mode is
   the committed `catalog/governance/policy.toml` (audit implemented)
+- An `instructions` component (ADR-5 in the catalog repo) deploying always-on
+  policy files from per-product bundle overlays to a strict destination
+  allowlist (Claude Code: `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`;
+  Codex: `AGENTS.md`, `agents/**`) with per-file single ownership, no
+  render-time merging, newline-normalized drift detection, and
+  `AGENTBRIDGE-MANAGED.json` markers on managed instruction directories
 - Canonical Codex Skill destination: `~/.agents/skills`
 - Claude Code Skill destination: `~/.claude/skills`
 - Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`
@@ -130,9 +139,9 @@ marketplace, and render per-target Schedule snapshots:
 agentbridge apply --yes
 ```
 
-`apply` records the standalone Skills and Settings leaves it manages and prints
-the product and host commands needed to activate rendered Plugins, Hooks, and
-Schedules. Registration is deliberately separate:
+`apply` records the standalone Skills, Instruction files, and Settings leaves
+it manages and prints the product and host commands needed to activate rendered
+Plugins, Hooks, and Schedules. Registration is deliberately separate:
 
 ```bash
 agentbridge register --target local-codex --yes
@@ -171,7 +180,7 @@ schema_version = 1
 catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto" # auto | symlink | copy
-components = ["skills", "plugins", "hooks", "settings", "schedules"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
 
 [[targets]]
 name = "local-codex"
@@ -252,11 +261,24 @@ catalog/
 │   └── shared-defaults/
 │       ├── codex/config.toml    # Codex-native fragment
 │       └── claude-code/settings.json
-└── schedules/
-    └── daily-review/
-        ├── schedule.toml        # cron, timezone, worktree, timeout
-        └── PROMPT.md            # prompt passed on standard input
+├── schedules/
+│   └── daily-review/
+│       ├── schedule.toml        # cron, timezone, worktree, timeout
+│       └── PROMPT.md            # prompt passed on standard input
+└── instructions/
+    └── global-policy/
+        ├── claude-code/         # optional product overlay (no common/)
+        │   ├── CLAUDE.md
+        │   └── rules/git-workflow.md
+        └── codex/
+            └── AGENTS.md
 ```
+
+Instruction bundles have no `common/` overlay and are never merged: each
+destination file below the product configuration home has exactly one owning
+bundle, and an existing unmanaged destination file is a conflict even when its
+content matches. Sources must be non-empty UTF-8 without BOM; content identity
+normalizes CRLF/CR to LF so a line-ending-only difference never reads as drift.
 
 `common/` is copied into each package, followed by only that product's overlay.
 Overlay files must be identical or non-overlapping; conflicting target files
@@ -337,7 +359,7 @@ for the schema and lifecycle.
 Target `name` is the ownership-state identity. Before renaming or deleting a
 target—or changing its product/home identity—keep the old identity, set
 `components = []`, run both `apply` and `register` to reconcile its managed
-Skills/Plugins/Hooks/Settings/Schedules, and only then change or remove the
+Skills/Plugins/Hooks/Settings/Schedules/Instructions, and only then change or remove the
 target. Otherwise the old `state_dir/targets/<name>` record becomes orphaned and
 diagnostics report
 that it cannot be reconciled automatically. `apply` and `register` then stop until

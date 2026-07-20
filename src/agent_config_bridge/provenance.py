@@ -19,13 +19,16 @@ from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.catalog import Artifact
+from agent_config_bridge.instructions import managed_instruction_directories
 from agent_config_bridge.models import BridgeConfig, Component, TargetConfig
 from agent_config_bridge.state import BridgeStateError, effective_link_mode, skill_root_for_target
 
 __all__ = [
     "ROOT_MARKER_FILENAME",
+    "read_instruction_dir_marker",
     "read_skill_root_marker",
     "remove_skill_root_marker",
+    "write_instruction_dir_markers",
     "write_skill_root_marker",
 ]
 
@@ -98,7 +101,10 @@ def read_skill_root_marker(target: TargetConfig) -> dict[str, Any] | None:
             or was not written by the bridge.
     """
 
-    marker = skill_root_for_target(target) / ROOT_MARKER_FILENAME
+    return _read_marker(skill_root_for_target(target) / ROOT_MARKER_FILENAME)
+
+
+def _read_marker(marker: Path) -> dict[str, Any] | None:
     if not marker.exists():
         if marker.is_symlink():
             raise BridgeStateError(f"provenance marker is a broken symlink: {marker}")
@@ -130,6 +136,106 @@ def remove_skill_root_marker(target: TargetConfig) -> None:
     if marker.is_symlink():
         raise BridgeStateError(f"cannot remove a symlinked provenance marker: {marker}")
     if not marker.is_file():
+        return
+    try:
+        marker.unlink()
+    except OSError as exc:
+        raise BridgeStateError(f"could not remove provenance marker: {marker}: {exc}") from exc
+
+
+_INSTRUCTION_NOTICE = (
+    "This directory holds instruction files managed by agent-config-bridge.",
+    "Managed files here are links or managed copies of one canonical catalog; "
+    "hand edits are reverted by the next `agentbridge apply`.",
+    "Similar-looking instruction directories on other hosts or products are "
+    "projections of the same catalog, not accidental duplicates.",
+    "Review with `agentbridge plan`; ownership records live in the state_dir recorded below.",
+)
+
+
+def write_instruction_dir_markers(
+    config: BridgeConfig,
+    target: TargetConfig,
+    relpaths: tuple[str, ...],
+    previous_relpaths: tuple[str, ...],
+) -> tuple[Path, ...]:
+    """Write markers for managed instruction directories; drop stale ones.
+
+    Per ADR-5 only managed *directories* (``rules/``, ``agents/``,
+    ``commands/``) carry a marker — root-level single files such as
+    ``AGENTS.md`` do not, because the config home as a whole is not
+    bridge-owned. Directories this target stopped managing lose their marker
+    only when this target wrote it. Directories are never created just to
+    hold a marker.
+
+    Raises:
+        BridgeStateError: If a symlink squats on a marker path or a write fails.
+    """
+
+    current_dirs = managed_instruction_directories(relpaths)
+    for stale in set(managed_instruction_directories(previous_relpaths)) - set(current_dirs):
+        _remove_instruction_marker_if_owned(target, stale)
+
+    written: list[Path] = []
+    # Informational marker metadata only; catalog validation guarantees a
+    # root-level file name never collides with a managed directory name.
+    file_counts = {
+        directory: sum(relpath.split("/", 1)[0] == directory and "/" in relpath for relpath in relpaths)
+        for directory in current_dirs
+    }
+    for directory in current_dirs:
+        root = target.config_home / directory
+        if not root.is_dir():
+            continue
+        marker = root / ROOT_MARKER_FILENAME
+        if marker.is_symlink():
+            raise BridgeStateError(f"refusing to write a provenance marker through a symlink: {marker}")
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "managed_by": _MANAGED_BY,
+            "role": "deployment-projection",
+            "component": "instructions",
+            "notice": list(_INSTRUCTION_NOTICE),
+            "target": target.name,
+            "product": target.product.value,
+            "platform": target.platform.value,
+            "mode": effective_link_mode(config.link_mode, target.platform).value,
+            "catalog_root": str(config.catalog.resolve()),
+            "state_dir": str(config.state_dir.resolve()),
+            "file_count": file_counts[directory],
+            "applied_at": datetime.now(UTC).astimezone().isoformat(timespec="seconds"),
+        }
+        temporary = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(temporary, marker)
+        except OSError as exc:
+            temporary.unlink(missing_ok=True)
+            raise BridgeStateError(f"could not write provenance marker: {marker}: {exc}") from exc
+        written.append(marker)
+    return tuple(written)
+
+
+def read_instruction_dir_marker(target: TargetConfig, directory: str) -> dict[str, Any] | None:
+    """Read one managed instruction directory's marker, or ``None`` when absent.
+
+    Raises:
+        BridgeStateError: If the marker is a symlink, unreadable, malformed,
+            or was not written by the bridge.
+    """
+
+    return _read_marker(target.config_home / directory / ROOT_MARKER_FILENAME)
+
+
+def _remove_instruction_marker_if_owned(target: TargetConfig, directory: str) -> None:
+    try:
+        payload = read_instruction_dir_marker(target, directory)
+    except BridgeStateError:
+        return
+    if payload is None or payload["target"] != target.name:
+        return
+    marker = target.config_home / directory / ROOT_MARKER_FILENAME
+    if marker.is_symlink() or not marker.is_file():
         return
     try:
         marker.unlink()

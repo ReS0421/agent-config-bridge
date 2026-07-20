@@ -11,6 +11,12 @@ from pathlib import Path
 from agent_config_bridge.catalog import Artifact, CatalogInventory
 from agent_config_bridge.filesystem import read_managed_marker, tree_digest
 from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
+from agent_config_bridge.instructions import (
+    InstructionFile,
+    instruction_digest,
+    instruction_files,
+    instruction_source_id,
+)
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key, paths_overlap, read_symlink_target
 from agent_config_bridge.platforms import (
@@ -41,11 +47,13 @@ from agent_config_bridge.settings import (
 )
 from agent_config_bridge.state import (
     BridgeStateError,
+    InstructionStateEntry,
     SettingsState,
     SkillStateEntry,
     desired_plugin_names,
     effective_link_mode,
     find_orphaned_target_states,
+    read_instruction_state,
     read_registration_state,
     read_settings_state,
     read_skill_state,
@@ -225,6 +233,35 @@ def build_plan(
                     _plan_skill_removal(
                         previous_skill,
                         _skill_destination(target),
+                        target,
+                        inventory,
+                        windows_path_semantics=windows_path_semantics,
+                    )
+                )
+
+        previous_instructions = read_instruction_state(config, target)
+        selected_instruction_relpaths: set[str] = set()
+        if Component.INSTRUCTIONS in target.components:
+            previous_instructions_by_relpath = {entry.relpath: entry for entry in previous_instructions}
+            mode = effective_link_mode(config.link_mode, target.platform)
+            for bundle in resolved.instructions_for_target(target):
+                for instruction in instruction_files(bundle, target.product):
+                    selected_instruction_relpaths.add(instruction.relpath)
+                    actions.append(
+                        _plan_instruction_file(
+                            instruction,
+                            _instruction_destination(target, instruction.relpath),
+                            target,
+                            mode,
+                            previous_instructions_by_relpath.get(instruction.relpath),
+                            windows_path_semantics=windows_path_semantics,
+                        )
+                    )
+        for previous_instruction in previous_instructions:
+            if previous_instruction.relpath not in selected_instruction_relpaths:
+                actions.append(
+                    _plan_instruction_removal(
+                        previous_instruction,
                         target,
                         inventory,
                         windows_path_semantics=windows_path_semantics,
@@ -734,6 +771,255 @@ def _conflict_action(
 
 def _skill_source_id(skill: Artifact) -> str:
     return f"skills/{skill.name}"
+
+
+def _instruction_destination(target: TargetConfig, relpath: str) -> Path:
+    destination = target.config_home.joinpath(*relpath.split("/"))
+    # Defense in depth: relpath validation already forbids traversal and
+    # drive-letter components, so a join that re-anchors outside config_home
+    # can only mean corrupted input and must never reach apply.
+    if not destination.is_relative_to(target.config_home):
+        raise BridgeStateError(f"instruction destination escapes target config_home: {relpath!r} -> {destination}")
+    return destination
+
+
+def _plan_instruction_file(
+    instruction: InstructionFile,
+    destination: Path,
+    target: TargetConfig,
+    mode: LinkMode,
+    previous: InstructionStateEntry | None,
+    *,
+    windows_path_semantics: bool,
+) -> Action:
+    source_id = instruction_source_id(instruction.bundle)
+    source_digest = instruction_digest(instruction.source)
+    if mode is LinkMode.SYMLINK:
+        return _plan_instruction_link(
+            instruction,
+            destination,
+            target,
+            previous,
+            source_id=source_id,
+            source_digest=source_digest,
+            windows_path_semantics=windows_path_semantics,
+        )
+    return _plan_instruction_copy(
+        instruction,
+        destination,
+        target,
+        previous,
+        source_id=source_id,
+        source_digest=source_digest,
+    )
+
+
+def _plan_instruction_link(
+    instruction: InstructionFile,
+    destination: Path,
+    target: TargetConfig,
+    previous: InstructionStateEntry | None,
+    *,
+    source_id: str,
+    source_digest: str,
+    windows_path_semantics: bool,
+) -> Action:
+    base = Action(
+        operation=Operation.LINK,
+        disposition=Disposition.CREATE,
+        component=Component.INSTRUCTIONS,
+        target=target.name,
+        name=instruction.relpath,
+        source=instruction.source,
+        destination=destination,
+        detail="create canonical instruction file symlink",
+        source_id=source_id,
+        source_digest=source_digest,
+    )
+    if destination.is_symlink():
+        if previous is None or previous.mode is not LinkMode.SYMLINK:
+            return replace(
+                base,
+                disposition=Disposition.CONFLICT,
+                detail="existing symlink has no matching target ownership state",
+            )
+        try:
+            actual_target = destination.resolve(strict=True)
+            same_target = path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            ) == path_comparison_key(
+                instruction.source.resolve(strict=True),
+                windows=windows_path_semantics,
+            )
+        except (OSError, RuntimeError):
+            actual_target = None
+            same_target = False
+        recorded_target = Path(previous.link_target) if previous.link_target is not None else None
+        recorded_target_matches = bool(
+            actual_target is not None
+            and recorded_target is not None
+            and path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            )
+            == path_comparison_key(
+                recorded_target,
+                windows=windows_path_semantics,
+            )
+        )
+        if same_target and recorded_target_matches:
+            return replace(
+                base,
+                disposition=Disposition.NOOP,
+                detail="symlink already points to canonical instruction file",
+            )
+        detail = (
+            "managed symlink no longer matches its recorded target"
+            if same_target
+            else "destination is a different or dangling symlink"
+        )
+        return replace(base, disposition=Disposition.CONFLICT, detail=detail)
+    if os.path.lexists(destination):
+        # Per ADR-5 an existing unmanaged destination file is a conflict even
+        # when its content matches the catalog source; it is never adopted.
+        return replace(
+            base,
+            disposition=Disposition.CONFLICT,
+            detail="destination already exists and is not managed as this symlink",
+        )
+    return base
+
+
+def _plan_instruction_copy(
+    instruction: InstructionFile,
+    destination: Path,
+    target: TargetConfig,
+    previous: InstructionStateEntry | None,
+    *,
+    source_id: str,
+    source_digest: str,
+) -> Action:
+    base = Action(
+        operation=Operation.COPY,
+        disposition=Disposition.CREATE,
+        component=Component.INSTRUCTIONS,
+        target=target.name,
+        name=instruction.relpath,
+        source=instruction.source,
+        destination=destination,
+        detail="create managed instruction file copy",
+        source_id=source_id,
+        source_digest=source_digest,
+    )
+    if not os.path.lexists(destination):
+        return base
+    if destination.is_symlink() or not destination.is_file():
+        return replace(
+            base,
+            disposition=Disposition.CONFLICT,
+            detail="copy destination exists with an unsupported type",
+        )
+    if previous is None or previous.mode is not LinkMode.COPY or previous.installed_digest is None:
+        return replace(
+            base,
+            disposition=Disposition.CONFLICT,
+            detail="existing copy destination has no matching target ownership state",
+        )
+    current_digest = instruction_digest(destination)
+    if current_digest != previous.installed_digest:
+        return replace(
+            base,
+            disposition=Disposition.CONFLICT,
+            detail="managed instruction copy was modified after installation",
+        )
+    if source_digest == current_digest:
+        return replace(
+            base,
+            disposition=Disposition.NOOP,
+            detail="managed copy matches canonical instruction file",
+        )
+    return replace(
+        base,
+        disposition=Disposition.UPDATE,
+        detail="update unchanged managed instruction copy and retain backup",
+    )
+
+
+def _plan_instruction_removal(
+    previous: InstructionStateEntry,
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    *,
+    windows_path_semantics: bool,
+) -> Action:
+    destination = _instruction_destination(target, previous.relpath)
+    # Unlike a Skill, whose source is its whole directory, an instruction
+    # removal names one file: point at the per-file catalog path.
+    source = (
+        Path(previous.link_target)
+        if previous.link_target is not None
+        else (inventory.root / previous.source_id / target.product.value).joinpath(*previous.relpath.split("/"))
+    )
+    base = Action(
+        operation=Operation.REMOVE,
+        disposition=Disposition.REMOVE,
+        component=Component.INSTRUCTIONS,
+        target=target.name,
+        name=previous.relpath,
+        source=source,
+        destination=destination,
+        detail="remove a deselected bridge-managed instruction file",
+        source_id=previous.source_id,
+        source_digest=previous.installed_digest,
+        link_mode=previous.mode,
+    )
+    if not os.path.lexists(destination):
+        return replace(
+            base,
+            disposition=Disposition.NOOP,
+            detail="previously managed instruction file is already absent",
+        )
+
+    if previous.mode is LinkMode.SYMLINK:
+        if not destination.is_symlink() or previous.link_target is None:
+            return replace(
+                base,
+                disposition=Disposition.CONFLICT,
+                detail="previously managed instruction link was replaced by other content",
+            )
+        try:
+            actual_target = read_symlink_target(destination)
+            target_matches = path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            ) == path_comparison_key(
+                Path(previous.link_target),
+                windows=windows_path_semantics,
+            )
+        except (OSError, RuntimeError):
+            target_matches = False
+        if not target_matches:
+            return replace(
+                base,
+                disposition=Disposition.CONFLICT,
+                detail="previously managed instruction link now points elsewhere",
+            )
+        return base
+
+    if destination.is_symlink() or not destination.is_file():
+        return replace(
+            base,
+            disposition=Disposition.CONFLICT,
+            detail="previously managed instruction copy was replaced by another path type",
+        )
+    if previous.installed_digest is None or instruction_digest(destination) != previous.installed_digest:
+        return replace(
+            base,
+            disposition=Disposition.CONFLICT,
+            detail="previously managed instruction copy was modified after installation",
+        )
+    return base
 
 
 def _hook_reviews(target: TargetConfig, hooks: tuple[Artifact, ...]) -> list[str]:

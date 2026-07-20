@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_config_bridge.catalog import Artifact, CatalogInventory
+from agent_config_bridge.catalog import Artifact, CatalogInventory, is_windows_portable_path_component
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key
 
 __all__ = [
     "BridgeStateError",
+    "InstructionStateEntry",
     "RegistrationState",
     "SchedulerState",
     "SettingStateEntry",
@@ -24,6 +25,8 @@ __all__ = [
     "desired_plugin_names",
     "effective_link_mode",
     "find_orphaned_target_states",
+    "instruction_state_path",
+    "read_instruction_state",
     "read_registration_state",
     "read_scheduler_state",
     "read_settings_state",
@@ -35,6 +38,7 @@ __all__ = [
     "settings_state_path",
     "skill_root_for_target",
     "skill_state_path",
+    "write_instruction_state",
     "write_registered_plugins",
     "write_scheduler_state",
     "write_settings_state",
@@ -57,6 +61,22 @@ class SkillStateEntry:
     mode: LinkMode
     source_id: str
     link_target: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InstructionStateEntry:
+    """One instruction file previously managed for a target (ADR-5).
+
+    ``relpath`` is the destination path below the target ``config_home`` in
+    POSIX form. ``installed_digest`` is the newline-normalized content digest
+    recorded for managed copies; symlinks record ``link_target`` instead.
+    """
+
+    relpath: str
+    mode: LinkMode
+    source_id: str
+    link_target: str | None
+    installed_digest: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +158,12 @@ def settings_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
     return _state_path(config, target, "settings.json")
 
 
+def instruction_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
+    """Return the validated per-target instruction ownership record path."""
+
+    return _state_path(config, target, "instructions.json")
+
+
 def scheduler_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
     """Return the validated per-target host-scheduler ownership record path."""
 
@@ -198,6 +224,121 @@ def read_skill_state(config: BridgeConfig, target: TargetConfig) -> tuple[SkillS
             )
         )
     return tuple(entries)
+
+
+def read_instruction_state(config: BridgeConfig, target: TargetConfig) -> tuple[InstructionStateEntry, ...]:
+    """Read instruction files previously reconciled through ``agentbridge apply``."""
+
+    path = instruction_state_path(config, target)
+    if not path.exists():
+        if path.is_symlink():
+            raise BridgeStateError(f"instruction ownership state is a broken symlink: {path}")
+        return ()
+    payload = _read_state_payload(path, "instruction ownership state")
+    try:
+        if payload["schema_version"] != 1 or payload["target"] != target.name:
+            raise ValueError("schema version or target does not match")
+        _require_identity(payload, _instruction_identity(target), path)
+        raw_entries = payload["instructions"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BridgeStateError(f"invalid instruction ownership state: {path}") from exc
+    if not isinstance(raw_entries, list):
+        raise BridgeStateError(f"invalid instruction list in ownership state: {path}")
+
+    entries: list[InstructionStateEntry] = []
+    relpaths: set[str] = set()
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise BridgeStateError(f"invalid instruction entry in ownership state: {path}")
+        try:
+            relpath = raw_entry["relpath"]
+            mode = LinkMode(raw_entry["mode"])
+            source_id = raw_entry["source_id"]
+            link_target = raw_entry.get("link_target")
+            installed_digest = raw_entry.get("installed_digest")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BridgeStateError(f"invalid instruction entry in ownership state: {path}") from exc
+        if (
+            not _is_valid_instruction_relpath(relpath)
+            or relpath in relpaths
+            or mode is LinkMode.AUTO
+            or not isinstance(source_id, str)
+            or not source_id.startswith("instructions/")
+            or _ARTIFACT_NAME.fullmatch(source_id.removeprefix("instructions/")) is None
+            or (link_target is not None and not isinstance(link_target, str))
+            or (mode is LinkMode.SYMLINK and (not link_target or installed_digest is not None))
+            or (
+                mode is LinkMode.COPY
+                and (
+                    link_target is not None
+                    or not isinstance(installed_digest, str)
+                    or _SHA256.fullmatch(installed_digest) is None
+                )
+            )
+        ):
+            raise BridgeStateError(f"invalid instruction entry in ownership state: {path}")
+        relpaths.add(relpath)
+        entries.append(
+            InstructionStateEntry(
+                relpath=relpath,
+                mode=mode,
+                source_id=source_id,
+                link_target=link_target,
+                installed_digest=installed_digest,
+            )
+        )
+    return tuple(entries)
+
+
+def write_instruction_state(
+    config: BridgeConfig,
+    target: TargetConfig,
+    entries: tuple[InstructionStateEntry, ...],
+) -> None:
+    """Atomically record the desired instruction files for one target.
+
+    ``entries`` must be the governance-gated desired set for this target —
+    recording gated-out files would make the next plan retract them forever.
+    """
+
+    path = instruction_state_path(config, target)
+    if not entries:
+        _remove_state_document(path, "instruction ownership state")
+        return
+    _write_state_document(
+        path,
+        {
+            "schema_version": 1,
+            "target": target.name,
+            "identity": _instruction_identity(target),
+            "instructions": [
+                {
+                    "relpath": entry.relpath,
+                    "mode": entry.mode.value,
+                    "source_id": entry.source_id,
+                    "link_target": entry.link_target,
+                    "installed_digest": entry.installed_digest,
+                }
+                for entry in entries
+            ],
+        },
+        "instruction ownership state",
+    )
+
+
+def _is_valid_instruction_relpath(relpath: object) -> bool:
+    """Reject traversal and any component the catalog itself would refuse.
+
+    The Windows-portability check is load-bearing, not cosmetic: a component
+    such as ``D:evil.md`` would re-anchor ``PureWindowsPath.joinpath`` to
+    another drive, letting a tampered state file point a removal outside the
+    target ``config_home``.
+    """
+
+    if not isinstance(relpath, str) or not relpath or "\\" in relpath or "\x00" in relpath:
+        return False
+    parts = relpath.split("/")
+    return all(part not in {"", ".", ".."} and is_windows_portable_path_component(part) for part in parts)
 
 
 def read_registered_plugins(config: BridgeConfig, target: TargetConfig) -> tuple[str, ...]:
@@ -469,7 +610,7 @@ def find_orphaned_target_states(config: BridgeConfig) -> tuple[str, ...]:
             raise BridgeStateError(f"invalid target ownership state directory: {candidate}")
         has_state = any(
             (candidate / filename).exists()
-            for filename in ("skills.json", "plugins.json", "settings.json", "scheduler.json")
+            for filename in ("skills.json", "plugins.json", "settings.json", "scheduler.json", "instructions.json")
         )
         if has_state and candidate.name not in enabled_names:
             orphaned.append(candidate.name)
@@ -486,6 +627,14 @@ def _skill_identity(target: TargetConfig) -> dict[str, str]:
 
 
 def _registration_identity(target: TargetConfig) -> dict[str, str]:
+    return {
+        "product": target.product.value,
+        "platform": target.platform.value,
+        "config_home": _path_identity(target.config_home, target.platform),
+    }
+
+
+def _instruction_identity(target: TargetConfig) -> dict[str, str]:
     return {
         "product": target.product.value,
         "platform": target.platform.value,
