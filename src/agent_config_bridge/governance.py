@@ -68,9 +68,9 @@ _LEGAL_KIND_DELIVERY = frozenset(
         ("tool", "mcp-registration"),
     }
 )
-# No "tools" or "instructions" component exists yet, so kind=tool (ADR-6) and
-# kind=instruction (ADR-5) manifests cannot carry resolvable artifact refs today.
-_ARTIFACT_COMPONENTS = ("hooks", "plugins", "schedules", "settings", "skills")
+# No "tools" component exists yet, so kind=tool (ADR-6) manifests cannot carry
+# resolvable artifact refs today.
+_ARTIFACT_COMPONENTS = ("hooks", "instructions", "plugins", "schedules", "settings", "skills")
 # Agent Skills spec: conservative allowed top-level frontmatter keys.
 _ALLOWED_SKILL_FRONTMATTER = frozenset(
     {"name", "description", "license", "metadata", "allowed-tools", "argument-hint", "model"}
@@ -152,6 +152,17 @@ class ResolvedInventory:
         """
 
         return self._artifacts_for_target("skills", self.inventory.skills, target)
+
+    def instructions_for_target(self, target: TargetConfig) -> tuple[Artifact, ...]:
+        """Return the instruction bundles this target should deploy (ADR-5).
+
+        The gate is the ``skills_for_target`` analogue: in ``required`` mode a
+        bundle deploys only when a deployable governing manifest matches this
+        target. Surface matching is any-overlap because instruction files share
+        one ``config_home`` per target.
+        """
+
+        return self._artifacts_for_target("instructions", self.inventory.instructions, target)
 
     def hooks_for_target(self, target: TargetConfig) -> tuple[Artifact, ...]:
         """Return the hook bundles governance gates in for this single target.
@@ -649,6 +660,7 @@ def _inventory_refs(inventory: CatalogInventory) -> set[str]:
         f"{component}/{artifact.name}"
         for component, artifacts in (
             ("hooks", inventory.hooks),
+            ("instructions", inventory.instructions),
             ("plugins", inventory.plugins),
             ("schedules", inventory.schedules),
             ("settings", inventory.settings),

@@ -20,6 +20,7 @@ __all__ = [
     "CatalogError",
     "CatalogInventory",
     "discover_catalog",
+    "is_windows_portable_path_component",
 ]
 
 _ARTIFACT_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
@@ -31,6 +32,18 @@ _SEMVER = re.compile(
 )
 _HOOK_PLUGIN_NAME = "agent-config-bridge-hooks"
 _MANAGED_MARKER = ".agent-config-bridge.json"
+_INSTRUCTION_ROOT_MARKER = "AGENTBRIDGE-MANAGED.json"
+# ADR-5 decision 2: instructions deploy to overlay-relative paths under a
+# product config_home, gated by this per-product destination allowlist so the
+# component cannot become an arbitrary config-home file writer.
+_INSTRUCTION_ALLOWED_ROOT_FILES = {
+    "claude-code": frozenset({"CLAUDE.md"}),
+    "codex": frozenset({"AGENTS.md"}),
+}
+_INSTRUCTION_ALLOWED_DIRS = {
+    "claude-code": frozenset({"rules", "agents", "commands"}),
+    "codex": frozenset({"agents"}),
+}
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
@@ -62,6 +75,7 @@ class CatalogInventory:
     settings: tuple[Artifact, ...]
     schedules: tuple[Artifact, ...]
     hook_version: str | None
+    instructions: tuple[Artifact, ...] = ()
 
 
 def discover_catalog(config: BridgeConfig) -> CatalogInventory:
@@ -86,6 +100,8 @@ def discover_catalog(config: BridgeConfig) -> CatalogInventory:
     hooks = _discover_group(root / "hooks", root, _validate_hook)
     settings = _discover_group(root / "settings", root, _validate_settings)
     schedules = _discover_group(root / "schedules", root, _validate_schedule)
+    instructions = _discover_group(root / "instructions", root, _validate_instructions)
+    _validate_instruction_collisions(instructions)
     hook_version = _read_hook_version(root / "hooks", root, required=bool(hooks))
     return CatalogInventory(
         root=root,
@@ -95,6 +111,7 @@ def discover_catalog(config: BridgeConfig) -> CatalogInventory:
         settings=settings,
         schedules=schedules,
         hook_version=hook_version,
+        instructions=instructions,
     )
 
 
@@ -322,6 +339,104 @@ def _validate_schedule(path: Path) -> None:
         raise CatalogError(f"schedule prompt must not be empty: {prompt}")
 
 
+def _validate_instructions(path: Path) -> None:
+    """Validate one instruction bundle's product overlays (ADR-5).
+
+    There is deliberately no ``common/`` cross-product overlay: the products
+    consume differently shaped files, and a shared-source merge is exactly the
+    content transformation the Bridge refuses elsewhere.
+    """
+
+    allowed_roots = set(_INSTRUCTION_ALLOWED_ROOT_FILES)
+    children = {child.name for child in path.iterdir()}
+    unknown = sorted(children - allowed_roots)
+    if unknown:
+        raise CatalogError(
+            f"instruction bundle contains unsupported roots {', '.join(repr(name) for name in unknown)}: {path}"
+        )
+    overlays = tuple(path / product for product in sorted(allowed_roots) if (path / product).is_dir())
+    if not overlays:
+        raise CatalogError(f"instruction bundle must contain a codex/ or claude-code/ product overlay: {path}")
+
+    for overlay in overlays:
+        files = tuple(sorted(candidate for candidate in overlay.rglob("*") if not candidate.is_dir()))
+        if not files:
+            raise CatalogError(f"instruction product overlay contains no files: {overlay}")
+        for file in files:
+            relative = file.relative_to(overlay)
+            _validate_instruction_destination(relative, overlay.name, file)
+            _validate_instruction_content(file)
+
+
+def _validate_instruction_destination(relative: Path, product: str, file: Path) -> None:
+    # Only the top-level segment needs allowlisting here: byte-level path
+    # safety for every nested segment (Windows-invalid characters, reserved
+    # device names, case-insensitive collisions) is guaranteed earlier by
+    # _validate_artifact_tree, which runs for the whole artifact before this
+    # validator. Reordering or removing that call would reopen the gap.
+    parts = relative.parts
+    if relative.name == _INSTRUCTION_ROOT_MARKER:
+        raise CatalogError(f"instruction file name is reserved for bridge provenance markers: {file}")
+    if len(parts) == 1:
+        if parts[0] not in _INSTRUCTION_ALLOWED_ROOT_FILES[product]:
+            raise CatalogError(
+                f"instruction destination {relative.as_posix()!r} is not allowed for {product} "
+                f"(allowed root files: {sorted(_INSTRUCTION_ALLOWED_ROOT_FILES[product])}, "
+                f"allowed directories: {sorted(_INSTRUCTION_ALLOWED_DIRS[product])}): {file}"
+            )
+        return
+    if parts[0] not in _INSTRUCTION_ALLOWED_DIRS[product]:
+        raise CatalogError(
+            f"instruction destination {relative.as_posix()!r} is outside the allowed {product} "
+            f"directories {sorted(_INSTRUCTION_ALLOWED_DIRS[product])}: {file}"
+        )
+
+
+def _validate_instruction_content(file: Path) -> None:
+    try:
+        data = file.read_bytes()
+    except OSError as exc:
+        raise CatalogError(f"cannot read instruction file {file}: {exc}") from exc
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise CatalogError(f"instruction file must be UTF-8 without BOM: {file}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CatalogError(f"instruction file must be valid UTF-8: {file}: {exc}") from exc
+    if not text.strip():
+        raise CatalogError(f"instruction file must not be empty: {file}")
+
+
+def _validate_instruction_collisions(instructions: tuple[Artifact, ...]) -> None:
+    """Reject two bundles shipping one destination relpath for one product.
+
+    Per-file single ownership (ADR-5 decision 3) is a catalog-wide invariant,
+    not a selection-time concern: governance gating must never be what keeps
+    two artifacts from owning the same destination file.
+    """
+
+    # Case-folded keys: two bundles shipping relpaths that differ only by case
+    # would collide on a case-insensitive destination filesystem, so treat
+    # that as the same catalog-time single-ownership violation.
+    owners: dict[tuple[str, str], tuple[str, str]] = {}
+    for bundle in instructions:
+        for product in sorted(_INSTRUCTION_ALLOWED_ROOT_FILES):
+            overlay = bundle.path / product
+            if not overlay.is_dir():
+                continue
+            for file in sorted(candidate for candidate in overlay.rglob("*") if not candidate.is_dir()):
+                relpath = file.relative_to(overlay).as_posix()
+                key = (product, relpath.casefold())
+                if previous := owners.get(key):
+                    previous_bundle, previous_relpath = previous
+                    raise CatalogError(
+                        f"instruction destination {relpath!r} for {product} collides with "
+                        f"{previous_relpath!r}: owned by both {previous_bundle!r} and {bundle.name!r}; "
+                        "each destination file has exactly one owning bundle"
+                    )
+                owners[key] = (bundle.name, relpath)
+
+
 def _validate_plugin_manifest(path: Path, artifact_name: str, product_name: str) -> str:
     if not path.is_file():
         raise CatalogError(f"plugin has no {product_name} manifest overlay: {path.parent.parent.parent}")
@@ -409,6 +524,21 @@ def _validate_artifact_tree(root: Path) -> None:
                     f"unsupported filesystem node in catalog artifact: {candidate}; "
                     "only real directories, regular files, and contained symlinks to regular files are allowed"
                 )
+
+
+def is_windows_portable_path_component(name: str) -> bool:
+    """Return whether one path component is portable and safe on Windows.
+
+    Shared with ownership-state validation so a state-file path segment can
+    never smuggle a drive-letter (``D:evil``), reserved device name, or other
+    component the catalog itself would reject.
+    """
+
+    if not name or name != name.rstrip(" ."):
+        return False
+    if any(character in _WINDOWS_INVALID_CHARACTERS or ord(character) < 32 for character in name):
+        return False
+    return _windows_portable_name(name) not in _WINDOWS_DEVICE_NAMES
 
 
 def _validate_windows_path_component(name: str, path: Path) -> None:

@@ -437,7 +437,7 @@ def _command_init(args: argparse.Namespace) -> int:
         raise ConfigError(f"config already exists (use --force to replace it): {config_path}")
 
     catalog = config_path.parent / "catalog"
-    for group in ("skills", "plugins", "hooks", "settings", "schedules"):
+    for group in ("skills", "plugins", "hooks", "settings", "schedules", "instructions"):
         (catalog / group).mkdir(parents=True, exist_ok=True)
     template = """schema_version = 1
 
@@ -445,7 +445,7 @@ def _command_init(args: argparse.Namespace) -> int:
 catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
 
 [[targets]]
 name = "local-codex"
@@ -477,6 +477,7 @@ def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
         "hooks": len(inventory.hooks),
         "settings": len(inventory.settings),
         "schedules": len(inventory.schedules),
+        "instructions": len(inventory.instructions),
         "valid": True,
     }
     if as_json:
@@ -485,7 +486,8 @@ def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
         print(
             f"valid: {payload['skills']} skills, {payload['plugins']} plugins, "
             f"{payload['hooks']} hook bundles, {payload['settings']} settings bundles, "
-            f"and {payload['schedules']} schedules in {payload['catalog']}"
+            f"{payload['schedules']} schedules, and {payload['instructions']} instruction bundles "
+            f"in {payload['catalog']}"
         )
     return 0
 

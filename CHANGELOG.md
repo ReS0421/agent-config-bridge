@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- An `instructions` component (catalog ADR-5) bringing always-loaded policy
+  files under the Bridge: `catalog/instructions/<bundle>/{claude-code,codex}/`
+  overlays deploy file-by-file to overlay-relative paths below the target
+  `config_home`, gated by a per-product destination allowlist (Claude Code:
+  `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`; Codex: `AGENTS.md`,
+  `agents/**`). Each destination file has exactly one owning bundle (two
+  bundles shipping one relpath for one product is a validation error), the
+  Bridge never merges or concatenates, and an existing unmanaged destination
+  file conflicts even when its content matches. Sources must be non-empty
+  UTF-8 without BOM; content identity normalizes CRLF/CR to LF. Delivery
+  reuses the standalone link/copy machinery at file granularity with a
+  per-target `instructions.json` ownership record, retained backups, safe
+  deselection, `ResolvedInventory.instructions_for_target` governance gating
+  in `required` mode, and `AGENTBRIDGE-MANAGED.json` provenance markers on
+  managed instruction directories (root-level single files carry no marker).
+
 - Governance core (`catalog/governance/*.toml` manifests as source of truth,
   ADR-1 capability axes, `GovernanceFinding` diagnostics) with `registry
   generate` writing a byte-deterministic `catalog/registry.json` and `registry
