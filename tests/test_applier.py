@@ -536,6 +536,7 @@ def test_skill_sync_never_renders_or_writes_non_skill_state(
 ) -> None:
     """Non-Skill NOOP actions and command hints stay completely passive."""
 
+    monkeypatch.setattr("agent_config_bridge.planner.current_platform", lambda: Platform.LINUX)
     catalog = make_catalog(tmp_path / "catalog", plugins=("shared",))
     components = frozenset({Component.SKILLS, Component.PLUGINS})
     config = make_config(tmp_path, catalog, mode=LinkMode.COPY, components=components)
