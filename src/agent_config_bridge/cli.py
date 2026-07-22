@@ -13,7 +13,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from agent_config_bridge.applier import ApplyError, apply_plan
+from agent_config_bridge.applier import ApplyError, apply_plan, apply_skill_plan, validate_skill_only_plan
 from agent_config_bridge.catalog import CatalogError, CatalogInventory, discover_catalog
 from agent_config_bridge.config import ConfigError, load_config
 from agent_config_bridge.doctor import CheckLevel, run_doctor
@@ -102,6 +102,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _command_plan(plan, args.json)
         if args.command == "apply":
             return _command_apply(config, inventory, plan, args.yes, args.json)
+        if args.command == "sync-skills":
+            return _command_sync_skills(config, inventory, plan, args.yes, args.json)
         if args.command == "register":
             return _command_register(config, inventory, plan, tuple(args.target), args.yes)
         parser.error(f"unknown command: {args.command}")
@@ -190,13 +192,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ("doctor", "diagnose target discovery and configuration"),
         ("render", "build the immutable dual plugin marketplace"),
         ("apply", "apply safe skill links/copies and render the marketplace"),
+        ("sync-skills", "apply only reviewed standalone Skill changes"),
         ("register", "run product CLI commands to register and install rendered plugins"),
     ):
         command_parser = subparsers.add_parser(command, help=help_text)
         command_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
-        if command in {"validate", "plan", "doctor", "render", "apply"}:
+        if command in {"validate", "plan", "doctor", "render", "apply", "sync-skills"}:
             command_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-        if command in {"apply", "register"}:
+        if command in {"apply", "sync-skills", "register"}:
             command_parser.add_argument("-y", "--yes", action="store_true", help="confirm state-changing actions")
         if command == "register":
             command_parser.add_argument(
@@ -574,6 +577,59 @@ def _command_apply(
             print("plugin and schedule registration remains explicit; review and run:")
             for command in plan.commands:
                 print(f"  [{command.target}] {_format_command(command)}")
+    return 0
+
+
+def _command_sync_skills(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    plan: SyncPlan,
+    confirmed: bool,
+    as_json: bool,
+) -> int:
+    """Apply only Skill changes after validating the complete reviewed plan."""
+
+    skill_actions = validate_skill_only_plan(plan)
+    if not skill_actions:
+        result = apply_skill_plan(config, inventory, plan)
+        warnings = [*plan.warnings, *result.warnings]
+        payload = {
+            "scope": "skills",
+            "skill_only": True,
+            "applied": 0,
+            "backups": [],
+            "warnings": warnings,
+            "no_op": True,
+        }
+        if as_json:
+            _print_json(payload)
+        else:
+            print("skill-only sync: no Skill changes")
+            for warning in warnings:
+                print(f"warning: {warning}", file=sys.stderr)
+        return 0
+    if not _confirm("Apply this skill-only plan?", confirmed):
+        print("cancelled", file=sys.stderr)
+        return 2
+
+    result = apply_skill_plan(config, inventory, plan)
+    warnings = [*plan.warnings, *result.warnings]
+    payload = {
+        "scope": "skills",
+        "skill_only": True,
+        "applied": len(result.applied),
+        "backups": [str(path) for path in result.backups],
+        "warnings": warnings,
+        "no_op": False,
+    }
+    if as_json:
+        _print_json(payload)
+    else:
+        print(f"skill-only sync: applied {payload['applied']} Skill actions")
+        for backup in result.backups:
+            print(f"backup: {backup}")
+        for warning in warnings:
+            print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 

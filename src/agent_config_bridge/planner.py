@@ -550,7 +550,13 @@ def _plan_skill(
             detail="managed copy mode does not support symlinks inside a Skill",
             source_id=_skill_source_id(skill),
         )
-    return _plan_copy(skill, destination, target, previous)
+    return _plan_copy(
+        skill,
+        destination,
+        target,
+        previous,
+        windows_path_semantics=windows_path_semantics,
+    )
 
 
 def _plan_link(
@@ -647,6 +653,8 @@ def _plan_copy(
     destination: Path,
     target: TargetConfig,
     previous: SkillStateEntry | None,
+    *,
+    windows_path_semantics: bool,
 ) -> Action:
     source_digest = tree_digest(skill.path)
     if not os.path.lexists(destination):
@@ -662,7 +670,65 @@ def _plan_copy(
             source_id=_skill_source_id(skill),
             source_digest=source_digest,
         )
-    if destination.is_symlink() or not destination.is_dir():
+    if destination.is_symlink():
+        if (
+            previous is None
+            or previous.mode is not LinkMode.SYMLINK
+            or previous.source_id != _skill_source_id(skill)
+            or previous.link_target is None
+        ):
+            return _conflict_action(
+                operation=Operation.COPY,
+                skill=skill,
+                destination=destination,
+                target=target,
+                detail="existing symlink has no matching Bridge ownership state",
+                source_id=_skill_source_id(skill),
+                source_digest=source_digest,
+            )
+        actual_target: Path | None
+        source_target: Path | None
+        recorded_target: Path | None
+        try:
+            actual_target = read_symlink_target(destination)
+            source_target = skill.path.resolve(strict=True)
+            recorded_target = Path(previous.link_target)
+        except (OSError, RuntimeError):
+            actual_target = None
+            source_target = None
+            recorded_target = None
+        targets_match = bool(
+            actual_target is not None
+            and source_target is not None
+            and recorded_target is not None
+            and path_comparison_key(actual_target, windows=windows_path_semantics)
+            == path_comparison_key(source_target, windows=windows_path_semantics)
+            == path_comparison_key(recorded_target, windows=windows_path_semantics)
+        )
+        if not targets_match:
+            return _conflict_action(
+                operation=Operation.COPY,
+                skill=skill,
+                destination=destination,
+                target=target,
+                detail="managed symlink no longer matches its recorded canonical source",
+                source_id=_skill_source_id(skill),
+                source_digest=source_digest,
+            )
+        return Action(
+            operation=Operation.COPY,
+            disposition=Disposition.UPDATE,
+            component=Component.SKILLS,
+            target=target.name,
+            name=skill.name,
+            source=skill.path,
+            destination=destination,
+            detail="replace unchanged managed symlink with a managed copy and retain backup",
+            source_id=_skill_source_id(skill),
+            source_digest=source_digest,
+            link_mode=LinkMode.SYMLINK,
+        )
+    if not destination.is_dir():
         return _conflict_action(
             operation=Operation.COPY,
             skill=skill,
@@ -673,13 +739,23 @@ def _plan_copy(
             source_digest=source_digest,
         )
 
-    if previous is None or previous.mode is not LinkMode.COPY:
+    if previous is None or previous.mode not in {LinkMode.COPY, LinkMode.SYMLINK}:
         return _conflict_action(
             operation=Operation.COPY,
             skill=skill,
             destination=destination,
             target=target,
             detail="existing copy destination has no matching target ownership state",
+            source_id=_skill_source_id(skill),
+            source_digest=source_digest,
+        )
+    if previous.source_id != _skill_source_id(skill):
+        return _conflict_action(
+            operation=Operation.COPY,
+            skill=skill,
+            destination=destination,
+            target=target,
+            detail="existing copy destination has mismatched target ownership state",
             source_id=_skill_source_id(skill),
             source_digest=source_digest,
         )
@@ -717,6 +793,30 @@ def _plan_copy(
             detail="managed copy was modified after installation",
             source_id=_skill_source_id(skill),
             source_digest=source_digest,
+        )
+    if previous.mode is LinkMode.SYMLINK:
+        if source_digest != current_digest:
+            return _conflict_action(
+                operation=Operation.COPY,
+                skill=skill,
+                destination=destination,
+                target=target,
+                detail="partially migrated managed copy does not match the canonical source",
+                source_id=_skill_source_id(skill),
+                source_digest=source_digest,
+            )
+        return Action(
+            operation=Operation.COPY,
+            disposition=Disposition.UPDATE,
+            component=Component.SKILLS,
+            target=target.name,
+            name=skill.name,
+            source=skill.path,
+            destination=destination,
+            detail="recover ownership state for an already installed managed copy",
+            source_id=_skill_source_id(skill),
+            source_digest=source_digest,
+            link_mode=LinkMode.COPY,
         )
     if source_digest == current_digest:
         return Action(

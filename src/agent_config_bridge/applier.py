@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_config_bridge.catalog import CatalogInventory, discover_catalog
-from agent_config_bridge.filesystem import apply_copy, apply_link, apply_remove, tree_digest
+from agent_config_bridge.filesystem import (
+    apply_copy,
+    apply_link,
+    apply_remove,
+    tree_digest,
+)
 from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
 from agent_config_bridge.instructions import (
     apply_instruction_copy,
@@ -36,16 +41,19 @@ from agent_config_bridge.state import (
     InstructionStateEntry,
     SettingsState,
     SettingStateEntry,
+    SkillStateEntry,
     effective_link_mode,
     find_orphaned_target_states,
     read_instruction_state,
     read_settings_state,
+    read_skill_state,
     write_instruction_state,
     write_settings_state,
     write_skill_state,
+    write_skill_state_entries,
 )
 
-__all__ = ["ApplyError", "ApplyResult", "apply_plan"]
+__all__ = ["ApplyError", "ApplyResult", "apply_plan", "apply_skill_plan", "validate_skill_only_plan"]
 
 
 class ApplyError(RuntimeError):
@@ -61,6 +69,156 @@ class ApplyResult:
     marketplace: RenderedMarketplace | None
     schedules: tuple[RenderedScheduleSet, ...]
     warnings: tuple[str, ...] = ()
+
+
+def validate_skill_only_plan(plan: SyncPlan) -> tuple[Action, ...]:
+    """Return changing Skill actions after enforcing the skill-only safety gate."""
+
+    if plan.has_conflicts:
+        conflicts = ", ".join(
+            f"{action.target}:{action.name}" for action in plan.actions if action.disposition is Disposition.CONFLICT
+        )
+        raise ApplyError(f"refusing skill-only sync because the full plan has conflicts: {conflicts}")
+    non_skill_changes = tuple(
+        action
+        for action in plan.actions
+        if action.component is not Component.SKILLS
+        and action.disposition in {Disposition.CREATE, Disposition.UPDATE, Disposition.REMOVE}
+    )
+    if non_skill_changes:
+        pending = ", ".join(f"{action.component.value}:{action.target}:{action.name}" for action in non_skill_changes)
+        raise ApplyError(f"refusing skill-only sync while non-skill changes are pending: {pending}")
+    return tuple(
+        action
+        for action in plan.actions
+        if action.component is Component.SKILLS
+        and action.disposition in {Disposition.CREATE, Disposition.UPDATE, Disposition.REMOVE}
+    )
+
+
+def apply_skill_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan) -> ApplyResult:
+    """Apply only Skill actions from a reviewed full synchronization plan.
+
+    The complete plan is rebuilt and compared before any mutation. Conflicts in
+    any component and pending changes outside Skills fail closed.
+    """
+
+    orphaned_targets = find_orphaned_target_states(config)
+    if orphaned_targets:
+        raise ApplyError(
+            "refusing to sync Skills while ownership state has no enabled target: " + ", ".join(orphaned_targets)
+        )
+
+    fresh_inventory = discover_catalog(config)
+    resolved = resolve_inventory(fresh_inventory)
+    fresh_plan = build_plan(config, fresh_inventory, resolved=resolved)
+    if fresh_plan != plan:
+        raise ApplyError("catalog or destination state changed after planning; review a fresh plan")
+    skill_actions = validate_skill_only_plan(fresh_plan)
+
+    targets_by_name = {target.name: target for target in config.targets if target.enabled}
+    skill_ownership = {
+        name: {entry.name: entry for entry in read_skill_state(config, target)}
+        for name, target in targets_by_name.items()
+    }
+    host_platform = current_platform()
+    applied: list[Action] = []
+    backups: list[Path] = []
+    for action in skill_actions:
+        target = targets_by_name.get(action.target)
+        if target is None:
+            raise ApplyError(f"Skill action has no enabled target: {action.target}:{action.name}")
+        windows_path_semantics = host_platform is Platform.WINDOWS or target.platform is Platform.WINDOWS
+        backup: Path | None = None
+        previous_entries: dict[str, SkillStateEntry] | None = None
+        if action.disposition is Disposition.CREATE:
+            if action.source_id is None or action.source_digest is None:
+                raise ApplyError(f"create action is missing ownership data: {action.target}:{action.name}")
+            mode = LinkMode.SYMLINK if action.operation is Operation.LINK else LinkMode.COPY
+            previous_entries = dict(skill_ownership[action.target])
+            next_entries = dict(skill_ownership[action.target])
+            next_entries[action.name] = SkillStateEntry(
+                name=action.name,
+                mode=mode,
+                source_id=action.source_id,
+                link_target=str(action.source.resolve()) if mode is LinkMode.SYMLINK else None,
+            )
+            try:
+                write_skill_state_entries(config, target, tuple(next_entries.values()))
+            except BridgeStateError as state_exc:
+                raise ApplyError(
+                    f"Skill ownership checkpoint failed before create; no filesystem mutation occurred: "
+                    f"{action.target}:{action.name}: {state_exc}"
+                ) from state_exc
+            skill_ownership[action.target] = next_entries
+        try:
+            if action.operation is Operation.LINK:
+                if action.source_digest is None or tree_digest(action.source) != action.source_digest:
+                    raise ApplyError(f"link source changed after planning: {action.target}:{action.name}")
+                apply_link(action.source, action.destination)
+            elif action.operation is Operation.COPY:
+                if action.source_id is None or action.source_digest is None:
+                    raise ApplyError(f"copy action is missing source identity: {action.target}:{action.name}")
+                backup = apply_copy(
+                    action.source,
+                    action.destination,
+                    source_id=action.source_id,
+                    source_digest=action.source_digest,
+                    state_dir=config.state_dir,
+                    target_name=action.target,
+                    update=action.disposition is Disposition.UPDATE,
+                    previous_mode=action.link_mode or LinkMode.COPY,
+                    expected_link_target=action.source if action.link_mode is LinkMode.SYMLINK else None,
+                    windows_path_semantics=windows_path_semantics,
+                )
+            elif action.operation is Operation.REMOVE:
+                if action.link_mode is None or action.source_id is None:
+                    raise ApplyError(f"remove action is missing ownership data: {action.target}:{action.name}")
+                backup = apply_remove(
+                    action.destination,
+                    mode=action.link_mode,
+                    source_id=action.source_id,
+                    expected_link_target=action.source if action.link_mode is LinkMode.SYMLINK else None,
+                    installed_digest=action.source_digest,
+                    state_dir=config.state_dir,
+                    target_name=action.target,
+                    windows_path_semantics=windows_path_semantics,
+                )
+            else:
+                raise ApplyError(f"unsupported skill-only operation: {action.operation.value}")
+        except BaseException as apply_exc:
+            if previous_entries is not None:
+                try:
+                    write_skill_state_entries(config, target, tuple(previous_entries.values()))
+                except BridgeStateError as rollback_exc:
+                    raise ApplyError(
+                        f"Skill create failed and its durable ownership checkpoint could not be rolled back: "
+                        f"{action.target}:{action.name}: {rollback_exc}"
+                    ) from apply_exc
+                skill_ownership[action.target] = previous_entries
+            raise
+        if backup is not None:
+            backups.append(backup)
+        applied.append(action)
+
+    warnings: list[str] = []
+    for target in config.targets:
+        if not target.enabled:
+            continue
+        desired_skills = resolved.skills_for_target(target)
+        write_skill_state(config, target, desired_skills)
+        try:
+            write_skill_root_marker(config, target, desired_skills)
+        except BridgeStateError as exc:
+            warnings.append(f"{target.name}: provenance marker was not updated: {exc}")
+
+    return ApplyResult(
+        applied=tuple(applied),
+        backups=tuple(backups),
+        marketplace=None,
+        schedules=(),
+        warnings=tuple(warnings),
+    )
 
 
 def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan) -> ApplyResult:
@@ -214,6 +372,11 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     state_dir=config.state_dir,
                     target_name=action.target,
                     update=action.disposition is Disposition.UPDATE,
+                    previous_mode=action.link_mode or LinkMode.COPY,
+                    expected_link_target=action.source if action.link_mode is LinkMode.SYMLINK else None,
+                    windows_path_semantics=(
+                        host_platform is Platform.WINDOWS or targets_by_name[action.target].platform is Platform.WINDOWS
+                    ),
                 )
             if backup is not None:
                 backups.append(backup)

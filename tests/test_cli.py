@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +17,7 @@ from agent_config_bridge.config import load_config
 from agent_config_bridge.models import Platform, Product
 from agent_config_bridge.planner import CommandHint, build_plan
 from agent_config_bridge.platforms import current_platform
-from agent_config_bridge.state import read_registered_plugins, write_registered_plugins
+from agent_config_bridge.state import read_registered_plugins, read_skill_state, write_registered_plugins
 from tests.conftest import make_catalog
 
 
@@ -141,6 +142,88 @@ def test_plan_json_returns_one_for_unmanaged_destination_conflict(
     assert payload["has_conflicts"] is True
     assert payload["actions"][0]["disposition"] == "conflict"
     assert sentinel.read_text(encoding="utf-8") == "keep me"
+
+
+def test_sync_skills_requires_confirmation_only_when_skills_change(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public command confirms mutations but converged runs do not prompt."""
+
+    make_catalog(tmp_path / "catalog", skills=("hello",))
+    config_path = _write_config(tmp_path, components=("skills",))
+    destination = tmp_path / "home/.agents/skills/hello"
+
+    assert cli.main(["sync-skills", "-c", str(config_path)]) == 2
+    assert not destination.exists()
+    capsys.readouterr()
+
+    assert cli.main(["sync-skills", "-c", str(config_path), "--yes", "--json"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["scope"] == "skills"
+    assert first["skill_only"] is True
+    assert first["applied"] == 1
+    assert first["no_op"] is False
+
+    monkeypatch.setattr(cli, "_confirm", Mock(side_effect=AssertionError("no-op must not confirm")))
+    assert cli.main(["sync-skills", "-c", str(config_path), "--json"]) == 0
+    converged = json.loads(capsys.readouterr().out)
+    assert converged == {
+        "applied": 0,
+        "backups": [],
+        "no_op": True,
+        "scope": "skills",
+        "skill_only": True,
+        "warnings": [],
+    }
+
+
+def test_sync_skills_noop_reconciles_stale_ownership_after_completed_remove(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No-op execution clears ownership left after interruption following removal."""
+
+    make_catalog(tmp_path / "catalog", skills=("hello",))
+    config_path = _write_config(tmp_path, components=("skills",))
+    assert cli.main(["sync-skills", "-c", str(config_path), "--yes"]) == 0
+    capsys.readouterr()
+    configured = load_config(config_path)
+    destination = tmp_path / "home/.agents/skills/hello"
+    if destination.is_symlink():
+        destination.unlink()
+    else:
+        shutil.rmtree(destination)
+    assert read_skill_state(configured, configured.targets[0])
+
+    _write_config(tmp_path, components=())
+    deselected = load_config(config_path)
+    assert cli.main(["sync-skills", "-c", str(config_path), "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] == 0
+    assert payload["no_op"] is True
+    assert read_skill_state(deselected, deselected.targets[0]) == ()
+
+
+def test_sync_skills_rejects_pending_non_skill_changes_before_mutation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A full-plan marketplace change blocks the otherwise safe Skill create."""
+
+    make_catalog(tmp_path / "catalog", skills=("hello",), plugins=("shared",))
+    config_path = _write_config(tmp_path, components=("skills", "plugins"))
+    destination = tmp_path / "home/.agents/skills/hello"
+
+    assert cli.main(["sync-skills", "-c", str(config_path), "--yes"]) == 2
+
+    captured = capsys.readouterr()
+    assert "non-skill changes are pending" in captured.err
+    assert "plugins:marketplace" in captured.err
+    assert not destination.exists()
+    assert not (tmp_path / "state/marketplace").exists()
 
 
 def test_plan_json_models_claude_default_profile_environment_removal(

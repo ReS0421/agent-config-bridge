@@ -64,7 +64,8 @@ The configured `state_dir` contains only:
 - immutable Schedule snapshots and their stable target pointers;
 - non-sensitive Schedule locks and last-processed minute markers;
 - small per-target Skill, Plugin, Settings, and scheduler ownership records;
-- retained managed Skill copies displaced during update or deselection.
+- verified, non-destructive managed Skill backup snapshots retained during
+  update or deselection.
 
 Use a separate stable `state_dir` per native Windows, WSL, or Linux host. It is
 operational ownership state with physical paths, not part of the portable
@@ -203,7 +204,17 @@ digest mismatches:
   planned source digest;
 - managed copies update/remove only when their marker and installed digest still
   match;
-- displaced unchanged managed copies are retained below `state_dir/backups`;
+- before managed-copy update/removal, a non-destructive final backup snapshot is
+  created below `state_dir/backups` and verified by marker, source identity, and
+  installed digest;
+- the live destination is revalidated after snapshot creation and immediately
+  before mutation; drift aborts without beginning the swap;
+- updates install through a same-filesystem destination swap only after the
+  backup is verified; handled install failures atomically restore that swap;
+- removals also use a same-filesystem swap. A partially deleted swap is never
+  restored: the destination is reconstructed through a fresh same-filesystem
+  restore staging path from the retained, reverified backup, which is not
+  consumed;
 - marketplace builds are immutable and content-addressed;
 - the published marketplace is rehashed before reuse/replacement, copied through
   a temporary sibling, and checked before publication;
@@ -224,7 +235,8 @@ Current alpha limitations matter for threat modeling:
 
 - there is no apply/register target lock or one transaction covering all
   actions (Schedule ticks have a separate runtime lock);
-- there is no automatic rollback or recovery log;
+- there is no transaction-wide automatic rollback or recovery log, although
+  managed-copy actions have localized snapshot/swap recovery;
 - a later action can fail after an earlier action succeeded;
 - symlink mode is live, so canonical Skill changes become visible immediately;
 - retained backups have no automatic retention/restore command;

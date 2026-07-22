@@ -141,7 +141,39 @@ agentbridge apply --yes
 
 `apply` records the standalone Skills, Instruction files, and Settings leaves
 it manages and prints the product and host commands needed to activate rendered
-Plugins, Hooks, and Schedules. Registration is deliberately separate:
+Plugins, Hooks, and Schedules.
+
+For automation that must update only standalone Skills, use the fail-closed
+skill-only command:
+
+```bash
+agentbridge sync-skills -c agentbridge.toml --yes
+```
+
+`sync-skills` still builds and rechecks the complete plan. It refuses to write
+when any component conflicts or when Plugins, Hooks, Settings, Schedules, or
+Instructions have a pending create, update, or removal. It never renders those
+components and never runs registration commands. A converged run does not ask
+for confirmation. When `link_mode` changes from `symlink` to `copy`, a
+still-matching Bridge-owned Skill link is atomically replaced by a marked copy
+and the prior link is retained in the backup tree; changed or unowned links
+remain conflicts. If a multi-Skill migration stops after installing only some
+copies, the next plan resumes copies whose ownership marker and installed,
+current, and canonical source digests all still match. Each new Skill is
+recorded in ownership state before its filesystem create, then that checkpoint
+is rolled back if the create fails; an abrupt stop therefore leaves durable
+evidence for any completed or pending create. Even a no-change invocation
+revalidates the full plan and reconciles Skill ownership/provenance, allowing a
+previously completed removal to clear stale state without prompting. Copy
+updates first create and verify a non-destructive final backup snapshot. Only
+after revalidating the live destination do they swap it aside on its own
+filesystem, atomically install the staged copy, and remove the redundant swap.
+Managed-copy removals use the same snapshot-and-revalidate rule. If removing
+the local swap partially fails, the Bridge reconstructs and verifies the prior
+destination from the retained backup through a fresh same-filesystem staging
+path; it never restores the damaged swap or consumes the only verified backup.
+
+Registration remains deliberately separate:
 
 ```bash
 agentbridge register --target local-codex --yes
