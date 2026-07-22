@@ -141,6 +141,9 @@ def apply_copy(
     state_dir: Path,
     target_name: str,
     update: bool,
+    previous_mode: LinkMode = LinkMode.COPY,
+    expected_link_target: Path | None = None,
+    windows_path_semantics: bool = False,
 ) -> Path | None:
     """Create or safely update a managed directory copy.
 
@@ -175,35 +178,104 @@ def apply_copy(
         os.replace(temporary, destination)
         return None
 
-    if not destination.is_dir() or destination.is_symlink() or is_directory_reparse_point(destination):
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise FilesystemError(f"managed update destination is no longer a directory: {destination}")
+    backup_digest = source_digest
+    if previous_mode is LinkMode.SYMLINK:
+        if not destination.is_symlink() or expected_link_target is None:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise FilesystemError(f"managed Skill link changed after planning: {destination}")
+        try:
+            actual_target = read_symlink_target(destination)
+            target_matches = path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            ) == path_comparison_key(
+                expected_link_target,
+                windows=windows_path_semantics,
+            )
+        except (OSError, RuntimeError):
+            target_matches = False
+        if not target_matches:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise FilesystemError(f"managed Skill link target changed after planning: {destination}")
+    elif previous_mode is LinkMode.COPY:
+        if not destination.is_dir() or destination.is_symlink() or is_directory_reparse_point(destination):
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise FilesystemError(f"managed update destination is no longer a directory: {destination}")
 
-    marker = read_managed_marker(destination)
-    if marker is None or marker.get("source_id") != source_id:
+        marker = read_managed_marker(destination)
+        if marker is None or marker.get("source_id") != source_id:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise FilesystemError(f"managed copy ownership changed after planning: {destination}")
+        installed_digest = marker.get("installed_digest")
+        if not isinstance(installed_digest, str) or tree_digest(destination) != installed_digest:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise FilesystemError(f"managed copy changed after planning: {destination}")
+        backup_digest = installed_digest
+    else:  # pragma: no cover - LinkMode is currently exhaustive
         shutil.rmtree(temporary, ignore_errors=True)
-        raise FilesystemError(f"managed copy ownership changed after planning: {destination}")
-    installed_digest = marker.get("installed_digest")
-    if not isinstance(installed_digest, str) or tree_digest(destination) != installed_digest:
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise FilesystemError(f"managed copy changed after planning: {destination}")
-
-    displaced = destination.with_name(f".{destination.name}.agentbridge.{uuid.uuid4().hex}.old")
-    os.replace(destination, displaced)
-    try:
-        os.replace(temporary, destination)
-    except OSError:
-        os.replace(displaced, destination)
-        shutil.rmtree(temporary, ignore_errors=True)
-        raise
+        raise FilesystemError(f"unsupported previous managed mode: {previous_mode.value}")
 
     backup = _backup_path(state_dir, target_name, destination.name)
     backup.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.move(str(displaced), str(backup))
-    except (OSError, shutil.Error) as exc:
+        _snapshot_managed_destination(
+            destination,
+            backup,
+            mode=previous_mode,
+            source_id=source_id,
+            installed_digest=backup_digest,
+            expected_link_target=expected_link_target,
+            windows_path_semantics=windows_path_semantics,
+        )
+    except (FilesystemError, OSError, shutil.Error) as exc:
+        shutil.rmtree(temporary, ignore_errors=True)
+        if os.path.lexists(backup):
+            _remove_path(backup)
+        raise FilesystemError(f"could not snapshot managed Skill backup at {backup}: {exc}") from exc
+
+    try:
+        _validate_managed_destination(
+            destination,
+            mode=previous_mode,
+            source_id=source_id,
+            installed_digest=backup_digest,
+            expected_link_target=expected_link_target,
+            windows_path_semantics=windows_path_semantics,
+        )
+    except FilesystemError:
+        shutil.rmtree(temporary, ignore_errors=True)
+        _remove_path(backup)
+        raise
+
+    displaced = destination.with_name(f".{destination.name}.agentbridge.{uuid.uuid4().hex}.old")
+    try:
+        os.replace(destination, displaced)
+    except OSError as exc:
+        shutil.rmtree(temporary, ignore_errors=True)
+        _remove_path(backup)
+        raise FilesystemError(f"could not stage managed Skill destination swap at {destination}: {exc}") from exc
+
+    try:
+        os.replace(temporary, destination)
+    except OSError as exc:
+        try:
+            os.replace(displaced, destination)
+        except OSError as restore_exc:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise FilesystemError(
+                f"new Skill install failed and same-filesystem swap could not be restored at "
+                f"{destination}: {restore_exc}"
+            ) from exc
+        shutil.rmtree(temporary, ignore_errors=True)
+        _remove_path(backup)
+        raise FilesystemError(f"failed to install staged managed Skill copy at {destination}: {exc}") from exc
+
+    try:
+        _remove_path(displaced)
+    except OSError as exc:
         raise FilesystemError(
-            f"updated Skill is installed but its backup could not be retained at {backup}: {exc}"
+            f"updated Skill and retained backup are valid but old same-filesystem swap could not be removed: "
+            f"{displaced}: {exc}"
         ) from exc
     return backup
 
@@ -265,9 +337,64 @@ def apply_remove(
     backup = _backup_path(state_dir, target_name, destination.name)
     backup.parent.mkdir(parents=True, exist_ok=True)
     try:
-        shutil.move(str(destination), str(backup))
-    except (OSError, shutil.Error) as exc:
-        raise FilesystemError(f"could not retain deselected Skill backup at {backup}: {exc}") from exc
+        _snapshot_managed_destination(
+            destination,
+            backup,
+            mode=LinkMode.COPY,
+            source_id=source_id,
+            installed_digest=marker_digest,
+            expected_link_target=None,
+            windows_path_semantics=windows_path_semantics,
+        )
+    except (FilesystemError, OSError, shutil.Error) as exc:
+        if os.path.lexists(backup):
+            _remove_path(backup)
+        raise FilesystemError(f"could not snapshot deselected Skill backup at {backup}: {exc}") from exc
+
+    try:
+        _validate_managed_destination(
+            destination,
+            mode=LinkMode.COPY,
+            source_id=source_id,
+            installed_digest=marker_digest,
+            expected_link_target=None,
+            windows_path_semantics=windows_path_semantics,
+        )
+    except FilesystemError:
+        _remove_path(backup)
+        raise
+
+    displaced = destination.with_name(f".{destination.name}.agentbridge.{uuid.uuid4().hex}.old")
+    try:
+        os.replace(destination, displaced)
+    except OSError as exc:
+        _remove_path(backup)
+        raise FilesystemError(f"could not stage deselected Skill removal at {destination}: {exc}") from exc
+    try:
+        _remove_path(displaced)
+    except OSError as exc:
+        try:
+            _restore_copy_backup_to_destination(
+                backup,
+                destination,
+                source_id=source_id,
+                installed_digest=marker_digest,
+            )
+        except (FilesystemError, OSError, shutil.Error) as restore_exc:
+            raise FilesystemError(
+                f"could not remove deselected Skill; verified backup is retained at {backup}, "
+                f"damaged swap remains at {displaced}, and destination restore failed: {restore_exc}"
+            ) from exc
+        try:
+            _remove_path(displaced)
+        except OSError as cleanup_exc:
+            raise FilesystemError(
+                f"could not remove deselected Skill; destination was restored from verified backup {backup}, "
+                f"but orphaned swap remains at {displaced}: {cleanup_exc}"
+            ) from exc
+        raise FilesystemError(
+            f"could not remove deselected Skill; destination was restored and verified from retained backup {backup}"
+        ) from exc
     return backup
 
 
@@ -281,6 +408,134 @@ def _write_marker(destination: Path, *, source_id: str, digest: str) -> None:
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _validate_managed_destination(
+    destination: Path,
+    *,
+    mode: LinkMode,
+    source_id: str,
+    installed_digest: str,
+    expected_link_target: Path | None,
+    windows_path_semantics: bool,
+) -> None:
+    """Revalidate reviewed ownership immediately before destructive mutation."""
+
+    if mode is LinkMode.SYMLINK:
+        if not destination.is_symlink() or expected_link_target is None:
+            raise FilesystemError(f"managed Skill link changed after backup snapshot: {destination}")
+        try:
+            actual_target = read_symlink_target(destination)
+            target_matches = path_comparison_key(
+                actual_target,
+                windows=windows_path_semantics,
+            ) == path_comparison_key(
+                expected_link_target,
+                windows=windows_path_semantics,
+            )
+        except (OSError, RuntimeError):
+            target_matches = False
+        if not target_matches:
+            raise FilesystemError(f"managed Skill link target changed after backup snapshot: {destination}")
+        return
+
+    if (
+        mode is not LinkMode.COPY
+        or destination.is_symlink()
+        or not destination.is_dir()
+        or is_directory_reparse_point(destination)
+    ):
+        raise FilesystemError(f"managed Skill copy changed after backup snapshot: {destination}")
+    marker = read_managed_marker(destination)
+    if (
+        marker is None
+        or marker.get("source_id") != source_id
+        or marker.get("installed_digest") != installed_digest
+        or tree_digest(destination) != installed_digest
+    ):
+        raise FilesystemError(f"managed Skill copy content changed after backup snapshot: {destination}")
+
+
+def _restore_copy_backup_to_destination(
+    backup: Path,
+    destination: Path,
+    *,
+    source_id: str,
+    installed_digest: str,
+) -> None:
+    """Reconstruct and atomically install a verified copy from retained backup."""
+
+    _validate_managed_destination(
+        backup,
+        mode=LinkMode.COPY,
+        source_id=source_id,
+        installed_digest=installed_digest,
+        expected_link_target=None,
+        windows_path_semantics=False,
+    )
+    if os.path.lexists(destination):
+        raise FilesystemError(f"cannot restore managed Skill over an existing destination: {destination}")
+    restore = destination.with_name(f".{destination.name}.agentbridge.{uuid.uuid4().hex}.restore.tmp")
+    try:
+        shutil.copytree(backup, restore, symlinks=True)
+        _validate_managed_destination(
+            restore,
+            mode=LinkMode.COPY,
+            source_id=source_id,
+            installed_digest=installed_digest,
+            expected_link_target=None,
+            windows_path_semantics=False,
+        )
+        os.replace(restore, destination)
+    except (FilesystemError, OSError, shutil.Error):
+        if os.path.lexists(restore):
+            _remove_path(restore)
+        raise
+
+
+def _snapshot_managed_destination(
+    destination: Path,
+    backup: Path,
+    *,
+    mode: LinkMode,
+    source_id: str,
+    installed_digest: str,
+    expected_link_target: Path | None,
+    windows_path_semantics: bool,
+) -> None:
+    """Create and verify a non-destructive final backup snapshot."""
+
+    if mode is LinkMode.SYMLINK:
+        if expected_link_target is None:
+            raise FilesystemError(f"managed Skill link backup has no expected target: {destination}")
+        actual_target = read_symlink_target(destination)
+        backup.symlink_to(actual_target, target_is_directory=True)
+        backup_target = read_symlink_target(backup)
+        if path_comparison_key(backup_target, windows=windows_path_semantics) != path_comparison_key(
+            expected_link_target,
+            windows=windows_path_semantics,
+        ):
+            raise FilesystemError(f"managed Skill link backup target verification failed: {backup}")
+        return
+
+    if mode is not LinkMode.COPY:
+        raise FilesystemError(f"unsupported managed Skill backup mode: {mode.value}")
+    shutil.copytree(destination, backup, symlinks=True)
+    marker = read_managed_marker(backup)
+    if (
+        marker is None
+        or marker.get("source_id") != source_id
+        or marker.get("installed_digest") != installed_digest
+        or tree_digest(backup) != installed_digest
+    ):
+        raise FilesystemError(f"managed Skill copy backup verification failed: {backup}")
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
 
 
 def _backup_path(state_dir: Path, target_name: str, name: str) -> Path:

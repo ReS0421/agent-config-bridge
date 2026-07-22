@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `agentbridge sync-skills` applies only reviewed standalone Skill changes,
+  while failing closed on full-plan conflicts or pending non-Skill mutations,
+  preserving plan TOCTOU verification, and never rendering or registering
+  other components. Converged runs require no confirmation. Switching from a
+  Bridge-owned symlink installation to `link_mode = "copy"` now performs a
+  checked, staged migration with a managed marker and retained link backup;
+  interrupted multi-Skill migrations can resume only from fully matching
+  managed copies. Skill creates use a per-action durable ownership checkpoint,
+  no-change runs reconcile stale Skill state after completed removals, and copy
+  updates create and verify a non-destructive final backup snapshot before a
+  same-filesystem destination swap installs the staged replacement. Managed
+  copy removals use the same snapshot-first retention model.
+  Both paths revalidate the live destination after snapshot creation, and a
+  partially deleted removal swap is recovered only through a newly verified
+  restore staged from the retained backup.
+
 - An `instructions` component (catalog ADR-5) bringing always-loaded policy
   files under the Bridge: `catalog/instructions/<bundle>/{claude-code,codex}/`
   overlays deploy file-by-file to overlay-relative paths below the target

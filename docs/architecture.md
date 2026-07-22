@@ -385,10 +385,21 @@ Actions then run sequentially:
   are removed;
 - Linux `auto` mode creates standalone Skill directory symlinks;
 - Windows `auto` mode creates managed standalone Skill copies;
-- an unchanged managed copy is staged next to its destination before update;
-- the displaced copy is retained under `state_dir/backups/<target>/...`;
+- a replacement managed copy is staged and verified next to its destination;
+- before a managed-copy update or removal, the old destination is copied
+  non-destructively into its final `state_dir/backups/<target>/...` path and
+  that snapshot's marker, source identity, and installed digest are verified;
+- a symlink-to-copy migration similarly recreates and verifies the old link in
+  the final backup path rather than moving the live link across filesystems;
+- after snapshot creation, the live destination is revalidated immediately
+  before mutation so drift during backup copying aborts without swapping it;
+- updates use a same-filesystem destination swap, atomically install the staged
+  copy, and then remove the redundant swap;
 - deselection unlinks a still-matching recorded symlink;
-- deselection moves a still-matching managed copy into the backup tree;
+- managed-copy deselection uses the same verified snapshot-first rule and then
+  removes a same-filesystem swap; if swap cleanup partially fails, recovery is
+  staged afresh from the retained backup, verified, and atomically installed at
+  the original destination without consuming the backup;
 - drift, changed ownership, or an unmanaged destination becomes a conflict;
 - successful reconciliation writes target-scoped Skill and Settings ownership
   state.
@@ -403,9 +414,10 @@ target completes an empty reconciliation and is then removed or disabled.
 The current alpha does not hold a target lock and does not wrap all actions in
 one atomic transaction. Individual managed-copy and marketplace replacements use
 temporary paths and local replacement checks, but a later action can fail after
-an earlier one succeeded. There is no automatic rollback or recovery log. Run a
-fresh `plan` after an interrupted apply; retained managed-copy backups are for
-manual recovery.
+an earlier one succeeded. Managed-copy operations perform the localized
+snapshot/swap recovery described above, but there is no transaction-wide
+rollback or recovery log. Run a fresh `plan` after an interrupted apply;
+retained managed-copy backups remain available for manual recovery.
 
 ## Plugin, Hook, and Schedule registration
 
@@ -470,7 +482,7 @@ state_dir/
 ├── schedule-builds/<digest>/<target>/snapshot.json
 ├── schedules/<target>.json          # stable Schedule pointer
 ├── schedule-runtime/                # claim/run locks + minute marker
-├── backups/<target>/...             # retained managed Skill copies
+├── backups/<target>/...             # verified managed Skill backup snapshots
 └── targets/<target>/
     ├── skills.json                  # standalone Skill ownership
     ├── plugins.json                 # registration ownership

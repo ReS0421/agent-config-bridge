@@ -43,6 +43,7 @@ __all__ = [
     "write_scheduler_state",
     "write_settings_state",
     "write_skill_state",
+    "write_skill_state_entries",
 ]
 
 _ARTIFACT_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
@@ -542,18 +543,28 @@ def write_skill_state(
     plan retract them again forever.
     """
 
-    entries: list[dict[str, Any]] = []
+    entries: list[SkillStateEntry] = []
     if Component.SKILLS in target.components:
         mode = effective_link_mode(config.link_mode, target.platform)
         for skill in skills:
             entries.append(
-                {
-                    "name": skill.name,
-                    "mode": mode.value,
-                    "source_id": f"skills/{skill.name}",
-                    "link_target": str(skill.path.resolve()) if mode is LinkMode.SYMLINK else None,
-                }
+                SkillStateEntry(
+                    name=skill.name,
+                    mode=mode,
+                    source_id=f"skills/{skill.name}",
+                    link_target=str(skill.path.resolve()) if mode is LinkMode.SYMLINK else None,
+                )
             )
+    write_skill_state_entries(config, target, tuple(entries))
+
+
+def write_skill_state_entries(
+    config: BridgeConfig,
+    target: TargetConfig,
+    entries: tuple[SkillStateEntry, ...],
+) -> None:
+    """Atomically checkpoint the exact standalone Skill ownership entries."""
+
     path = skill_state_path(config, target)
     if not entries:
         _remove_state_document(path, "skill ownership state")
@@ -564,7 +575,15 @@ def write_skill_state(
             "schema_version": 2,
             "target": target.name,
             "identity": _skill_identity(target),
-            "skills": entries,
+            "skills": [
+                {
+                    "name": entry.name,
+                    "mode": entry.mode.value,
+                    "source_id": entry.source_id,
+                    "link_target": entry.link_target,
+                }
+                for entry in sorted(entries, key=lambda item: item.name)
+            ],
         },
         "skill ownership state",
     )
