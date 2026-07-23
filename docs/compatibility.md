@@ -13,6 +13,34 @@ product CLI commands for that combination. It does not mean every component has
 identical semantics or that the vendor product is generally available on that
 operating system.
 
+## Machine-readable plan contract
+
+`agentbridge plan --json` emits a top-level JSON object with the integer
+`schema_version` field. The current version is `1`; absence of that field is not
+an implicit version. A downstream consumer must reject a missing, non-integer,
+or unsupported version before interpreting any other field.
+
+Version 1 contains these required top-level fields:
+
+- `actions`: an array of read-only filesystem or rendering decisions. Each
+  action includes `operation`, `disposition`, `component`, `target`, `name`,
+  `source`, `destination`, `detail`, and the nullable provenance fields
+  `source_id`, `source_digest`, and `link_mode`.
+- `commands`: an array of structured product command hints. Each command
+  contains `target`, an `environment` object, an `environment_unsets` array, an
+  `argv` array, and a human-readable `reason`. Consumers must preserve both
+  environment additions and removals when evaluating a command.
+- `reviews` and `warnings`: arrays of human-readable strings.
+- `has_changes` and `has_conflicts`: booleans summarizing the action set.
+
+Exit status `0` means the plan has no conflicts; status `1` means the emitted
+plan contains a conflict. Any other status, invalid JSON, a non-object payload,
+a missing required field, or a required field with the wrong type is not a
+usable plan. Consumers should fail closed in those cases and may ignore unknown
+additive fields only after accepting a supported `schema_version`. Planning
+remains read-only; command hints are data for a separately authorized workflow,
+not commands executed by `plan`.
+
 The 0.1.0 integration baseline exercised a complete isolated lifecycle on
 native Linux with Codex CLI 0.144.3 and Claude Code 2.1.206: render, vendor
 validation where available, marketplace registration, install, refresh,

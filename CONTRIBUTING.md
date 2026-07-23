@@ -30,11 +30,37 @@ Activate the environment with `. .venv/bin/activate` on Linux or
 Run the complete local quality gate before submitting a pull request:
 
 ```console
+python scripts/check_release_contract.py
 ruff check .
 ruff format --check .
 mypy
 pytest
 ```
+
+## Release contract
+
+`pyproject.toml` is the package-version source of truth, and the editable
+project entry in `uv.lock` must match it. Run
+`python scripts/check_release_contract.py` before every pull request. The check
+uses the latest reachable exact stable `vX.Y.Z` tag and fails when tracked
+changes or nonignored untracked files retain that released version. Hatch
+source distributions include nearly all tracked repository files, while wheel
+metadata includes files such as `pyproject.toml`, `README.md`, and `LICENSE`;
+release identity therefore is not limited to `src/`. A patch fix uses the next
+patch version without skipping a patch; intentional minor or major releases may
+move to the corresponding next release line. An untagged change may use either
+a populated current-version changelog section or a populated Unreleased
+section. An exact stable version tag on `HEAD` requires matching package
+metadata, a populated version-specific changelog section, and a clean worktree.
+
+CI checks out the complete tag history so these comparisons cannot silently
+degrade in a shallow clone. See [Release and cross-host
+promotion](docs/releases.md) for the build-once and digest-verification
+procedure. The validator and CI enforce metadata, tag, changelog, and
+cleanliness rules. Until an automated release workflow exists, creating and
+verifying artifact SHA-256 records remains an operator-enforced release step.
+Do not tag or promote a build until the complete quality gate passes from the
+clean release commit.
 
 ## Safety invariants
 
@@ -126,5 +152,7 @@ Include:
 - Tests covering success, conflict, and failure paths
 - The platforms and product surfaces you exercised
 - Documentation or changelog updates when behavior changes
+- A package patch bump for release-impacting post-release changes, with matching
+  `uv.lock` metadata and changelog entry
 
 By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).

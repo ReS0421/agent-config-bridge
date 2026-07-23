@@ -1096,6 +1096,7 @@ def _powershell_quote(value: str) -> str:
 
 def _plan_payload(plan: SyncPlan) -> dict[str, Any]:
     return {
+        "schema_version": 1,
         "actions": [_json_safe(asdict(action)) for action in plan.actions],
         "commands": [_command_payload(command) for command in plan.commands],
         "reviews": list(plan.reviews),
