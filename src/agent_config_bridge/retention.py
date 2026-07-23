@@ -197,15 +197,15 @@ def apply_retention_plan(
     if reviewed_plan.has_blockers:
         raise RetentionError("retention plan contains blockers; no entries were deleted")
     with _OperationLock(config.state_dir):
+        if reviewed_plan.actions and not shutil.rmtree.avoids_symlink_attacks:
+            raise RetentionError(
+                "this platform lacks descriptor-anchored directory removal; retention apply is blocked"
+            )
         fresh_plan = build_retention_plan(config)
         if fresh_plan != reviewed_plan:
             raise RetentionError("generated state changed after retention planning; review a fresh plan")
         if fresh_plan.has_blockers:
             raise RetentionError("retention state became unsafe; no entries were deleted")
-        if fresh_plan.actions and not shutil.rmtree.avoids_symlink_attacks:
-            raise RetentionError(
-                "this platform lacks descriptor-anchored directory removal; retention apply is blocked"
-            )
         for action in fresh_plan.actions:
             _revalidate_action(config, action)
         for action in fresh_plan.actions:
