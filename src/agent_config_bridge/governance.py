@@ -57,6 +57,7 @@ _DELIVERIES = frozenset({"standalone", "plugin", "mcp-registration", "settings-f
 _FAILURE_POLICIES = frozenset({"advisory", "block", "escalate"})
 _LIFECYCLES = frozenset({"proposed", "active", "deprecated", "quarantined", "removed"})
 _DEPLOYABLE_LIFECYCLES = frozenset({"active", "deprecated"})
+_PROVENANCE_ORIGINS = frozenset({"local-original", "imported-git", "imported-marketplace", "orca-runtime"})
 _LEGAL_KIND_DELIVERY = frozenset(
     {
         ("instruction", "standalone"),
@@ -485,6 +486,20 @@ def validate_governance(
                             manifest.id,
                             artifact.get("ref"),
                             detail="active artifact missing [artifacts.provenance]",
+                        )
+                    )
+                provenance = artifact.get("provenance")
+                if provenance is not None and (
+                    not isinstance(provenance, dict) or provenance.get("origin") not in _PROVENANCE_ORIGINS
+                ):
+                    origin = provenance.get("origin") if isinstance(provenance, dict) else provenance
+                    findings.append(
+                        GovernanceFinding(
+                            "GOV028",
+                            GovernanceSeverity.ERROR,
+                            manifest.id,
+                            artifact.get("ref"),
+                            detail=(f"provenance origin={origin!r} not in {sorted(_PROVENANCE_ORIGINS)}"),
                         )
                     )
                 # ADR-2 §6: agent-schedule structure (schedule.toml+PROMPT.md) is

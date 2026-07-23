@@ -120,6 +120,47 @@ def test_tombstone_may_have_no_artifacts_but_others_may_not(tmp_path: Path) -> N
     assert [finding.capability_id for finding in gov010] == ["empty"]
 
 
+@pytest.mark.parametrize(
+    "origin",
+    ("local-original", "imported-git", "imported-marketplace", "orca-runtime"),
+)
+def test_provenance_origin_uses_closed_vocabulary(tmp_path: Path, origin: str) -> None:
+    """Every ADR-2 provenance origin is accepted by the core validator."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    manifest = _manifest("good", lifecycle="active", provenance=True).replace(
+        'origin = "local-original"', f'origin = "{origin}"'
+    )
+    _write(catalog / "governance" / "good.toml", manifest)
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+
+    assert not [finding for finding in report.findings if finding.code == "GOV028"]
+
+
+@pytest.mark.parametrize(
+    "provenance_block",
+    ('origin = "unknown-source"', 'origin = ""', "origin = 42"),
+)
+def test_unknown_or_invalid_provenance_origin_is_rejected(tmp_path: Path, provenance_block: str) -> None:
+    """An open-ended or mistyped origin must not enter the generated registry."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    manifest = _manifest("good", lifecycle="active", provenance=True).replace(
+        'origin = "local-original"', provenance_block
+    )
+    _write(catalog / "governance" / "good.toml", manifest)
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+
+    findings = [finding for finding in report.findings if finding.code == "GOV028"]
+    assert len(findings) == 1
+    assert findings[0].capability_id == "good"
+    assert findings[0].artifact_ref == "skills/good"
+
+
 def test_policy_file_sets_mode_and_is_never_a_manifest(tmp_path: Path) -> None:
     """policy.toml is reserved: it configures the mode and is skipped by load."""
 
