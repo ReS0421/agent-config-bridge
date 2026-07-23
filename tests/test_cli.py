@@ -11,14 +11,23 @@ from unittest.mock import Mock
 
 import pytest
 
-from agent_config_bridge import cli
+from agent_config_bridge import cli, marketplace_registry
 from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.config import load_config
+from agent_config_bridge.marketplace_registry import MarketplaceRegistryError
 from agent_config_bridge.models import Platform, Product
 from agent_config_bridge.planner import CommandHint, build_plan
 from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.retention import (
+    RetentionAction,
+    RetentionBlocker,
+    RetentionPlan,
+    RetentionResult,
+)
 from agent_config_bridge.state import read_registered_plugins, read_skill_state, write_registered_plugins
 from tests.conftest import make_catalog
+
+_CODEX_FIXTURES = Path(__file__).parent / "fixtures" / "codex-marketplace-list"
 
 
 def _write_config(
@@ -81,6 +90,228 @@ def _write_launcher(path: Path) -> Path:
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     path.chmod(0o700)
     return path
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "platform", "expected"),
+    [
+        (
+            "windows-0.144.4-root-only.json",
+            Platform.WINDOWS,
+            "c:/users/res/appdata/local/agentconfigbridge/state/marketplace",
+        ),
+        (
+            "wsl-0.144.6-expanded.json",
+            Platform.LINUX,
+            "/home/res/.local/state/agent-config-bridge/wsl/marketplace",
+        ),
+    ],
+)
+def test_codex_marketplace_parser_accepts_supported_cli_schemas(
+    tmp_path: Path,
+    fixture_name: str,
+    platform: Platform,
+    expected: str,
+) -> None:
+    """Captured Codex 0.144.4 and 0.144.6 schemas resolve one source."""
+
+    make_catalog(tmp_path / "catalog")
+    target = replace(
+        load_config(_write_config(tmp_path, components=("plugins",))).targets[0],
+        platform=platform,
+    )
+    payload = json.loads((_CODEX_FIXTURES / fixture_name).read_text(encoding="utf-8"))
+
+    assert marketplace_registry.parse_marketplace_source(payload, target) == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {},
+        {"marketplaces": None},
+        {"marketplaces": ["bad-entry"]},
+        {"marketplaces": [{}]},
+        {"marketplaces": [{"name": 1}]},
+        {
+            "marketplaces": [
+                {"name": "agent-config-bridge", "root": "/one"},
+                {"name": "agent-config-bridge", "root": "/two"},
+            ]
+        },
+        {"marketplaces": [{"name": "agent-config-bridge"}]},
+        {"marketplaces": [{"name": "agent-config-bridge", "root": ""}]},
+        {"marketplaces": [{"name": "agent-config-bridge", "root": 1}]},
+        {"marketplaces": [{"name": "agent-config-bridge", "root": "relative"}]},
+        {"marketplaces": [{"name": "agent-config-bridge", "root": "/bad\u0000root"}]},
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": None,
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": [],
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": "local",
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "github", "source": "/bridge"},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"source": "/bridge"},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "local"},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "local", "source": ""},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "local", "source": 1},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "local", "source": "/bad\u0000source"},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "local", "source": "relative"},
+                }
+            ]
+        },
+        {
+            "marketplaces": [
+                {
+                    "name": "agent-config-bridge",
+                    "root": "/bridge",
+                    "marketplaceSource": {"sourceType": "local", "source": "/other"},
+                }
+            ]
+        },
+    ],
+)
+def test_codex_marketplace_parser_fails_closed_on_unknown_records(
+    tmp_path: Path,
+    payload: object,
+) -> None:
+    """Malformed registry records never produce an ownership source."""
+
+    make_catalog(tmp_path / "catalog")
+    target = load_config(_write_config(tmp_path, components=("plugins",))).targets[0]
+
+    with pytest.raises(MarketplaceRegistryError):
+        marketplace_registry.parse_marketplace_source(payload, target)
+
+
+def test_marketplace_probe_decodes_utf8_stdout_independently_of_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ASCII UTF-8 warning on stderr cannot trigger host-locale decoding."""
+
+    calls: list[dict[str, object]] = []
+
+    def run(argv: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=b'{"marketplaces": []}',
+            stderr="경고".encode(),
+        )
+
+    monkeypatch.setattr(marketplace_registry.subprocess, "run", run)
+
+    assert marketplace_registry.run_utf8_json_command(("codex", "list"), {}) == {"marketplaces": []}
+    assert calls == [{"check": False, "capture_output": True, "env": {}, "timeout": 5}]
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (subprocess.CompletedProcess(("codex",), 1, stdout=b"{}", stderr=b""), "exited with status 1"),
+        (subprocess.CompletedProcess(("codex",), 0, stdout=b"\xec", stderr=b""), "non-UTF-8"),
+        (subprocess.CompletedProcess(("codex",), 0, stdout=b"not-json", stderr=b""), "invalid JSON"),
+    ],
+)
+def test_marketplace_probe_fails_closed_on_process_or_decode_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    result: subprocess.CompletedProcess[bytes],
+    message: str,
+) -> None:
+    """Process failures and undecodable output cannot authorize ownership."""
+
+    monkeypatch.setattr(marketplace_registry.subprocess, "run", lambda *_args, **_kwargs: result)
+
+    with pytest.raises(MarketplaceRegistryError, match=message):
+        marketplace_registry.run_utf8_json_command(("codex", "list"), {})
+
+
+def test_marketplace_probe_fails_closed_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bounded read-only probe reports timeout deterministically."""
+
+    def timeout(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(marketplace_registry.subprocess, "run", timeout)
+
+    with pytest.raises(MarketplaceRegistryError, match="timed out"):
+        marketplace_registry.run_utf8_json_command(("codex", "list"), {})
 
 
 def test_init_creates_starter_config_and_refuses_unconfirmed_overwrite(
@@ -277,7 +508,11 @@ def test_register_confirmed_passes_scoped_home_to_product_commands(
     assert preflight_call.args[0] == ("codex", "plugin", "marketplace", "list", "--json")
     assert marketplace_call.args[0][:4] == ("codex", "plugin", "marketplace", "add")
     assert install_call.args[0] == ("codex", "plugin", "add", "shared@agent-config-bridge")
-    for invocation in run.call_args_list:
+    assert preflight_call.kwargs["check"] is False
+    assert preflight_call.kwargs["capture_output"] is True
+    assert preflight_call.kwargs["timeout"] == 5
+    assert "text" not in preflight_call.kwargs
+    for invocation in (marketplace_call, install_call):
         assert invocation.kwargs["check"] is True
         assert invocation.kwargs["env"]["CODEX_HOME"] == str(tmp_path / "home" / ".codex")
     config = load_config(config_path)
@@ -594,6 +829,25 @@ def test_removal_probe_fails_closed_on_unknown_vendor_json(monkeypatch: pytest.M
     assert not cli._removal_is_already_satisfied(command, {}, Product.CLAUDE_CODE)
 
 
+def test_removal_probe_fails_closed_on_non_utf8_vendor_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undecodable idempotence output never turns a failed removal into success."""
+
+    command = CommandHint(
+        target="codex",
+        platform=current_platform(),
+        environment=(),
+        argv=("codex", "plugin", "marketplace", "remove", "agent-config-bridge"),
+        reason="test",
+    )
+    monkeypatch.setattr(
+        marketplace_registry.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, stdout=b"\xec", stderr=b""),
+    )
+
+    assert not cli._removal_is_already_satisfied(command, {}, Product.CODEX)
+
+
 def test_removal_retry_reuses_explicit_product_executable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Idempotence probes never fall back to a different PATH-discovered CLI."""
 
@@ -769,7 +1023,7 @@ def test_registration_preflight_fails_closed_on_unknown_marketplace_json(
         reason="test schema failure",
     )
 
-    with pytest.raises(cli.ConfigError, match="unexpected Codex bridge marketplace source"):
+    with pytest.raises(cli.ConfigError, match="invalid Codex bridge marketplace root"):
         cli._preflight_registration_ownership(config, target, (destructive,), {})
 
 
@@ -873,3 +1127,124 @@ def test_register_scheduler_only_does_not_crash_on_governed_hooks(
     assert exit_code == 0
     assert applied  # the scheduler path ran instead of crashing
     assert read_registered_plugins(config, target) == ()
+
+
+def _retention_plan(
+    config_path: Path,
+    *,
+    actions: tuple[RetentionAction, ...] = (),
+    blockers: tuple[RetentionBlocker, ...] = (),
+) -> RetentionPlan:
+    config = load_config(config_path)
+    return RetentionPlan(
+        limits=config.retention,
+        build_count=2,
+        build_bytes=20,
+        skill_backup_group_count=1,
+        skill_backup_snapshot_count=4,
+        skill_backup_bytes=40,
+        actions=actions,
+        blockers=blockers,
+        excluded_instruction_roots=(config.state_dir / "backups" / "local" / "instructions",),
+    )
+
+
+def test_state_prune_is_a_read_only_json_plan_without_yes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    action_path = tmp_path / "state" / "builds" / ("a" * 20)
+    action = RetentionAction(
+        category="marketplace_build",
+        path=action_path,
+        node_kind="directory",
+        bytes=10,
+        mtime_ns=1,
+        ctime_ns=1,
+        device=2,
+        inode=3,
+    )
+    plan = _retention_plan(config_path, actions=(action,))
+    monkeypatch.setattr(cli, "build_retention_plan", lambda _config: plan)
+    monkeypatch.setattr(
+        cli,
+        "apply_retention_plan",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("dry-run must not apply")),
+    )
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), "--json"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] is False
+    assert payload["has_changes"] is True
+    assert payload["actions"][0]["path"] == str(action_path)
+    assert payload["converged"] is False
+
+
+def test_state_prune_yes_applies_exact_reviewed_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    action = RetentionAction(
+        category="skill_backup",
+        path=tmp_path / "state" / "backups" / "local" / "seo" / "20260723-120000-1234abcd",
+        node_kind="directory",
+        bytes=10,
+        mtime_ns=1,
+        ctime_ns=1,
+        device=2,
+        inode=3,
+    )
+    reviewed = _retention_plan(config_path, actions=(action,))
+    converged = _retention_plan(config_path)
+    monkeypatch.setattr(cli, "build_retention_plan", lambda _config: reviewed)
+    monkeypatch.setattr(
+        cli,
+        "apply_retention_plan",
+        lambda _config, received: (
+            RetentionResult((action,), 10, converged)
+            if received is reviewed
+            else (_ for _ in ()).throw(AssertionError("wrong reviewed plan"))
+        ),
+    )
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] is True
+    assert payload["deleted"][0]["path"] == str(action.path)
+    assert payload["reclaimed_bytes"] == 10
+    assert payload["converged"] is True
+
+
+def test_state_prune_blocker_fails_closed_without_apply(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    blocker = RetentionBlocker(tmp_path / "state" / "builds" / "odd", "unexpected entry")
+    plan = _retention_plan(config_path, blockers=(blocker,))
+    monkeypatch.setattr(cli, "build_retention_plan", lambda _config: plan)
+    monkeypatch.setattr(
+        cli,
+        "apply_retention_plan",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("blocked plan must not apply")),
+    )
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["safe"] is False
+    assert payload["has_blockers"] is True
+    assert payload["deleted"] == []

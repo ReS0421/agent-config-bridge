@@ -17,7 +17,9 @@ from agent_config_bridge.renderer import (
     _copy_overlay,
     _rendered_tree_digest,
     _update_tree_digest,
+    published_marketplace_digest,
     render_marketplace,
+    validate_marketplace_build,
 )
 from tests.conftest import make_catalog, make_config, require_directory_symlink_support
 
@@ -99,6 +101,30 @@ def test_render_marketplace_reuses_content_addressed_build(tmp_path: Path) -> No
     second = render_marketplace(config, inventory)
 
     assert first == second
+
+
+def test_retention_helpers_validate_published_and_exact_build_identity(
+    tmp_path: Path,
+) -> None:
+    catalog = make_catalog(tmp_path / "catalog", plugins=("shared-plugin",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        components=frozenset({Component.PLUGINS}),
+    )
+    rendered = render_marketplace(config, discover_catalog(config))
+
+    assert published_marketplace_digest(config) == rendered.digest
+    assert validate_marketplace_build(config, rendered.build_root, rendered.digest) == replace(
+        rendered, root=rendered.build_root
+    )
+
+    with pytest.raises(RenderError, match="path does not match"):
+        validate_marketplace_build(
+            config,
+            rendered.build_root,
+            "0" * 20,
+        )
 
 
 def test_render_marketplace_changes_digest_after_source_change(tmp_path: Path) -> None:

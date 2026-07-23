@@ -25,7 +25,9 @@ __all__ = [
     "marketplace_digest",
     "marketplace_is_current",
     "marketplace_publish_path",
+    "published_marketplace_digest",
     "render_marketplace",
+    "validate_marketplace_build",
 ]
 
 _MARKETPLACE_NAME = "agent-config-bridge"
@@ -252,6 +254,32 @@ def marketplace_is_current(
     marker_digest = _marker_digest(published_root)
     _read_rendered_marketplace(published_root, marker_digest)
     return marker_digest == marketplace_digest(config, inventory, resolved=resolved)
+
+
+def published_marketplace_digest(config: BridgeConfig) -> str | None:
+    """Return the integrity-checked digest of the stable published marketplace."""
+
+    published_root = marketplace_publish_path(config)
+    if not os.path.lexists(published_root):
+        return None
+    _validate_state_directory(config, published_root, "published marketplace")
+    digest = _marker_digest(published_root)
+    _read_rendered_marketplace(published_root, digest)
+    return digest
+
+
+def validate_marketplace_build(
+    config: BridgeConfig,
+    build_root: Path,
+    digest: str,
+) -> RenderedMarketplace:
+    """Validate one exact content-addressed build without publishing it."""
+
+    expected = config.state_dir / "builds" / digest
+    if build_root != expected:
+        raise RenderError(f"immutable marketplace build path does not match its digest: {build_root}")
+    _validate_state_directory(config, build_root, "immutable marketplace build")
+    return _read_rendered_marketplace(build_root, digest)
 
 
 def _selected_products(config: BridgeConfig) -> frozenset[Product]:

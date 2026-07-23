@@ -4,10 +4,33 @@ from __future__ import annotations
 
 import ntpath
 import os
+import posixpath
 import stat
 from pathlib import Path
 
-__all__ = ["is_directory_reparse_point", "path_comparison_key", "paths_overlap", "read_symlink_target"]
+__all__ = [
+    "is_absolute_target_path",
+    "is_directory_reparse_point",
+    "path_comparison_key",
+    "paths_overlap",
+    "read_symlink_target",
+    "target_path_comparison_key",
+]
+
+
+def is_absolute_target_path(value: str, *, windows: bool) -> bool:
+    """Return whether a product-emitted path is absolute for its target OS."""
+
+    return ntpath.isabs(value) if windows else value.startswith("/")
+
+
+def target_path_comparison_key(value: str, *, windows: bool) -> str:
+    """Normalize a target-native lexical path without host filesystem access."""
+
+    raw_path, _ = _strip_windows_extended_prefix(value)
+    if windows:
+        return ntpath.normpath(raw_path).replace("\\", "/").casefold()
+    return posixpath.normpath(raw_path)
 
 
 def is_directory_reparse_point(path: Path) -> bool:

@@ -16,6 +16,7 @@ from agent_config_bridge.models import (
     LinkMode,
     Platform,
     Product,
+    RetentionConfig,
     Surface,
     TargetConfig,
 )
@@ -26,7 +27,8 @@ __all__ = ["ConfigError", "load_config"]
 
 _SCHEMA_VERSION = 1
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "bridge", "targets"})
-_BRIDGE_KEYS = frozenset({"catalog", "state_dir", "link_mode", "components"})
+_BRIDGE_KEYS = frozenset({"catalog", "state_dir", "link_mode", "components", "retention"})
+_RETENTION_KEYS = frozenset({"marketplace_builds", "skill_backups"})
 _TARGET_KEYS = frozenset(
     {
         "name",
@@ -103,6 +105,7 @@ def load_config(path: str | os.PathLike[str]) -> BridgeConfig:
         Component,
         "bridge.components",
     )
+    retention = _parse_retention(bridge["retention"]) if "retention" in bridge else RetentionConfig()
 
     _require_directory(catalog, "bridge.catalog")
     _reject_existing_non_directory(state_dir, "bridge.state_dir")
@@ -125,6 +128,7 @@ def load_config(path: str | os.PathLike[str]) -> BridgeConfig:
         components=components,
         targets=targets,
         config_path=config_path,
+        retention=retention,
     )
 
 
@@ -465,6 +469,28 @@ def _parse_enum_set(
 def _parse_bool(value: object, context: str) -> bool:
     if type(value) is not bool:
         raise ConfigError(f"{context} must be a boolean")
+    return value
+
+
+def _parse_retention(value: object) -> RetentionConfig:
+    table = _as_table(value, "bridge.retention")
+    _reject_unknown_keys(table, _RETENTION_KEYS, "bridge.retention")
+    defaults = RetentionConfig()
+    return RetentionConfig(
+        marketplace_builds=_parse_positive_integer(
+            table.get("marketplace_builds", defaults.marketplace_builds),
+            "bridge.retention.marketplace_builds",
+        ),
+        skill_backups=_parse_positive_integer(
+            table.get("skill_backups", defaults.skill_backups),
+            "bridge.retention.skill_backups",
+        ),
+    )
+
+
+def _parse_positive_integer(value: object, context: str) -> int:
+    if type(value) is not int or value < 1:
+        raise ConfigError(f"{context} must be an integer greater than or equal to 1")
     return value
 
 

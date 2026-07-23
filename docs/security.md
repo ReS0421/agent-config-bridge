@@ -152,9 +152,15 @@ so automation never needs to split human status text from machine output.
 ## Plan before mutation
 
 `validate`, `plan`, and `doctor` do not write Bridge or product state. `doctor`
-does execute the selected product CLI with `--version`, so an explicit target
-`executable` remains executable supply-chain input and must be reviewed before
-running diagnostics. `plan` reports:
+does execute the selected product CLI with `--version` and, when marketplace
+registration is relevant, `plugin marketplace list --json`. An explicit target
+`executable` therefore remains executable supply-chain input and must be
+reviewed before running diagnostics. Marketplace JSON stdout is decoded as
+strict UTF-8. Codex's absolute root-only local record and its expanded local
+record are accepted, but duplicates, malformed or relative paths, expanded
+root/source mismatches, unknown schemas, command failures, and undecodable
+output fail closed. The resulting source must still be absent or match the
+desired or previously recorded bridge-owned source. `plan` reports:
 
 - Skill creates, updates, removals, no-ops, and conflicts;
 - aggregate Settings leaf dispositions, fragment paths, and destinations;
@@ -239,7 +245,9 @@ Current alpha limitations matter for threat modeling:
   managed-copy actions have localized snapshot/swap recovery;
 - a later action can fail after an earlier action succeeded;
 - symlink mode is live, so canonical Skill changes become visible immediately;
-- retained backups have no automatic retention/restore command;
+- bounded marketplace-build and managed-Skill-backup retention is available
+  through `state prune`; Instruction backups and automatic restore remain out
+  of scope;
 - the implementation does not provide comprehensive no-follow/reparse-point
   protection against every concurrent filesystem race on POSIX, Windows, or WSL.
 

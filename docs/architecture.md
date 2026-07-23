@@ -363,10 +363,15 @@ Review items are an inspection aid, not a safety certification, and may include
 literal command or URL values from the catalog.
 
 `doctor` separately validates the exact explicit or PATH-selected product
-launcher and invokes it once with `--version`. A missing or invalid configured
+launcher and invokes it with `--version`. A missing or invalid configured
 launcher is an error; ambient PATH discovery and version-probe failures are
-warnings unless an explicit launcher caused them. This reports identity and
-version only; it does not certify Plugin, Hook, Settings, or Schedule support.
+warnings unless an explicit launcher caused them. When Plugin or Hook
+registration is relevant, Doctor also uses the same shared, read-only registry
+probe as `register` and reports absent/owned, foreign, malformed, or skipped
+marketplace state. Both probes capture bytes and decode vendor text as strict
+UTF-8 rather than using the host locale. These checks validate executable
+identity and registration readiness; they do not certify Plugin, Hook,
+Settings, or Schedule feature semantics.
 
 ## Apply and filesystem reconciliation
 
@@ -467,6 +472,12 @@ prior ownership state, only absence or the desired source is accepted, so a
 Claude marketplace add cannot silently replace another checkout's same-name
 entry.
 
+Codex registry parsing accepts either an absolute `root`-only local entry
+(observed in 0.144.4) or an expanded local entry whose absolute `root` and
+`marketplaceSource.source` agree (observed in 0.144.6). A shared parser and
+strict UTF-8 subprocess transport serve both Doctor and registration, so schema
+or decoding drift cannot pass one gate and fail differently at mutation time.
+
 With no `--target` arguments, `register` selects enabled targets for the current
 host platform only. An explicitly selected target for another platform remains
 an error.
@@ -489,6 +500,26 @@ state_dir/
     ├── settings.json                # owned paths/value digests
     └── scheduler.json               # heartbeat ownership
 ```
+
+`agentbridge state prune` owns bounded cleanup of two generated subtrees.
+`bridge.retention.marketplace_builds` defaults to 20, and
+`bridge.retention.skill_backups` defaults to 3 per target/Skill; both must be
+integers of at least one. Planning is read-only. `--yes` acquires an exclusive
+retention lock, rebuilds the complete plan, revalidates candidate identity and
+ownership, then uses descriptor-anchored removal for only the reviewed entries.
+If the Python/platform combination cannot provide that primitive, apply fails
+closed. The published marketplace build is pinned even when it is older than
+the normal cutoff; a missing corresponding immutable build is a blocker.
+
+Instruction backups below `backups/<target>/instructions/` are deliberately
+excluded because their file-granular layout has a different lifecycle. A
+terminal symlink snapshot is a valid historical Skill backup and is removed by
+unlinking the link itself. Any unexpected name, special node, redirected
+ancestor, invalid build marker, or mismatched Skill marker/digest is a global
+blocker: no retention candidate is deleted.
+An identity change after this fresh-plan gate stops before the changed
+candidate; deletion is not transactionally rolled back if earlier candidates
+were already removed.
 
 This state is designed to be non-secret: the bridge never writes product auth,
 session, trust, cache, or conversation state there. The ownership files contain
@@ -513,7 +544,7 @@ merely sharing a `user_home` ancestor is allowed. See
 
 ## Alpha limitations
 
-- No all-actions atomic transaction, apply/register target lock, automatic
+- No all-actions atomic transaction, apply/register lock shared with retention, automatic
   rollback, or recovery log. Schedule ticks use a separate runtime lock.
 - External mutation and ownership-state persistence are separate steps. A crash
   after a Settings/product-registry/crontab/Task-Scheduler change but before its

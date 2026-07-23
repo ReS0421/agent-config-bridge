@@ -4,7 +4,9 @@ This document describes the implemented local projection targets and known
 product boundaries as of 2026-07-15. Vendor behavior changes quickly. An alpha
 bridge release validates its own catalog and generated-state invariants, but it
 does not infer product capabilities or certify every vendor schema. `doctor`
-does report the exact selected executable's `--version` output.
+does report the exact selected executable's `--version` output and, when Plugin
+or Hook registration is relevant, performs a read-only marketplace ownership
+preflight.
 
 “Targeted” means the bridge can model the local filesystem home and generate
 product CLI commands for that combination. It does not mean every component has
@@ -25,6 +27,13 @@ official standalone Codex 0.144.4, Claude Code 2.1.20, Python 3.12, and a native
 plan. Codex Plugin add/list/remove and marketplace-list command surfaces were
 probed successfully; no native Windows Plugin registration was performed
 because the audited catalog contained no Plugin or Hook artifact.
+
+Codex marketplace preflight accepts the two observed local-entry schemas:
+0.144.4's absolute `root`-only record and 0.144.6's expanded record with the
+same absolute `root` and `marketplaceSource.source` plus
+`marketplaceSource.sourceType = "local"`. Vendor JSON stdout is decoded as
+strict UTF-8. Duplicate entries, relative or malformed paths, mismatched
+expanded paths, undecodable output, and unknown schemas fail closed.
 
 Version 0.2 adds native Settings leaf projection and host-managed recurring CLI
 Schedules. These features use public Settings files and operating-system

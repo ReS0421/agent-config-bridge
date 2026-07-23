@@ -10,6 +10,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import asdict
+from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
@@ -28,11 +29,22 @@ from agent_config_bridge.governance import (
     run_governance,
     serialize_registry,
 )
-from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, TargetConfig
-from agent_config_bridge.path_safety import path_comparison_key
+from agent_config_bridge.marketplace_registry import (
+    MarketplaceRegistryError,
+    probe_marketplace_source,
+    run_utf8_json_command,
+)
+from agent_config_bridge.models import BridgeConfig, Component, Product, TargetConfig
 from agent_config_bridge.planner import CommandHint, SyncPlan, build_plan
 from agent_config_bridge.platforms import UnsupportedPlatformError, current_platform, scope_product_home_environment
 from agent_config_bridge.renderer import RenderError, render_marketplace
+from agent_config_bridge.retention import (
+    RetentionAction,
+    RetentionError,
+    RetentionPlan,
+    apply_retention_plan,
+    build_retention_plan,
+)
 from agent_config_bridge.schedule_runner import ScheduleRunnerError, run_due_schedules, run_named_schedule
 from agent_config_bridge.schedule_store import ScheduleStoreError
 from agent_config_bridge.scheduler_backends import ScheduleBackendError
@@ -82,6 +94,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "schedule":
             config = load_config(Path(args.config))
             return _command_schedule(config, args)
+        if args.command == "state":
+            config = load_config(Path(args.config))
+            return _command_state(config, args)
         config, inventory = _load_context(Path(args.config))
         if args.command == "registry":
             return _command_registry(inventory, args.registry_command, args.json)
@@ -123,6 +138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ScheduleExecutionError,
         SettingsError,
         MigrationError,
+        RetentionError,
         UnsupportedPlatformError,
         OSError,
         subprocess.CalledProcessError,
@@ -136,6 +152,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agentbridge",
         description="Share canonical agent settings and automations across Codex and Claude Code.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {package_version('agent-config-bridge')}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -185,6 +206,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
     run_parser.add_argument("--target", required=True)
     run_parser.add_argument("--name", required=True)
+
+    state_parser = subparsers.add_parser("state", help="inspect or prune Bridge-generated operational state")
+    state_subparsers = state_parser.add_subparsers(dest="state_command", required=True)
+    prune_parser = state_subparsers.add_parser(
+        "prune",
+        help="plan bounded generated-state retention, or apply it with --yes",
+    )
+    prune_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+    prune_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    prune_parser.add_argument("-y", "--yes", action="store_true", help="apply the reviewed retention plan")
 
     for command, help_text in (
         ("validate", "validate config and catalog structure"),
@@ -434,6 +465,92 @@ def _command_schedule(config: BridgeConfig, args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _command_state(config: BridgeConfig, args: argparse.Namespace) -> int:
+    if args.state_command != "prune":  # pragma: no cover - argparse restricts the nested command
+        raise ConfigError(f"unknown state command: {args.state_command}")
+
+    plan = build_retention_plan(config)
+    if plan.has_blockers:
+        payload = _retention_payload(plan, applied=False)
+        if args.json:
+            _print_json(payload)
+        else:
+            _print_retention_plan(plan)
+        return 1
+
+    if args.yes:
+        result = apply_retention_plan(config, plan)
+        payload = _retention_payload(
+            result.final_plan,
+            applied=True,
+            reviewed_plan=plan,
+            deleted=result.deleted,
+            reclaimed_bytes=result.reclaimed_bytes,
+        )
+        if args.json:
+            _print_json(payload)
+        else:
+            print(f"retention applied: {len(result.deleted)} entries deleted, {result.reclaimed_bytes} bytes reclaimed")
+        return 0
+
+    payload = _retention_payload(plan, applied=False)
+    if args.json:
+        _print_json(payload)
+    else:
+        _print_retention_plan(plan)
+    return 0
+
+
+def _retention_payload(
+    plan: RetentionPlan,
+    *,
+    applied: bool,
+    reviewed_plan: RetentionPlan | None = None,
+    deleted: Sequence[RetentionAction] = (),
+    reclaimed_bytes: int | None = None,
+) -> dict[str, Any]:
+    source_plan = reviewed_plan or plan
+    return {
+        "schema_version": 1,
+        "applied": applied,
+        "safe": not source_plan.has_blockers,
+        "has_changes": source_plan.has_changes,
+        "has_blockers": source_plan.has_blockers,
+        "limits": asdict(source_plan.limits),
+        "marketplace_builds": {
+            "count": source_plan.build_count,
+            "bytes": source_plan.build_bytes,
+        },
+        "skill_backups": {
+            "group_count": source_plan.skill_backup_group_count,
+            "snapshot_count": source_plan.skill_backup_snapshot_count,
+            "bytes": source_plan.skill_backup_bytes,
+        },
+        "reclaimable_bytes": source_plan.reclaimable_bytes,
+        "actions": [asdict(action) for action in source_plan.actions],
+        "blockers": [asdict(blocker) for blocker in source_plan.blockers],
+        "excluded_instruction_roots": list(source_plan.excluded_instruction_roots),
+        "deleted": [asdict(item) for item in deleted],
+        "reclaimed_bytes": reclaimed_bytes if reclaimed_bytes is not None else 0,
+        "converged": not plan.has_changes and not plan.has_blockers,
+    }
+
+
+def _print_retention_plan(plan: RetentionPlan) -> None:
+    print(
+        "retention plan: "
+        f"{plan.build_count} marketplace builds, "
+        f"{plan.skill_backup_snapshot_count} Skill backups, "
+        f"{len(plan.actions)} deletions, {len(plan.blockers)} blockers"
+    )
+    for blocker in plan.blockers:
+        print(f"  BLOCKED {blocker.path}: {blocker.reason}")
+    for action in plan.actions:
+        print(f"  DELETE  {action.category}: {action.path}")
+    if plan.has_changes:
+        print("dry run only; rerun with --yes to delete the reviewed entries")
+
+
 def _command_init(args: argparse.Namespace) -> int:
     config_path = Path(args.config).expanduser().resolve()
     if config_path.exists() and not args.force:
@@ -449,6 +566,10 @@ catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto"
 components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+
+[bridge.retention]
+marketplace_builds = 20
+skill_backups = 3
 
 [[targets]]
 name = "local-codex"
@@ -820,85 +941,12 @@ def _registered_marketplace_source(
 ) -> str | None:
     """Return the physical source for the bridge-named product marketplace."""
 
-    argv = (executable, "plugin", "marketplace", "list", "--json")
     try:
-        result = subprocess.run(
-            argv,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        payload = json.loads(result.stdout)
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, TypeError) as exc:
+        return probe_marketplace_source(target, executable, environment)
+    except MarketplaceRegistryError as exc:
         raise ConfigError(
-            f"target {target.name!r}: could not verify marketplace ownership before registration"
+            f"target {target.name!r}: could not verify marketplace ownership before registration: {exc}"
         ) from exc
-
-    raw_source = (
-        _codex_marketplace_source(payload, target)
-        if target.product is Product.CODEX
-        else _claude_marketplace_source(payload, target)
-    )
-    if raw_source is None:
-        return None
-    source = Path(raw_source)
-    if not source.is_absolute():
-        raise ConfigError(
-            f"target {target.name!r}: product returned a non-absolute marketplace source; refusing registration"
-        )
-    return path_comparison_key(source, windows=target.platform is Platform.WINDOWS)
-
-
-def _codex_marketplace_source(payload: object, target: TargetConfig) -> str | None:
-    if not isinstance(payload, dict) or not isinstance(payload.get("marketplaces"), list):
-        raise ConfigError(f"target {target.name!r}: unexpected Codex marketplace-list JSON")
-    entries = payload["marketplaces"]
-    if not all(isinstance(entry, dict) and isinstance(entry.get("name"), str) for entry in entries):
-        raise ConfigError(f"target {target.name!r}: unexpected Codex marketplace-list JSON")
-    matches = [entry for entry in entries if entry["name"] == "agent-config-bridge"]
-    if not matches:
-        return None
-    if len(matches) != 1:
-        raise ConfigError(f"target {target.name!r}: duplicate Codex bridge marketplaces")
-    entry = matches[0]
-    root = entry.get("root")
-    marketplace_source = entry.get("marketplaceSource")
-    source: object = marketplace_source.get("source") if isinstance(marketplace_source, dict) else None
-    if (
-        not isinstance(root, str)
-        or not isinstance(marketplace_source, dict)
-        or marketplace_source.get("sourceType") != "local"
-        or not isinstance(source, str)
-    ):
-        raise ConfigError(f"target {target.name!r}: unexpected Codex bridge marketplace source")
-    windows = target.platform is Platform.WINDOWS
-    if path_comparison_key(Path(root), windows=windows) != path_comparison_key(Path(source), windows=windows):
-        raise ConfigError(f"target {target.name!r}: inconsistent Codex bridge marketplace source")
-    return source
-
-
-def _claude_marketplace_source(payload: object, target: TargetConfig) -> str | None:
-    if not isinstance(payload, list) or not all(
-        isinstance(entry, dict) and isinstance(entry.get("name"), str) for entry in payload
-    ):
-        raise ConfigError(f"target {target.name!r}: unexpected Claude marketplace-list JSON")
-    matches = [entry for entry in payload if entry["name"] == "agent-config-bridge"]
-    if not matches:
-        return None
-    if len(matches) != 1:
-        raise ConfigError(f"target {target.name!r}: duplicate Claude bridge marketplaces")
-    entry = matches[0]
-    source_path = entry.get("path")
-    install_location = entry.get("installLocation")
-    if entry.get("source") != "directory" or not isinstance(source_path, str) or not isinstance(install_location, str):
-        raise ConfigError(f"target {target.name!r}: unexpected Claude bridge marketplace source")
-    windows = target.platform is Platform.WINDOWS
-    if path_comparison_key(Path(source_path), windows=windows) != path_comparison_key(
-        Path(install_location), windows=windows
-    ):
-        raise ConfigError(f"target {target.name!r}: inconsistent Claude bridge marketplace source")
-    return source_path
 
 
 def _run_registration_command(
@@ -938,15 +986,11 @@ def _removal_is_already_satisfied(
         return False
 
     try:
-        result = subprocess.run(
+        payload = run_utf8_json_command(
             probe_argv,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
+            environment,
         )
-        payload = json.loads(result.stdout)
-    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError, TypeError):
+    except MarketplaceRegistryError:
         return False
     if removal_kind == "codex-marketplace":
         if not isinstance(payload, dict) or not isinstance(payload.get("marketplaces"), list):

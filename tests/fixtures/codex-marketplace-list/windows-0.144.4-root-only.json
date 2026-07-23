@@ -1,0 +1,20 @@
+{
+  "marketplaces": [
+    {
+      "name": "openai-primary-runtime",
+      "root": "C:\\Users\\ReS\\.cache\\codex-runtimes\\codex-primary-runtime\\plugins\\openai-primary-runtime"
+    },
+    {
+      "name": "openai-bundled",
+      "root": "C:\\Users\\ReS\\.codex\\.tmp\\bundled-marketplaces\\openai-bundled"
+    },
+    {
+      "name": "openai-curated",
+      "root": "C:\\Users\\ReS\\.codex\\.tmp\\plugins"
+    },
+    {
+      "name": "agent-config-bridge",
+      "root": "C:\\Users\\ReS\\AppData\\Local\\AgentConfigBridge\\state\\marketplace"
+    }
+  ]
+}

@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 
 from agent_config_bridge.config import ConfigError, load_config
-from agent_config_bridge.models import Component, LinkMode, Platform, Product, Surface
+from agent_config_bridge.models import (
+    Component,
+    LinkMode,
+    Platform,
+    Product,
+    RetentionConfig,
+    Surface,
+)
 from agent_config_bridge.platforms import current_platform
 from tests.conftest import symlink_directory_or_skip
 
@@ -61,6 +68,10 @@ def test_load_config_builds_typed_immutable_model(tmp_path: Path) -> None:
     assert config.link_mode is LinkMode.AUTO
     assert config.components == frozenset({Component.SKILLS, Component.PLUGINS, Component.HOOKS})
     assert isinstance(config.targets, tuple)
+    assert config.retention == RetentionConfig(
+        marketplace_builds=20,
+        skill_backups=3,
+    )
 
     target = config.targets[0]
     assert target.name == "local-codex"
@@ -71,6 +82,37 @@ def test_load_config_builds_typed_immutable_model(tmp_path: Path) -> None:
     assert target.components is config.components
     assert target.surfaces == frozenset(Surface)
     assert target.enabled is True
+
+
+def test_load_config_accepts_retention_limits(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        bridge_extra=("[bridge.retention]\nmarketplace_builds = 8\nskill_backups = 2\n"),
+    )
+
+    config = load_config(config_path)
+
+    assert config.retention == RetentionConfig(
+        marketplace_builds=8,
+        skill_backups=2,
+    )
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "true", '"3"'))
+def test_load_config_rejects_invalid_retention_limit(
+    tmp_path: Path,
+    value: str,
+) -> None:
+    config_path = _write_config(
+        tmp_path,
+        bridge_extra=(f"[bridge.retention]\nskill_backups = {value}\n"),
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match="bridge.retention.skill_backups must be an integer greater than or equal to 1",
+    ):
+        load_config(config_path)
 
 
 def test_load_config_accepts_settings_and_schedules_components(tmp_path: Path) -> None:
