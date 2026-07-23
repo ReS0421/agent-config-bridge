@@ -53,8 +53,8 @@ selected product command must resolve to reviewed `.exe` or `.com` files.
 
 **[BUG] Incompatible product CLI**
 - Symptom: Plugin preflight rejects a JSON listing, or add/remove/install/uninstall flags are unknown.
-- Cause: the product CLI selected by `target.executable` or `PATH` is older than the Plugin workflow.
-- Fix: upgrade the host-native CLI or set `target.executable` to a reviewed absolute executable. Codex must support `plugin marketplace list --json` plus Plugin and marketplace add/remove. Claude Code must support `plugin marketplace list --json`, `plugin list --json`, marketplace add/remove, and Plugin install/uninstall.
+- Cause: the product CLI selected by `target.executable` or `PATH` lacks the Plugin workflow, returned undecodable JSON, or changed to an unknown schema. Codex 0.144.4's absolute `root`-only local marketplace record and 0.144.6's expanded local record are both supported, so a 0.144.4 root-only listing alone is not an upgrade signal.
+- Fix: run `doctor` on the target host and inspect `plugins.marketplace-preflight`. Upgrade the host-native CLI only when its command surface is missing or its schema is unsupported, or set `target.executable` to a reviewed absolute executable. Codex must support `plugin marketplace list --json` plus Plugin and marketplace add/remove. Claude Code must support `plugin marketplace list --json`, `plugin list --json`, marketplace add/remove, and Plugin install/uninstall.
 
 ## 3. Create or Migrate the Canonical Catalog
 

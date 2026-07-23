@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from agent_config_bridge import doctor
 from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.doctor import CheckLevel, run_doctor
 from agent_config_bridge.models import Component, Platform, Product
@@ -538,3 +541,180 @@ def test_doctor_warns_on_malformed_and_mismatched_markers(tmp_path: Path) -> Non
     mismatched = [check for check in run_doctor(config, inventory, plan) if check.code == "skills.provenance"]
     assert mismatched[0].level is CheckLevel.WARNING
     assert "expected" in mismatched[0].message
+
+
+def test_doctor_marketplace_preflight_accepts_absent_registry_without_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A planned registration is ready when the bridge marketplace is absent."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    executable = Path(sys.executable).resolve()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: str(executable))
+
+    def run(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if argv[-1] == "--version":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"codex-cli 0.144.6\n", stderr=b"")
+        return subprocess.CompletedProcess(argv, 0, stdout=b'{"marketplaces": []}', stderr="경고".encode())
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    checks = run_doctor(config, inventory, plan)
+
+    preflight = next(check for check in checks if check.code == "plugins.marketplace-preflight")
+    assert preflight.level is CheckLevel.OK
+    assert "absent" in preflight.message
+    assert not config.state_dir.exists()
+
+
+def test_doctor_marketplace_preflight_accepts_owned_legacy_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Codex 0.144.4 root-only record preserves ownership semantics."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    executable = Path(sys.executable).resolve()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: str(executable))
+    root = str((config.state_dir / "marketplace").resolve())
+
+    def run(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if argv[-1] == "--version":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"codex-cli 0.144.4\n", stderr=b"")
+        payload = {"marketplaces": [{"name": "agent-config-bridge", "root": root}]}
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload).encode(), stderr=b"")
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    checks = run_doctor(config, inventory, plan)
+
+    preflight = next(check for check in checks if check.code == "plugins.marketplace-preflight")
+    assert preflight.level is CheckLevel.OK
+    assert "ownership are valid" in preflight.message
+
+
+@pytest.mark.parametrize(
+    "marketplace_result",
+    [
+        subprocess.CompletedProcess(("codex",), 1, stdout=b"{}", stderr=b"failed"),
+        subprocess.CompletedProcess(("codex",), 0, stdout=b"\xec", stderr=b""),
+        subprocess.CompletedProcess(
+            ("codex",),
+            0,
+            stdout=b'{"marketplaces":[{"name":"agent-config-bridge","root":"/foreign"}]}',
+            stderr=b"",
+        ),
+        subprocess.CompletedProcess(
+            ("codex",),
+            0,
+            stdout=b'{"marketplaces":[{"name":"agent-config-bridge","root":"/one"},'
+            b'{"name":"agent-config-bridge","root":"/two"}]}',
+            stderr=b"",
+        ),
+    ],
+)
+def test_doctor_marketplace_preflight_errors_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marketplace_result: subprocess.CompletedProcess[bytes],
+) -> None:
+    """Vendor, schema, decode, duplicate, and ownership failures are errors."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+    inventory = discover_catalog(config)
+    executable = Path(sys.executable).resolve()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: str(executable))
+
+    def run(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if argv[-1] == "--version":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"codex-cli 0.144.6\n", stderr=b"")
+        return marketplace_result
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    checks = run_doctor(config, inventory, build_plan(config, inventory))
+
+    preflight = next(check for check in checks if check.code == "plugins.marketplace-preflight")
+    assert preflight.level is CheckLevel.ERROR
+
+
+def test_doctor_marketplace_preflight_reports_timeout_as_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded marketplace probe timeout is a registration-readiness error."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=current_platform(),
+        components=frozenset({Component.PLUGINS}),
+    )
+    inventory = discover_catalog(config)
+    executable = Path(sys.executable).resolve()
+    monkeypatch.setattr(doctor.shutil, "which", lambda _name: str(executable))
+
+    def run(argv: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        if argv[-1] == "--version":
+            return subprocess.CompletedProcess(argv, 0, stdout=b"codex-cli 0.144.6\n", stderr=b"")
+        raise subprocess.TimeoutExpired(argv, 5)
+
+    monkeypatch.setattr(doctor.subprocess, "run", run)
+
+    checks = run_doctor(config, inventory, build_plan(config, inventory))
+
+    preflight = next(check for check in checks if check.code == "plugins.marketplace-preflight")
+    assert preflight.level is CheckLevel.ERROR
+    assert "timed out" in preflight.message
+
+
+def test_doctor_marketplace_preflight_skips_opposite_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doctor never invokes a vendor CLI for an unsupported target platform."""
+
+    other_platform = Platform.WINDOWS if current_platform() is Platform.LINUX else Platform.LINUX
+    catalog = make_catalog(tmp_path / "catalog", skills=(), plugins=("shared",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=other_platform,
+        components=frozenset({Component.PLUGINS}),
+    )
+    inventory = discover_catalog(config)
+    monkeypatch.setattr(
+        doctor,
+        "probe_marketplace_source",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("probe must be skipped")),
+    )
+
+    checks = run_doctor(config, inventory, build_plan(config, inventory))
+
+    preflight = next(check for check in checks if check.code == "plugins.marketplace-preflight")
+    assert preflight.level is CheckLevel.INFO
+    assert "skipped" in preflight.message

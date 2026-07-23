@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
@@ -12,6 +12,7 @@ __all__ = [
     "LinkMode",
     "Platform",
     "Product",
+    "RetentionConfig",
     "Surface",
     "TargetConfig",
 ]
@@ -59,6 +60,14 @@ class Surface(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RetentionConfig:
+    """Bounded retention limits for Bridge-generated operational state."""
+
+    marketplace_builds: int = 20
+    skill_backups: int = 3
+
+
+@dataclass(frozen=True, slots=True)
 class TargetConfig:
     """Resolved configuration for one product installation target.
 
@@ -88,3 +97,4 @@ class BridgeConfig:
     components: frozenset[Component]
     targets: tuple[TargetConfig, ...]
     config_path: Path | None = None
+    retention: RetentionConfig = field(default_factory=RetentionConfig)

@@ -173,6 +173,23 @@ the local swap partially fails, the Bridge reconstructs and verifies the prior
 destination from the retained backup through a fresh same-filesystem staging
 path; it never restores the damaged swap or consumes the only verified backup.
 
+Generated marketplace builds and managed Skill backups have bounded retention:
+
+```bash
+agentbridge state prune -c agentbridge.toml --json
+agentbridge state prune -c agentbridge.toml --yes --json
+```
+
+The first command is a byte-preserving dry run. The second deletes only the
+reviewed, revalidated candidates. Any malformed entry, redirected ancestor, or
+ownership/digest mismatch found by the locked fresh plan blocks all deletion.
+An identity change detected later stops before deleting that changed candidate;
+earlier candidates from the same reviewed plan may already have been removed.
+The currently published marketplace build is always retained, terminal symlink
+snapshots are unlinked without following their target, and Instruction backups
+are outside this retention policy. Applying deletions also fails closed on a
+platform whose Python runtime lacks descriptor-anchored removal.
+
 Registration remains deliberately separate:
 
 ```bash
@@ -213,6 +230,10 @@ catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto" # auto | symlink | copy
 components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+
+[bridge.retention]
+marketplace_builds = 20
+skill_backups = 3
 
 [[targets]]
 name = "local-codex"
@@ -371,6 +392,11 @@ for the schema and lifecycle.
 - Copy mode updates only when the ownership marker matches and the installed digest has not drifted.
 - Updated or deselected, unchanged managed copies are retained under the
   configured state directory.
+- `state prune` is dry-run by default. Applying retention requires `--yes`,
+  holds an exclusive retention lock, rebuilds the reviewed plan, and
+  revalidates every deletion candidate immediately before descriptor-anchored
+  removal. A later concurrent change stops subsequent deletion but does not
+  roll back candidates already removed.
 - Marketplace builds are immutable and addressed by source digest; the stable
   published snapshot is integrity-checked before reuse or replacement.
 - Settings update/remove only while each current value matches its target-scoped
@@ -438,7 +464,8 @@ or enabling unattended Schedules.
   a separate per-Schedule lock skips only a recurrence whose previous run is
   still active, while the Schedule's own timeout remains authoritative.
 - Alpha releases do not provide an all-actions atomic transaction, an
-  apply/register target lock, automatic rollback, recovery logs, product
+  apply/register target lock shared with retention, automatic rollback,
+  recovery logs, product
   capability inference, or full post-install validation. Doctor's selected-CLI
   `--version` probe is informational. Schedule ticks use a separate runtime
   lock.

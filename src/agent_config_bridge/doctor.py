@@ -19,13 +19,20 @@ from agent_config_bridge.governance import (
     GovernanceSeverity,
     run_governance,
 )
+from agent_config_bridge.marketplace_registry import MarketplaceRegistryError, probe_marketplace_source
 from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key
-from agent_config_bridge.planner import Disposition, SyncPlan
-from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.planner import CommandHint, Disposition, SyncPlan
+from agent_config_bridge.platforms import current_platform, scope_product_home_environment
 from agent_config_bridge.provenance import ROOT_MARKER_FILENAME, read_skill_root_marker
 from agent_config_bridge.scheduler_registration import SchedulerRegistrationError, validate_vendor_executable
-from agent_config_bridge.state import BridgeStateError, find_orphaned_target_states, skill_root_for_target
+from agent_config_bridge.state import (
+    BridgeStateError,
+    find_orphaned_target_states,
+    read_registration_state,
+    registration_marketplace_source,
+    skill_root_for_target,
+)
 
 __all__ = ["CheckLevel", "DoctorCheck", "run_doctor"]
 
@@ -119,6 +126,8 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                 checks.append(provenance)
 
         same_platform = target.platform is host_platform
+        target_commands = tuple(command for command in plan.commands if command.target == target.name)
+        marketplace_relevant = _marketplace_preflight_relevant(target, inventory, target_commands)
         if not same_platform:
             checks.append(
                 DoctorCheck(
@@ -131,8 +140,19 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     target.name,
                 )
             )
+            if marketplace_relevant:
+                checks.append(
+                    DoctorCheck(
+                        CheckLevel.INFO,
+                        "plugins.marketplace-preflight",
+                        "marketplace ownership preflight skipped for an unsupported target platform",
+                        target.name,
+                    )
+                )
         else:
             checks.append(_executable_check(target))
+            if marketplace_relevant:
+                checks.append(_marketplace_preflight_check(config, target, target_commands))
 
         if same_platform and target.product is Product.CODEX and current_codex_home:
             expected_path = target.config_home.resolve()
@@ -243,7 +263,6 @@ def _executable_check(target: TargetConfig) -> DoctorCheck:
             (str(selected), "--version"),
             check=False,
             capture_output=True,
-            text=True,
             timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
@@ -254,7 +273,18 @@ def _executable_check(target: TargetConfig) -> DoctorCheck:
             target.name,
         )
 
-    raw_version = result.stdout.strip() or result.stderr.strip()
+    try:
+        stdout = result.stdout.decode("utf-8", errors="strict")
+        stderr = result.stderr.decode("utf-8", errors="strict")
+    except (AttributeError, UnicodeDecodeError) as exc:
+        return DoctorCheck(
+            CheckLevel.ERROR if explicit else CheckLevel.WARNING,
+            "target.executable",
+            f"{command} executable ({source}): {selected}; version probe returned non-UTF-8 output: {exc}",
+            target.name,
+        )
+
+    raw_version = stdout.strip() or stderr.strip()
     version = "".join(character for character in " ".join(raw_version.split()) if character.isprintable())
     if len(version) > 512:
         version = f"{version[:511]}…"
@@ -270,6 +300,111 @@ def _executable_check(target: TargetConfig) -> DoctorCheck:
         CheckLevel.OK,
         "target.executable",
         f"{command} executable ({source}): {selected}; version: {version}",
+        target.name,
+    )
+
+
+def _marketplace_preflight_relevant(
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    commands: tuple[CommandHint, ...],
+) -> bool:
+    """Return whether this target can need bridge marketplace reconciliation."""
+
+    return bool(
+        commands
+        or (Component.PLUGINS in target.components and inventory.plugins)
+        or (Component.HOOKS in target.components and inventory.hooks)
+    )
+
+
+def _marketplace_preflight_check(
+    config: BridgeConfig,
+    target: TargetConfig,
+    commands: tuple[CommandHint, ...],
+) -> DoctorCheck:
+    """Verify marketplace schema and ownership without mutating product state."""
+
+    command = "codex" if target.product is Product.CODEX else "claude"
+    executables = {item.argv[0] for item in commands}
+    if len(executables) > 1:
+        return DoctorCheck(
+            CheckLevel.ERROR,
+            "plugins.marketplace-preflight",
+            "registration plan does not use one product executable",
+            target.name,
+        )
+    if executables:
+        executable = next(iter(executables))
+    elif target.executable is not None:
+        try:
+            executable = str(validate_vendor_executable(target, target.executable))
+        except SchedulerRegistrationError as exc:
+            return DoctorCheck(
+                CheckLevel.ERROR,
+                "plugins.marketplace-preflight",
+                f"configured executable is invalid; marketplace ownership preflight failed: {exc}",
+                target.name,
+            )
+    else:
+        discovered = shutil.which(command)
+        if discovered is None:
+            return DoctorCheck(
+                CheckLevel.ERROR,
+                "plugins.marketplace-preflight",
+                f"{command} executable was not found; marketplace ownership preflight failed",
+                target.name,
+            )
+        try:
+            executable = str(validate_vendor_executable(target, Path(discovered)))
+        except SchedulerRegistrationError as exc:
+            return DoctorCheck(
+                CheckLevel.ERROR,
+                "plugins.marketplace-preflight",
+                f"PATH-selected executable is invalid; marketplace ownership preflight failed: {exc}",
+                target.name,
+            )
+
+    environment = os.environ.copy()
+    scope_product_home_environment(environment, target)
+    if commands:
+        first = commands[0]
+        for key in first.environment_unsets:
+            environment.pop(key, None)
+        environment.update(dict(first.environment))
+
+    try:
+        actual_source = probe_marketplace_source(target, executable, environment)
+    except MarketplaceRegistryError as exc:
+        return DoctorCheck(
+            CheckLevel.ERROR,
+            "plugins.marketplace-preflight",
+            f"marketplace ownership preflight failed: {exc}",
+            target.name,
+        )
+    if actual_source is None:
+        return DoctorCheck(
+            CheckLevel.OK,
+            "plugins.marketplace-preflight",
+            "bridge marketplace is absent and can be registered",
+            target.name,
+        )
+
+    registration = read_registration_state(config, target)
+    allowed_sources = {registration_marketplace_source(config, target)}
+    if registration.marketplace_source is not None:
+        allowed_sources.add(registration.marketplace_source)
+    if actual_source not in allowed_sources:
+        return DoctorCheck(
+            CheckLevel.ERROR,
+            "plugins.marketplace-preflight",
+            "bridge marketplace is registered from an unowned source",
+            target.name,
+        )
+    return DoctorCheck(
+        CheckLevel.OK,
+        "plugins.marketplace-preflight",
+        "bridge marketplace schema and ownership are valid",
         target.name,
     )
 

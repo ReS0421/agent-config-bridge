@@ -9,7 +9,13 @@ from typing import Any, cast
 
 import pytest
 
-from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key, paths_overlap
+from agent_config_bridge.path_safety import (
+    is_absolute_target_path,
+    is_directory_reparse_point,
+    path_comparison_key,
+    paths_overlap,
+    target_path_comparison_key,
+)
 
 
 class _FakePath:
@@ -48,6 +54,27 @@ def test_windows_path_comparison_strips_extended_device_prefix(tmp_path: Path) -
     extended = Path("\\\\?\\" + str(ordinary).replace("/", "\\"))
 
     assert path_comparison_key(extended, windows=True) == path_comparison_key(ordinary, windows=True)
+
+
+def test_target_native_absolute_paths_do_not_depend_on_host_flavor() -> None:
+    """Windows drive/UNC paths and POSIX roots are validated lexically."""
+
+    assert is_absolute_target_path(r"C:\Users\Res\.codex", windows=True)
+    assert is_absolute_target_path(r"\\server\share\codex", windows=True)
+    assert not is_absolute_target_path(r"Users\Res\.codex", windows=True)
+    assert is_absolute_target_path("/home/res/.codex", windows=False)
+    assert not is_absolute_target_path("home/res/.codex", windows=False)
+
+
+def test_target_native_windows_key_normalizes_case_and_separators() -> None:
+    """Product-emitted Windows paths compare without adding the host cwd."""
+
+    assert target_path_comparison_key(r"C:\Users\RES\.codex", windows=True) == "c:/users/res/.codex"
+    assert target_path_comparison_key("c:/users/res/.CODEX", windows=True) == "c:/users/res/.codex"
+
+
+def test_target_native_posix_key_uses_posix_rules_on_every_host() -> None:
+    assert target_path_comparison_key("/home/res/../bridge", windows=False) == "/home/bridge"
 
 
 def test_paths_overlap_is_bidirectional_and_segment_aware() -> None:

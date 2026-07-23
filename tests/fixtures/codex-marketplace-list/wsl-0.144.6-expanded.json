@@ -1,0 +1,12 @@
+{
+  "marketplaces": [
+    {
+      "name": "agent-config-bridge",
+      "root": "/home/res/.local/state/agent-config-bridge/wsl/marketplace",
+      "marketplaceSource": {
+        "sourceType": "local",
+        "source": "/home/res/.local/state/agent-config-bridge/wsl/marketplace"
+      }
+    }
+  ]
+}
