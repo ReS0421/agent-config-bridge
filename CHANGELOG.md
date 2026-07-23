@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-23
+
+### Added
+
+- Machine-readable `agentbridge plan --json` output now declares
+  `schema_version = 1` and documents its required fields and fail-closed
+  consumer contract.
+- A CI-enforced release contract now keeps project and lock metadata aligned,
+  prevents post-tag distribution changes from retaining the released version,
+  and verifies exact version tags against package metadata and a clean
+  worktree.
+- Governance provenance validation now uses a closed origin vocabulary,
+  including `orca-runtime`, and rejects unknown or malformed provenance
+  origins before registry generation.
+
+### Changed
+
+- Cross-host promotion now requires one build from a clean, exactly tagged
+  commit, recorded wheel and source-distribution SHA-256 digests, and
+  installation of those same artifacts instead of rebuilding an existing
+  version on each host.
+
 ## [0.3.0] - 2026-07-23
 
 ### Added

@@ -370,6 +370,7 @@ def test_plan_json_returns_one_for_unmanaged_destination_conflict(
     assert cli.main(["plan", "--config", str(config_path), "--json"]) == 1
 
     payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
     assert payload["has_conflicts"] is True
     assert payload["actions"][0]["disposition"] == "conflict"
     assert sentinel.read_text(encoding="utf-8") == "keep me"
@@ -469,7 +470,28 @@ def test_plan_json_models_claude_default_profile_environment_removal(
     assert cli.main(["plan", "--config", str(config_path), "--json"]) == 0
 
     payload = json.loads(capsys.readouterr().out)
+    assert {
+        "actions",
+        "commands",
+        "has_changes",
+        "has_conflicts",
+        "reviews",
+        "schema_version",
+        "warnings",
+    } <= set(payload)
+    assert payload["schema_version"] == 1
     assert payload["commands"]
+    assert all(
+        {
+            "argv",
+            "environment",
+            "environment_unsets",
+            "reason",
+            "target",
+        }
+        <= set(command)
+        for command in payload["commands"]
+    )
     assert all(command["environment"] == {} for command in payload["commands"])
     assert all(command["environment_unsets"] == ["CLAUDE_CONFIG_DIR"] for command in payload["commands"])
 
