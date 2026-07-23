@@ -326,7 +326,8 @@ def test_candidate_identity_replacement_after_plan_deletes_nothing(
     shutil.rmtree(candidate)
     replacement = _make_backup(config, 0)
 
-    with pytest.raises(RetentionError, match="changed after retention planning"):
+    expected = "changed after retention planning" if shutil.rmtree.avoids_symlink_attacks else "descriptor-anchored"
+    with pytest.raises(RetentionError, match=expected):
         apply_retention_plan(config, plan)
 
     assert replacement.is_dir()
