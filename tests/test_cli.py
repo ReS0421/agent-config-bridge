@@ -1163,7 +1163,6 @@ def test_state_prune_is_a_read_only_json_plan_without_yes(
         node_kind="directory",
         bytes=10,
         mtime_ns=1,
-        ctime_ns=1,
         device=2,
         inode=3,
     )
@@ -1198,7 +1197,6 @@ def test_state_prune_yes_applies_exact_reviewed_plan(
         node_kind="directory",
         bytes=10,
         mtime_ns=1,
-        ctime_ns=1,
         device=2,
         inode=3,
     )

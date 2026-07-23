@@ -49,7 +49,6 @@ class RetentionAction:
     node_kind: str
     bytes: int
     mtime_ns: int
-    ctime_ns: int
     device: int
     inode: int
 
@@ -110,7 +109,6 @@ class _ScannedEntry:
     node_kind: str
     bytes: int
     mtime_ns: int
-    ctime_ns: int
     device: int
     inode: int
 
@@ -121,7 +119,6 @@ class _ScannedEntry:
             node_kind=self.node_kind,
             bytes=self.bytes,
             mtime_ns=self.mtime_ns,
-            ctime_ns=self.ctime_ns,
             device=self.device,
             inode=self.inode,
         )
@@ -205,12 +202,12 @@ def apply_retention_plan(
             raise RetentionError("generated state changed after retention planning; review a fresh plan")
         if fresh_plan.has_blockers:
             raise RetentionError("retention state became unsafe; no entries were deleted")
-        for action in fresh_plan.actions:
-            _revalidate_action(config, action)
         if fresh_plan.actions and not shutil.rmtree.avoids_symlink_attacks:
             raise RetentionError(
                 "this platform lacks descriptor-anchored directory removal; retention apply is blocked"
             )
+        for action in fresh_plan.actions:
+            _revalidate_action(config, action)
         for action in fresh_plan.actions:
             _revalidate_action(config, action)
             _remove_action_anchored(config, action)
@@ -486,12 +483,7 @@ def _revalidate_action(config: BridgeConfig, action: RetentionAction) -> None:
         current = action.path.lstat()
     except OSError as exc:
         raise RetentionError(f"retention candidate changed before deletion: {action.path}") from exc
-    if (
-        current.st_dev != action.device
-        or current.st_ino != action.inode
-        or current.st_mtime_ns != action.mtime_ns
-        or current.st_ctime_ns != action.ctime_ns
-    ):
+    if current.st_dev != action.device or current.st_ino != action.inode or current.st_mtime_ns != action.mtime_ns:
         raise RetentionError(f"retention candidate identity changed before deletion: {action.path}")
     if action.node_kind == "symlink":
         if not stat.S_ISLNK(current.st_mode):
@@ -523,12 +515,7 @@ def _remove_action_anchored(config: BridgeConfig, action: RetentionAction) -> No
         raise RetentionError(f"retention candidate parent changed before deletion: {parent}") from exc
     try:
         current = os.stat(action.path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            current.st_dev != action.device
-            or current.st_ino != action.inode
-            or current.st_mtime_ns != action.mtime_ns
-            or current.st_ctime_ns != action.ctime_ns
-        ):
+        if current.st_dev != action.device or current.st_ino != action.inode or current.st_mtime_ns != action.mtime_ns:
             raise RetentionError(f"retention candidate identity changed before deletion: {action.path}")
         if action.node_kind == "symlink":
             if not stat.S_ISLNK(current.st_mode):
@@ -571,7 +558,6 @@ def _scanned_entry(
         node_kind=node_kind,
         bytes=entry_bytes,
         mtime_ns=entry_stat.st_mtime_ns,
-        ctime_ns=entry_stat.st_ctime_ns,
         device=entry_stat.st_dev,
         inode=entry_stat.st_ino,
     )

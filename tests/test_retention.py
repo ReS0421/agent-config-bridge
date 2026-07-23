@@ -122,6 +122,12 @@ def test_plan_and_apply_keep_twenty_builds_including_old_published_build(
     assert len(plan.actions) == 2
     assert published not in {action.path for action in plan.actions}
 
+    if not shutil.rmtree.avoids_symlink_attacks:
+        with pytest.raises(RetentionError, match="descriptor-anchored"):
+            apply_retention_plan(config, plan)
+        assert all(path.is_dir() for path in builds)
+        return
+
     result = apply_retention_plan(config, plan)
 
     assert len(result.deleted) == 2
@@ -162,6 +168,12 @@ def test_skill_backup_plan_keeps_latest_three_by_snapshot_name_and_applies(
     plan = build_retention_plan(config)
 
     assert [action.path for action in plan.actions] == backups[:2]
+    if not shutil.rmtree.avoids_symlink_attacks:
+        with pytest.raises(RetentionError, match="descriptor-anchored"):
+            apply_retention_plan(config, plan)
+        assert all(path.is_dir() for path in backups)
+        return
+
     result = apply_retention_plan(config, plan)
     assert [path.exists() for path in backups] == [False, False, True, True, True]
     assert len(result.deleted) == 2
@@ -203,6 +215,13 @@ def test_terminal_symlink_snapshot_is_unlinked_without_following_target(
     plan = build_retention_plan(config)
 
     assert [action.path for action in plan.actions] == [old_link]
+    if not shutil.rmtree.avoids_symlink_attacks:
+        with pytest.raises(RetentionError, match="descriptor-anchored"):
+            apply_retention_plan(config, plan)
+        assert old_link.is_symlink()
+        assert sentinel.read_text(encoding="utf-8") == "keep\n"
+        return
+
     apply_retention_plan(config, plan)
     assert not old_link.is_symlink()
     assert newest.is_dir()
