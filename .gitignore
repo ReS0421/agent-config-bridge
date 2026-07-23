@@ -24,3 +24,17 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+credentials.json
+credentials.*.json
+client_secret*.json
+service-account*.json
+secrets.toml
+secrets.*.toml
+*.key
+*.pem
