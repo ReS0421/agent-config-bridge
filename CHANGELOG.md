@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-23
+
 ### Added
 
+- `agentbridge state prune`, with a read-only default plan and explicit
+  `--yes` apply mode, bounds immutable marketplace builds and managed Skill
+  backups through optional `[bridge.retention]` limits. It pins the published
+  build, excludes Instruction backups, safely unlinks terminal symlink
+  snapshots, and fails closed before every deletion when state shape,
+  ownership, integrity, path ancestry, or identity is unsafe.
+- `doctor` now performs the same read-only marketplace schema and ownership
+  preflight used by registration and reports absent, owned, foreign, malformed,
+  undecodable, timed-out, or cross-platform-skipped registry state.
 - `agentbridge sync-skills` applies only reviewed standalone Skill changes,
   while failing closed on full-plan conflicts or pending non-Skill mutations,
   preserving plan TOCTOU verification, and never rendering or registering
@@ -64,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Codex marketplace discovery supports both the absolute `root`-only local
+  entry observed in CLI 0.144.4 and the expanded, matching
+  `marketplaceSource` entry observed in 0.144.6. Product JSON and executable
+  version output are decoded as strict UTF-8 rather than the host locale.
 - Default Claude homes remove any inherited `CLAUDE_CONFIG_DIR`; command plans,
   JSON, copyable previews, and internal registration all model that removal,
   while custom homes still receive the reviewed value.
@@ -74,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Retention rebuilds the complete reviewed plan under an exclusive lock and
+  revalidates inode/device/timestamps, ownership markers, content digests, and
+  real ancestors immediately before descriptor-anchored deletion of only
+  Bridge-generated entries. Platforms without that safe primitive fail closed.
 - Skill migration never mutates source roots; refuses overlapping or redirected
   catalog, conflict, and report outputs; verifies retained variants on rerun;
   bounds each Skill to 100 MiB before reading; excludes transient bytecode/cache
