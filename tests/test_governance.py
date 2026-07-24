@@ -48,6 +48,8 @@ def _manifest(
         'failure_policy = "advisory"',
         'owner = "test"',
         'last_reviewed = "2026-07-16"',
+        "[distribution]",
+        'redistribution = "blocked"',
     ]
     if ref is not None:
         lines += ["[[artifacts]]", f'ref = "{ref}"']
@@ -159,6 +161,156 @@ def test_unknown_or_invalid_provenance_origin_is_rejected(tmp_path: Path, proven
     assert len(findings) == 1
     assert findings[0].capability_id == "good"
     assert findings[0].artifact_ref == "skills/good"
+
+
+@pytest.mark.parametrize("redistribution", ("", "public", 42))
+def test_redistribution_uses_closed_vocabulary(tmp_path: Path, redistribution: object) -> None:
+    """GOV029 rejects open-ended and non-string distribution values."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    manifest = _manifest("good")
+    value = f'"{redistribution}"' if isinstance(redistribution, str) else str(redistribution)
+    manifest = manifest.replace('redistribution = "blocked"', f"redistribution = {value}")
+    _write(catalog / "governance" / "good.toml", manifest)
+    config = make_config(tmp_path, catalog)
+
+    findings = [finding for finding in run_governance(discover_catalog(config)).findings if finding.code == "GOV029"]
+
+    assert len(findings) == 1
+    assert findings[0].capability_id == "good"
+
+
+def test_distribution_must_be_a_table_when_declared(tmp_path: Path) -> None:
+    """A scalar distribution declaration cannot bypass the vocabulary gate."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    manifest = _manifest("good").replace('[distribution]\nredistribution = "blocked"\n', 'distribution = "allowed"\n')
+    _write(catalog / "governance" / "good.toml", manifest)
+    config = make_config(tmp_path, catalog)
+
+    findings = [finding for finding in run_governance(discover_catalog(config)).findings if finding.code == "GOV029"]
+
+    assert len(findings) == 1
+
+
+def _redistributable_manifest(*, overrides: dict[str, str] | None = None) -> str:
+    """Return one complete allowed imported-Git manifest for focused validation."""
+
+    values = {
+        "expected_upstream_digest": "sha256:" + "a" * 64,
+        "source_url": "https://example.invalid/upstream.git",
+        "source_revision": "b" * 40,
+        "source_subpath": "skills/good",
+        "license_concluded": "MIT",
+        "rights_basis": "upstream-license",
+        "license_evidence": '["LICENSE"]',
+        "attribution_files": '["NOTICE"]',
+        "origin": "imported-git",
+    }
+    values.update(overrides or {})
+    return (
+        'id = "good"\n'
+        'capability_kind = "skill"\n'
+        'delivery = "standalone"\n'
+        'lifecycle = "active"\n'
+        'failure_policy = "advisory"\n'
+        'owner = "test"\n'
+        'last_reviewed = "2026-07-23"\n'
+        "[distribution]\n"
+        'redistribution = "allowed"\n'
+        "[[artifacts]]\n"
+        'ref = "skills/good"\n'
+        f'expected_upstream_digest = "{values["expected_upstream_digest"]}"\n'
+        "[artifacts.provenance]\n"
+        f'origin = "{values["origin"]}"\n'
+        f'source_url = "{values["source_url"]}"\n'
+        f'source_revision = "{values["source_revision"]}"\n'
+        f'source_subpath = "{values["source_subpath"]}"\n'
+        f'license_concluded = "{values["license_concluded"]}"\n'
+        f'rights_basis = "{values["rights_basis"]}"\n'
+        f"license_evidence = {values['license_evidence']}\n"
+        f"attribution_files = {values['attribution_files']}\n"
+    )
+
+
+def test_allowed_redistribution_accepts_complete_contained_evidence(tmp_path: Path) -> None:
+    """Complete pinned provenance with real in-artifact evidence is accepted."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(catalog / "skills" / "good" / "LICENSE", "MIT\n")
+    _write(catalog / "skills" / "good" / "NOTICE", "Attribution\n")
+    _write(catalog / "governance" / "good.toml", _redistributable_manifest())
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+
+    assert not [finding for finding in report.findings if finding.code in {f"GOV{code}" for code in range(29, 38)}]
+
+
+def test_allowed_redistribution_requires_provenance_table(tmp_path: Path) -> None:
+    """GOV033 remains stable when an allowed artifact omits provenance."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    manifest = _redistributable_manifest().split("[artifacts.provenance]", 1)[0]
+    _write(catalog / "governance" / "good.toml", manifest)
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+
+    assert any(finding.code == "GOV033" and finding.artifact_ref == "skills/good" for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    (
+        ({"expected_upstream_digest": ""}, "GOV032"),
+        ({"origin": "local-original"}, "GOV034"),
+        ({"source_url": ""}, "GOV034"),
+        ({"source_revision": "main"}, "GOV034"),
+        ({"source_subpath": "../good"}, "GOV034"),
+        ({"license_concluded": "NOASSERTION"}, "GOV035"),
+        ({"rights_basis": "none"}, "GOV035"),
+        ({"license_evidence": "[]"}, "GOV036"),
+        ({"attribution_files": "[]"}, "GOV036"),
+        ({"license_evidence": '["missing.txt"]'}, "GOV037"),
+        ({"license_evidence": '["LICENSE", "missing.txt"]'}, "GOV037"),
+        ({"attribution_files": '["../NOTICE"]'}, "GOV037"),
+    ),
+)
+def test_allowed_redistribution_rejects_incomplete_metadata_or_evidence(
+    tmp_path: Path,
+    overrides: dict[str, str],
+    code: str,
+) -> None:
+    """Each allowed-redistribution prerequisite has a stable diagnostic."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(catalog / "skills" / "good" / "LICENSE", "MIT\n")
+    _write(catalog / "skills" / "good" / "NOTICE", "Attribution\n")
+    _write(catalog / "governance" / "good.toml", _redistributable_manifest(overrides=overrides))
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+
+    assert any(finding.code == code and finding.artifact_ref == "skills/good" for finding in report.findings)
+
+
+def test_allowed_redistribution_rejects_symlinked_evidence(tmp_path: Path) -> None:
+    """Evidence must be a real file, even when a symlink remains contained."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=("good",))
+    _write(catalog / "skills" / "good" / "LICENSE.real", "MIT\n")
+    _write(catalog / "skills" / "good" / "NOTICE", "Attribution\n")
+    try:
+        (catalog / "skills" / "good" / "LICENSE").symlink_to("LICENSE.real")
+    except OSError as exc:  # pragma: no cover - host symlink policy
+        pytest.skip(f"file symlinks are unavailable in this test environment: {exc}")
+    _write(catalog / "governance" / "good.toml", _redistributable_manifest())
+    config = make_config(tmp_path, catalog)
+
+    report = run_governance(discover_catalog(config))
+
+    assert any(finding.code == "GOV037" and "must not traverse" in finding.detail for finding in report.findings)
 
 
 def test_policy_file_sets_mode_and_is_never_a_manifest(tmp_path: Path) -> None:
@@ -429,6 +581,8 @@ def _required_manifest(identifier: str, *, lifecycle: str = "active", targets: s
         'failure_policy = "advisory"\n'
         'owner = "test"\n'
         'last_reviewed = "2026-07-16"\n'
+        "[distribution]\n"
+        'redistribution = "blocked"\n'
         f"{target_blocks}"
         "[[artifacts]]\n"
         f'ref = "skills/{identifier}"\n'
@@ -654,6 +808,8 @@ def _hook_manifest(identifier: str, *, lifecycle: str = "active", products: tupl
         'failure_policy = "advisory"\n'
         'owner = "test"\n'
         'last_reviewed = "2026-07-18"\n'
+        "[distribution]\n"
+        'redistribution = "blocked"\n'
         f"{target_blocks}"
         "[[artifacts]]\n"
         f'ref = "hooks/{identifier}"\n'

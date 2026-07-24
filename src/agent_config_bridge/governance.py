@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -58,6 +59,9 @@ _FAILURE_POLICIES = frozenset({"advisory", "block", "escalate"})
 _LIFECYCLES = frozenset({"proposed", "active", "deprecated", "quarantined", "removed"})
 _DEPLOYABLE_LIFECYCLES = frozenset({"active", "deprecated"})
 _PROVENANCE_ORIGINS = frozenset({"local-original", "imported-git", "imported-marketplace", "orca-runtime"})
+_REDISTRIBUTIONS = frozenset({"allowed", "blocked"})
+_SHA256_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PINNED_GIT_REVISION = re.compile(r"^[0-9a-f]{40,64}$")
 _LEGAL_KIND_DELIVERY = frozenset(
     {
         ("instruction", "standalone"),
@@ -439,6 +443,17 @@ def validate_governance(
         kind = data.get("capability_kind")
         delivery = data.get("delivery")
         lifecycle = data.get("lifecycle")
+        distribution = data.get("distribution")
+        redistribution = distribution.get("redistribution") if isinstance(distribution, dict) else None
+        if distribution is not None and redistribution not in _REDISTRIBUTIONS:
+            findings.append(
+                GovernanceFinding(
+                    "GOV029",
+                    GovernanceSeverity.ERROR,
+                    manifest.id,
+                    detail=f"distribution.redistribution={redistribution!r} not in {sorted(_REDISTRIBUTIONS)}",
+                )
+            )
         for field_name, allowed in (
             ("capability_kind", _CAPABILITY_KINDS),
             ("delivery", _DELIVERIES),
@@ -502,6 +517,8 @@ def validate_governance(
                             detail=(f"provenance origin={origin!r} not in {sorted(_PROVENANCE_ORIGINS)}"),
                         )
                     )
+                if redistribution == "allowed":
+                    findings.extend(_check_redistributable_artifact(manifest, artifact, inventory))
                 # ADR-2 §6: agent-schedule structure (schedule.toml+PROMPT.md) is
                 # enforced by inventory membership, but only if the ref actually
                 # points at the schedules component.
@@ -570,6 +587,156 @@ def validate_governance(
     for skill in inventory.skills:
         findings.extend(_check_skill_frontmatter(skill.path, f"skills/{skill.name}"))
     return tuple(findings)
+
+
+def _check_redistributable_artifact(
+    manifest: GovernanceManifest,
+    artifact: dict[str, Any],
+    inventory: CatalogInventory,
+) -> tuple[GovernanceFinding, ...]:
+    """Validate the evidence required before an artifact may be redistributed."""
+
+    ref = artifact.get("ref")
+    artifact_ref = ref if isinstance(ref, str) and ref else None
+    findings: list[GovernanceFinding] = []
+    digest = artifact.get("expected_upstream_digest")
+    if not isinstance(digest, str) or _SHA256_DIGEST.fullmatch(digest) is None:
+        findings.append(
+            GovernanceFinding(
+                "GOV032",
+                GovernanceSeverity.ERROR,
+                manifest.id,
+                artifact_ref,
+                detail="redistribution=allowed requires expected_upstream_digest as sha256:<64 lowercase hex>",
+            )
+        )
+
+    provenance = artifact.get("provenance")
+    if not isinstance(provenance, dict):
+        findings.append(
+            GovernanceFinding(
+                "GOV033",
+                GovernanceSeverity.ERROR,
+                manifest.id,
+                artifact_ref,
+                detail="redistribution=allowed requires [artifacts.provenance]",
+            )
+        )
+        return tuple(findings)
+
+    source_problems: list[str] = []
+    if provenance.get("origin") != "imported-git":
+        source_problems.append("origin='imported-git'")
+    source_url = provenance.get("source_url")
+    if (
+        not isinstance(source_url, str)
+        or not source_url.strip()
+        or any(character.isspace() for character in source_url)
+    ):
+        source_problems.append("non-empty source_url without whitespace")
+    source_subpath = provenance.get("source_subpath")
+    if not isinstance(source_subpath, str) or not source_subpath.strip():
+        source_problems.append("non-empty source_subpath")
+    else:
+        parsed_subpath = PurePosixPath(source_subpath)
+        if parsed_subpath.is_absolute() or parsed_subpath == PurePosixPath(".") or ".." in parsed_subpath.parts:
+            source_problems.append("relative source_subpath without parent traversal")
+    revision = provenance.get("source_revision")
+    if not isinstance(revision, str) or _PINNED_GIT_REVISION.fullmatch(revision) is None:
+        source_problems.append("source_revision (full 40-64 hex commit)")
+    if source_problems:
+        findings.append(
+            GovernanceFinding(
+                "GOV034",
+                GovernanceSeverity.ERROR,
+                manifest.id,
+                artifact_ref,
+                detail="redistribution=allowed requires pinned imported-git provenance: " + ", ".join(source_problems),
+            )
+        )
+
+    license_concluded = provenance.get("license_concluded")
+    rights_basis = provenance.get("rights_basis")
+    if (
+        not isinstance(license_concluded, str)
+        or not license_concluded.strip()
+        or license_concluded == "NOASSERTION"
+        or not isinstance(rights_basis, str)
+        or not rights_basis.strip()
+        or rights_basis == "none"
+    ):
+        findings.append(
+            GovernanceFinding(
+                "GOV035",
+                GovernanceSeverity.ERROR,
+                manifest.id,
+                artifact_ref,
+                detail="redistribution=allowed requires a concluded license and non-none rights_basis",
+            )
+        )
+
+    for field in ("license_evidence", "attribution_files"):
+        declared_paths = provenance.get(field)
+        if (
+            not isinstance(declared_paths, list)
+            or not declared_paths
+            or any(not isinstance(value, str) or not value.strip() for value in declared_paths)
+        ):
+            findings.append(
+                GovernanceFinding(
+                    "GOV036",
+                    GovernanceSeverity.ERROR,
+                    manifest.id,
+                    artifact_ref,
+                    detail=f"redistribution=allowed requires a non-empty {field} string list",
+                )
+            )
+            continue
+        if artifact_ref is None:
+            continue
+        artifact_root = inventory.root / artifact_ref
+        for declared_path in declared_paths:
+            assert isinstance(declared_path, str)
+            problem = _evidence_path_problem(artifact_root, declared_path)
+            if problem is not None:
+                findings.append(
+                    GovernanceFinding(
+                        "GOV037",
+                        GovernanceSeverity.ERROR,
+                        manifest.id,
+                        artifact_ref,
+                        detail=f"{field} path {declared_path!r} {problem}",
+                    )
+                )
+    return tuple(findings)
+
+
+def _evidence_path_problem(artifact_root: Path, declared_path: str) -> str | None:
+    """Return why an evidence path is not a contained real regular file."""
+
+    relative = Path(declared_path)
+    if relative.is_absolute() or relative == Path(".") or ".." in relative.parts:
+        return "must be a relative path without parent traversal"
+    candidate = artifact_root / relative
+    try:
+        resolved_root = artifact_root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return "does not resolve to an existing file"
+    if not resolved.is_relative_to(resolved_root):
+        return "resolves outside the governed artifact root"
+    current = artifact_root
+    for part in relative.parts:
+        current /= part
+        try:
+            redirected = current.is_symlink() or (current.is_dir() and is_directory_reparse_point(current))
+        except OSError:
+            return "cannot be inspected safely"
+        if redirected:
+            return "must not traverse a symlink, junction, or reparse point"
+    if not candidate.is_file() or candidate.is_symlink():
+        return "must resolve to a real regular file"
+    return None
 
 
 def run_governance(inventory: CatalogInventory) -> GovernanceReport:

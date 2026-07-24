@@ -6,9 +6,9 @@ schema_version = 1
 catalog = "../catalog"
 state_dir = "../.agentbridge"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
 
-# This target inherits all five bridge-level components. The same user home is
+# This target inherits all six bridge-level components. The same user home is
 # used by Codex CLI and Desktop; Agent Config Bridge installs each artifact once.
 # Set config_home explicitly when a launcher injects a non-default CODEX_HOME.
 # Schedules require the cli surface: apply publishes their snapshot and register
@@ -32,6 +32,6 @@ name = "local-claude-code"
 product = "claude-code"
 platform = "auto"
 user_home = "~"
-components = ["skills", "hooks", "settings"]
+components = ["skills", "hooks", "settings", "instructions"]
 surfaces = ["cli", "desktop"]
 enabled = true

@@ -17,6 +17,7 @@ from agent_config_bridge.renderer import (
     _copy_overlay,
     _rendered_tree_digest,
     _update_tree_digest,
+    marketplace_digest,
     published_marketplace_digest,
     render_marketplace,
     validate_marketplace_build,
@@ -62,6 +63,127 @@ def test_render_marketplace_builds_both_product_catalogs(tmp_path: Path) -> None
     assert codex_hooks == claude_hooks
     assert (codex_hook_plugin / "scripts/audit-event/allow.py").is_file()
     assert (claude_hook_plugin / "scripts/audit-event/allow.py").is_file()
+
+
+def test_rendered_hook_plugin_includes_governed_attribution(tmp_path: Path) -> None:
+    """Declared Hook attribution ships with each rendered product plugin."""
+
+    catalog = make_catalog(tmp_path / "catalog", hooks=("audit-event",))
+    license_file = catalog / "hooks/audit-event/LICENSE"
+    license_file.write_text("MIT\n", encoding="utf-8")
+    governance = catalog / "governance"
+    governance.mkdir()
+    (governance / "policy.toml").write_text(
+        'schema_version = 1\nmode = "audit"\n',
+        encoding="utf-8",
+    )
+    (governance / "audit-event.toml").write_text(
+        "\n".join(
+            (
+                'id = "audit-event"',
+                'capability_kind = "event-handler"',
+                'delivery = "plugin"',
+                'lifecycle = "active"',
+                'failure_policy = "advisory"',
+                'owner = "test"',
+                'last_reviewed = "2026-07-23"',
+                "[distribution]",
+                'redistribution = "allowed"',
+                "[[artifacts]]",
+                'ref = "hooks/audit-event"',
+                'expected_upstream_digest = "sha256:' + "a" * 64 + '"',
+                "[artifacts.provenance]",
+                'origin = "imported-git"',
+                'source_url = "https://example.invalid/upstream.git"',
+                'source_revision = "' + "b" * 40 + '"',
+                'source_subpath = "hooks/audit-event"',
+                'license_concluded = "MIT"',
+                'rights_basis = "upstream-license"',
+                'license_evidence = ["LICENSE"]',
+                'attribution_files = ["LICENSE"]',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    components = frozenset({Component.HOOKS})
+    config = make_config(tmp_path, catalog, components=components)
+    claude_target = replace(
+        config.targets[0],
+        name="claude",
+        product=Product.CLAUDE_CODE,
+        config_home=tmp_path / "home/.claude",
+    )
+    config = replace(config, targets=(config.targets[0], claude_target))
+
+    rendered = render_marketplace(config, discover_catalog(config))
+
+    for product in ("codex", "claude-code"):
+        installed = (
+            rendered.root / "plugins" / product / "agent-config-bridge-hooks" / "licenses" / "audit-event" / "LICENSE"
+        )
+        assert installed.read_text(encoding="utf-8") == "MIT\n"
+
+
+def test_hook_attribution_declaration_changes_digest_and_requires_version_bump(
+    tmp_path: Path,
+) -> None:
+    """Governance fields that change rendered bytes participate in identity."""
+
+    catalog = make_catalog(tmp_path / "catalog", hooks=("audit-event",))
+    hook = catalog / "hooks/audit-event"
+    (hook / "LICENSE").write_text("MIT\n", encoding="utf-8")
+    (hook / "NOTICE").write_text("Notice\n", encoding="utf-8")
+    governance = catalog / "governance"
+    governance.mkdir()
+    (governance / "policy.toml").write_text(
+        'schema_version = 1\nmode = "audit"\n',
+        encoding="utf-8",
+    )
+    manifest = governance / "audit-event.toml"
+    template = "\n".join(
+        (
+            'id = "audit-event"',
+            'capability_kind = "event-handler"',
+            'delivery = "plugin"',
+            'lifecycle = "active"',
+            'failure_policy = "advisory"',
+            'owner = "test"',
+            'last_reviewed = "2026-07-23"',
+            "[distribution]",
+            'redistribution = "allowed"',
+            "[[artifacts]]",
+            'ref = "hooks/audit-event"',
+            'expected_upstream_digest = "sha256:' + "a" * 64 + '"',
+            "[artifacts.provenance]",
+            'origin = "imported-git"',
+            'source_url = "https://example.invalid/upstream.git"',
+            'source_revision = "' + "b" * 40 + '"',
+            'source_subpath = "hooks/audit-event"',
+            'license_concluded = "MIT"',
+            'rights_basis = "upstream-license"',
+            'license_evidence = ["LICENSE"]',
+            'attribution_files = ["{attribution}"]',
+            "",
+        )
+    )
+    manifest.write_text(template.format(attribution="LICENSE"), encoding="utf-8")
+    config = make_config(
+        tmp_path,
+        catalog,
+        components=frozenset({Component.HOOKS}),
+    )
+    first_inventory = discover_catalog(config)
+    first_digest = marketplace_digest(config, first_inventory)
+    render_marketplace(config, first_inventory)
+
+    manifest.write_text(template.format(attribution="NOTICE"), encoding="utf-8")
+    second_inventory = discover_catalog(config)
+    second_digest = marketplace_digest(config, second_inventory)
+
+    assert first_digest != second_digest
+    with pytest.raises(RenderError, match="does not increase"):
+        render_marketplace(config, second_inventory)
 
 
 def test_render_marketplace_respects_per_product_component_selection(tmp_path: Path) -> None:

@@ -222,11 +222,17 @@ def _build_parser() -> argparse.ArgumentParser:
         ("plan", "show a read-only synchronization plan"),
         ("doctor", "diagnose target discovery and configuration"),
         ("render", "build the immutable dual plugin marketplace"),
-        ("apply", "apply safe skill links/copies and render the marketplace"),
+        (
+            "apply",
+            "reconcile Skills, Instructions, Settings, Plugin/Hook marketplace builds, and Schedule snapshots",
+        ),
         ("sync-skills", "apply only reviewed standalone Skill changes"),
-        ("register", "run product CLI commands to register and install rendered plugins"),
+        (
+            "register",
+            "reconcile product Plugin/Hook registrations and host scheduler heartbeats",
+        ),
     ):
-        command_parser = subparsers.add_parser(command, help=help_text)
+        command_parser = subparsers.add_parser(command, help=help_text, description=help_text)
         command_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
         if command in {"validate", "plan", "doctor", "render", "apply", "sync-skills"}:
             command_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
