@@ -91,11 +91,11 @@ uv sync --extra dev
 uv run agentbridge --help
 ```
 
-The runtime supports Python 3.11+ and uses `tomlkit` for comment-preserving
-Codex Settings edits. Native Windows also installs `tzdata` so IANA Schedule
-timezones do not depend on a system timezone database. `uv` is used for
-reproducible development, but the package can also be installed with `pipx` or
-`pip`.
+The runtime supports Python 3.11+, uses PyYAML for Skill metadata, and uses
+`tomlkit` for comment-preserving Codex Settings edits. Native Windows also
+installs `tzdata` so IANA Schedule timezones do not depend on a system timezone
+database. `uv` is used for reproducible development, but the package can also
+be installed with `pipx` or `pip`.
 
 ## Quick start
 

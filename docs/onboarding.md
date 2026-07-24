@@ -1,5 +1,5 @@
 # Agent Config Bridge Onboarding
-**Version 1.1.0** · Agent Config Bridge · 2026-07-15 · Windows, Linux, WSL
+**Development documentation** · Agent Config Bridge · updated 2026-07-23 · Windows, Linux, WSL
 
 ---
 
@@ -15,7 +15,8 @@ unresolved.
 ## 1. Safety Boundary
 
 **[SPEC]**
-- Share only selected Skills, Plugins, Hooks, public Settings, and host-managed Schedules.
+- Share only selected Skills, Plugins, Hooks, public Settings, host-managed
+  Schedules, and allowlisted Instructions.
 - Keep authentication, sessions, caches, logs, databases, trust decisions, and whole product homes local.
 - Keep one canonical catalog accessible to every host, but use one host-local `state_dir` per Windows, Linux, or WSL runtime.
 - Run `register` on the target operating system. Do not register a Windows target from WSL or a WSL target from PowerShell.
@@ -117,7 +118,7 @@ schema_version = 1
 catalog = "/mnt/c/Users/USER/AgentConfig/catalog"
 state_dir = "/home/USER/.local/state/agent-config-bridge/wsl"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
 
 [[targets]]
 name = "wsl-codex-launcher"
@@ -126,7 +127,7 @@ platform = "linux"
 user_home = "/home/USER"
 config_home = "/absolute/launcher/injected/CODEX_HOME"
 executable = "/absolute/path/to/codex"
-components = ["skills", "plugins", "hooks", "settings"]
+components = ["skills", "plugins", "hooks", "settings", "instructions"]
 surfaces = ["cli", "desktop"]
 enabled = true
 
@@ -137,7 +138,7 @@ platform = "linux"
 user_home = "/home/USER"
 config_home = "/home/USER/.codex"
 executable = "/absolute/path/to/codex"
-components = ["plugins", "hooks", "settings", "schedules"]
+components = ["plugins", "hooks", "settings", "schedules", "instructions"]
 surfaces = ["cli"]
 enabled = true
 
@@ -148,7 +149,7 @@ platform = "linux"
 user_home = "/home/USER"
 config_home = "/home/USER/.claude"
 executable = "/absolute/path/to/claude"
-components = ["skills", "plugins", "hooks", "settings"]
+components = ["skills", "plugins", "hooks", "settings", "instructions"]
 surfaces = ["cli"]
 enabled = true
 ```
@@ -164,7 +165,7 @@ schema_version = 1
 catalog = 'C:\Users\USER\AgentConfig\catalog'
 state_dir = 'C:\Users\USER\AppData\Local\AgentConfigBridge\state'
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
 
 [[targets]]
 name = "windows-codex"
@@ -183,7 +184,7 @@ platform = "windows"
 user_home = 'C:\Users\USER'
 config_home = 'C:\Users\USER\.claude'
 executable = 'C:\absolute\path\to\claude.exe'
-components = ["skills", "plugins", "hooks", "settings"]
+components = ["skills", "plugins", "hooks", "settings", "instructions"]
 surfaces = ["cli", "desktop"]
 enabled = true
 ```
@@ -284,10 +285,12 @@ Proceed only when:
   executable and its expected `--version` output;
 - each recurring Schedule is assigned to exactly the intended target.
 
-`apply` writes standalone Skills, selected Settings, rendered marketplace state,
-and Schedule snapshots. `register` performs product CLI registration and host
-scheduler reconciliation. Product permission and trust prompts remain
-product-owned.
+`apply` writes standalone Skills, allowlisted Instruction files, selected
+Settings, rendered marketplace state, and Schedule snapshots. Instruction
+destinations are single-owner files; managed-copy updates/removals retain
+verified backups under `state_dir/backups/<target>/instructions/`. `register`
+performs product CLI registration and host scheduler reconciliation. Product
+permission and trust prompts remain product-owned.
 
 After registration, rerun `doctor` and `plan`, inspect the product's Plugin list,
 and confirm the scheduler heartbeat on the same host. Convergence means no
@@ -302,7 +305,10 @@ installed, and only the intended Schedule target owns a heartbeat.
 - Before moving or deleting a target, restore its old identity, set `components = []`, and reconcile `apply` plus `register`.
 - Never delete ownership state to force adoption.
 - Keep conflict variants and migration reports until every target has converged and a backup has been verified.
-- Keep an external backup of every pre-existing destination. Bridge retains backups for selected managed Skill copy updates, but it does not provide a universal automatic rollback for product CLI registration, Settings changes, symlinks, or host scheduler state.
+- Keep an external backup of every pre-existing destination. Bridge retains
+  backups for selected managed Skill copy and Instruction file updates, but it
+  does not provide a universal automatic rollback for product CLI registration,
+  Settings changes, symlinks, or host scheduler state.
 
 **[BUG] Partial external registration**
 - Symptom: a product command succeeds but ownership state is not written because the process stops.

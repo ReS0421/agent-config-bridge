@@ -27,6 +27,34 @@ from agent_config_bridge.retention import (
 from agent_config_bridge.state import read_registered_plugins, read_skill_state, write_registered_plugins
 from tests.conftest import make_catalog
 
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    (
+        (
+            "apply",
+            "reconcile Skills, Instructions, Settings, Plugin/Hook marketplace builds, and Schedule snapshots",
+        ),
+        (
+            "register",
+            "reconcile product Plugin/Hook registrations and host scheduler heartbeats",
+        ),
+    ),
+)
+def test_mutating_command_help_names_its_full_reconciliation_scope(
+    command: str,
+    expected: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Operators can distinguish filesystem apply from external registration."""
+
+    with pytest.raises(SystemExit) as raised:
+        cli.main([command, "--help"])
+
+    assert raised.value.code == 0
+    assert expected in " ".join(capsys.readouterr().out.split())
+
+
 _CODEX_FIXTURES = Path(__file__).parent / "fixtures" / "codex-marketplace-list"
 
 

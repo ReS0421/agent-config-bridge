@@ -69,8 +69,8 @@ Changes must preserve these project guarantees:
 - `plan` is read-only.
 - Apply operations never replace unmanaged files or silently overwrite drifted
   managed files.
-- Only explicitly selected Skills, Plugins, Hooks, Settings, and Schedules are
-  synchronized.
+- Only explicitly selected Skills, Plugins, Hooks, Settings, Schedules, and
+  Instructions are synchronized.
 - Authentication, caches, logs, sessions, databases, and whole configuration
   homes are never synchronized.
 - Source catalogs remain separate from generated, content-addressed output.
@@ -78,9 +78,10 @@ Changes must preserve these project guarantees:
   immutable build.
 - Codex and Claude Code overlays remain product-specific where their formats or
   behavior differ.
-- Ownership reconciliation touches only standalone Skills and Settings leaves
-  applied by the bridge, Plugins/Hooks registered through the bridge, and
-  target scheduler heartbeats recorded by the bridge.
+- Ownership reconciliation touches only standalone Skills, allowlisted
+  Instruction files, and Settings leaves applied by the bridge,
+  Plugins/Hooks registered through the bridge, and target scheduler
+  heartbeats recorded by the bridge.
 - Hooks are executable code. Tests and examples must be non-destructive, avoid
   network access, and never collect prompt or tool payloads.
 - Schedule prompts are unattended executable intent. Tests must cover minute
@@ -103,6 +104,9 @@ A Settings bundle uses only product-native
 cross-product common Settings schema. A Schedule directory contains exactly
 `schedule.toml` and `PROMPT.md`, uses the strict portable schema documented in
 [Host-managed Schedules](docs/schedules.md), and must not embed secrets.
+An Instruction bundle uses product overlays and only the destination allowlist
+documented in [Security model](docs/security.md). Instruction sources must not
+embed secrets or attempt to claim an unmanaged destination.
 
 Both Plugin manifests must have the same directory-matching `name` and strict
 SemVer `version`. Bump both versions whenever rendered Plugin content changes.

@@ -3,8 +3,9 @@
 Agent Config Bridge projects one canonical catalog of reusable agent
 customizations into the native layouts expected by Codex and Claude Code. It
 shares declarative content—Skills, Plugin source, Hook source, selected public
-Settings, and recurring CLI workflows—but keeps credentials, sessions, caches,
-trust decisions, and other runtime state local to each product installation.
+Settings, recurring CLI workflows, and allowlisted always-loaded Instructions—
+but keeps credentials, sessions, caches, trust decisions, and other runtime
+state local to each product installation.
 
 The core rule is:
 
@@ -18,7 +19,8 @@ The bridge is designed to:
 
 - maintain one reviewable catalog for Windows and Linux;
 - target Codex CLI, Claude Code CLI, Codex Desktop, and Claude Code Desktop;
-- enable `skills`, `plugins`, `hooks`, `settings`, and `schedules`
+- enable `skills`, `plugins`, `hooks`, `settings`, `schedules`, and
+  `instructions`
   independently, globally or per target;
 - produce separate Codex and Claude Code Plugin packages from shared source;
 - patch explicit product Settings leaves without replacing unrelated local
@@ -42,7 +44,8 @@ product CLI returns. `doctor` reports the selected launcher's informational
                     +----------------------+
                     | canonical catalog    |
                     | skills/plugins/hooks |
-                    | settings/schedules   |
+                    | settings/schedules/  |
+                    | instructions         |
                     +----------+-----------+
                                |
                       discover + validate
@@ -56,8 +59,8 @@ product CLI returns. `doctor` reports the selected launcher's informational
                          |             |
             +------------+--+       product CLIs
             |               |       + host scheduler
-      Skills + Settings     |
-      + ownership state     |
+      Skills + Instructions |
+      + Settings + ownership|
                             v
                   immutable build
              marketplaces + target schedules
@@ -66,10 +69,10 @@ product CLI returns. `doctor` reports the selected launcher's informational
 ```
 
 The catalog is the source of truth. Immutable builds, the published marketplace,
-Schedule snapshots, Skill links/copies, Settings patches, scheduler heartbeats,
-and product install caches are derived artifacts. The stable marketplace and
-per-target Schedule pointers let registered consumers use content without
-depending on a changing build digest.
+Schedule snapshots, Skill links/copies, Instruction links/copies, Settings
+patches, scheduler heartbeats, and product install caches are derived artifacts.
+The stable marketplace and per-target Schedule pointers let registered
+consumers use content without depending on a changing build digest.
 
 ## Configuration model
 
@@ -82,7 +85,7 @@ schema_version = 1
 catalog = "/path/to/agent-catalog"
 state_dir = "/path/to/bridge-state"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
 
 [[targets]]
 name = "local-codex"
@@ -98,7 +101,7 @@ name = "local-claude"
 product = "claude-code"
 platform = "auto"
 user_home = "~"
-components = ["skills", "hooks", "settings"]
+components = ["skills", "hooks", "settings", "instructions"]
 surfaces = ["cli"]
 enabled = true
 ```
@@ -176,9 +179,12 @@ catalog/
 ├── settings/<bundle>/
 │   ├── codex/config.toml        # optional native fragment
 │   └── claude-code/settings.json
-└── schedules/<name>/
-    ├── schedule.toml
-    └── PROMPT.md
+├── schedules/<name>/
+│   ├── schedule.toml
+│   └── PROMPT.md
+└── instructions/<bundle>/
+    ├── codex/                    # AGENTS.md and agents/**
+    └── claude-code/              # CLAUDE.md, rules/**, agents/**, commands/**
 ```
 
 Artifact identities are lowercase kebab-case and portable to Windows. Discovery
@@ -197,6 +203,9 @@ overlay, not `common/`. The name `agent-config-bridge-hooks` is reserved for the
 generated Hook Plugin. Settings bundles and Schedules use the same portable
 lowercase kebab-case identity. A Settings bundle must contain at least one
 non-empty product fragment. A Schedule contains exactly its two declared files.
+An Instruction bundle contains one or both product overlays. Each source is
+non-empty UTF-8 without BOM, every destination is on the product allowlist, and
+only one bundle may own a destination for a product.
 
 ## Product-specific rendering
 
@@ -339,6 +348,7 @@ catalog content, destination paths, generated marketplace integrity metadata,
 and bridge ownership records. It reports:
 
 - Skill link/copy creates, updates, removals, no-ops, and conflicts;
+- Instruction file link/copy creates, updates, removals, no-ops, and conflicts;
 - aggregate Settings leaf create/update/remove/no-op/conflict counts;
 - whether the stable marketplace must be created or refreshed;
 - whether each per-target Schedule snapshot must be published or removed;
@@ -384,12 +394,18 @@ integrity check. Any planned conflict aborts before the action loop starts.
 Actions then run sequentially:
 
 - the marketplace build and stable published snapshot are rendered as needed;
+- governed Hook attribution files are included under
+  `licenses/<hook>/` in each rendered product Hook plugin;
+- Hook attribution declarations participate in marketplace identity, so a
+  declaration change cannot reuse an older immutable build;
 - selected product Settings leaves are patched and their digest-only ownership
   state is updated;
 - immutable per-target Schedule snapshots are published or deselected pointers
   are removed;
 - Linux `auto` mode creates standalone Skill directory symlinks;
 - Windows `auto` mode creates managed standalone Skill copies;
+- Instruction destinations use the same selected copy/symlink mode at the
+  allowlisted file level;
 - a replacement managed copy is staged and verified next to its destination;
 - before a managed-copy update or removal, the old destination is copied
   non-destructively into its final `state_dir/backups/<target>/...` path and
@@ -406,8 +422,8 @@ Actions then run sequentially:
   staged afresh from the retained backup, verified, and atomically installed at
   the original destination without consuming the backup;
 - drift, changed ownership, or an unmanaged destination becomes a conflict;
-- successful reconciliation writes target-scoped Skill and Settings ownership
-  state.
+- successful reconciliation writes target-scoped Skill, Instruction, and
+  Settings ownership state.
 
 An existing canonical-pointing symlink or valid managed-copy marker is not, by
 itself, ownership proof. It can be a no-op or update only when that same target
@@ -455,7 +471,8 @@ name; an unrecorded or digest-mismatched heartbeat is a conflict.
 Target `name` is also the key below `state_dir/targets`. Before changing a
 target's name, product, or home—or deleting it—retain the old identity, set its
 `components = []`, then run `apply` and `register` to reconcile Skills,
-Settings, Schedule snapshots, registered Plugins/Hooks, and the host heartbeat.
+Instruction files, Settings, Schedule snapshots, registered Plugins/Hooks, and
+the host heartbeat.
 After the empty ownership records are cleared, the target can be changed or
 removed. Otherwise its state directory is orphaned; diagnostics fail and
 state-changing commands stop rather than guessing a
@@ -493,9 +510,10 @@ state_dir/
 ├── schedule-builds/<digest>/<target>/snapshot.json
 ├── schedules/<target>.json          # stable Schedule pointer
 ├── schedule-runtime/                # claim/run locks + minute marker
-├── backups/<target>/...             # verified managed Skill backup snapshots
+├── backups/<target>/...             # verified Skill/Instruction backups
 └── targets/<target>/
     ├── skills.json                  # standalone Skill ownership
+    ├── instructions.json            # file-granular Instruction ownership
     ├── plugins.json                 # registration ownership
     ├── settings.json                # owned paths/value digests
     └── scheduler.json               # heartbeat ownership

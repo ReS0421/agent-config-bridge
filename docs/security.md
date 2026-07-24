@@ -26,13 +26,16 @@ avoid importing unrelated product state.
 
 ## Allowlist, never home-directory sync
 
-Only five component classes are eligible for projection:
+Only six component classes are eligible for projection:
 
 - standalone `skills`;
 - `plugins` and their declarative package payload;
 - `hooks` and the handler files explicitly placed in Hook bundles;
 - explicit product-native `settings` leaves in reviewed fragments;
 - strict `schedules` containing a definition and prompt.
+- reviewed `instructions` overlays restricted to explicit product destinations:
+  Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, and `commands/**`; Codex
+  `AGENTS.md` and `agents/**`.
 
 Everything else is excluded. Never copy or link:
 
@@ -63,9 +66,12 @@ The configured `state_dir` contains only:
 - the stable published marketplace snapshot;
 - immutable Schedule snapshots and their stable target pointers;
 - non-sensitive Schedule locks and last-processed minute markers;
-- small per-target Skill, Plugin, Settings, and scheduler ownership records;
+- small per-target Skill, Instruction, Plugin, Settings, and scheduler
+  ownership records;
 - verified, non-destructive managed Skill backup snapshots retained during
   update or deselection.
+- verified, non-destructive managed Instruction file backup snapshots retained
+  during update or deselection.
 
 Use a separate stable `state_dir` per native Windows, WSL, or Linux host. It is
 operational ownership state with physical paths, not part of the portable
@@ -117,6 +123,13 @@ Implemented validation includes:
   symlinked or special fragment files;
 - exact Schedule file sets, bounded source sizes, numeric five-field cron,
   IANA timezone, bounded timeout, and a portable relative worktree path;
+- non-empty UTF-8 Instruction files without BOM, exact product overlay roots,
+  destination allowlisting, and single-bundle ownership of each destination;
+- a closed `allowed`/`blocked` redistribution vocabulary; an allowed artifact
+  requires its upstream SHA-256, commit-pinned imported-Git source, concluded
+  license and rights basis, and non-symlink evidence/attribution files contained
+  in that artifact root; declared Hook attribution files are copied under
+  `licenses/<hook>/` in the rendered Hook plugin;
 - rejection of broken/escaping symlinks and all directory symlinks; only
   contained links to regular files are accepted;
 - rejection of conflicting product overlay output;
@@ -163,6 +176,8 @@ output fail closed. The resulting source must still be absent or match the
 desired or previously recorded bridge-owned source. `plan` reports:
 
 - Skill creates, updates, removals, no-ops, and conflicts;
+- Instruction file creates, updates, removals, no-ops, conflicts, source
+  bundles, and allowlisted destinations;
 - aggregate Settings leaf dispositions, fragment paths, and destinations;
 - Schedule snapshot creates/updates/removals and the host-scheduler boundary;
 - marketplace create/update state;
@@ -185,10 +200,11 @@ are not a substitute for code review.
 
 Before `apply` or `register` mutates state, it rediscovers the catalog and
 rebuilds the plan. A difference from the reviewed plan aborts the operation.
-Unmanaged Skill destinations, unmanaged Settings leaves, and drifted
-bridge-managed content are hard conflicts. A corrupted generated artifact that
-does not change plan identity can still fail a later integrity check rather than
-being classified as a stale plan.
+Unmanaged Skill destinations, unmanaged allowlisted Instruction destinations,
+unmanaged Settings leaves, and drifted bridge-managed content are hard
+conflicts. A corrupted generated artifact that does not change plan identity
+can still fail a later integrity check rather than being classified as a stale
+plan.
 
 External mutation and ownership persistence cannot be one filesystem-atomic
 operation. A process can crash after replacing a Settings file, changing a
@@ -210,6 +226,10 @@ digest mismatches:
   planned source digest;
 - managed copies update/remove only when their marker and installed digest still
   match;
+- Instruction files use the same link/copy ownership checks at file grain.
+  Managed Instruction directories carry `AGENTBRIDGE-MANAGED.json`; root-level
+  `AGENTS.md` and `CLAUDE.md` remain attributable through per-target
+  `instructions.json` state because their product root cannot carry a marker;
 - before managed-copy update/removal, a non-destructive final backup snapshot is
   created below `state_dir/backups` and verified by marker, source identity, and
   installed digest;
@@ -221,6 +241,9 @@ digest mismatches:
   restored: the destination is reconstructed through a fresh same-filesystem
   restore staging path from the retained, reverified backup, which is not
   consumed;
+- managed Instruction updates and removals retain their own verified snapshots
+  below `state_dir/backups/<target>/instructions/`; retention pruning excludes
+  that tree, and backups never confer ownership over a live destination;
 - marketplace builds are immutable and content-addressed;
 - the published marketplace is rehashed before reuse/replacement, copied through
   a temporary sibling, and checked before publication;

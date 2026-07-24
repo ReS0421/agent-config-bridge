@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.catalog import Artifact, CatalogInventory, discover_catalog
-from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
+from agent_config_bridge.governance import GovernanceReport, ResolvedInventory, resolve_inventory
 from agent_config_bridge.models import BridgeConfig, Component, Product
 from agent_config_bridge.path_safety import is_directory_reparse_point
 
@@ -172,6 +172,7 @@ def render_marketplace(
                         product,
                         product_root / _HOOK_PLUGIN_NAME,
                         inventory.hook_version,
+                        resolved.report,
                     )
                     plugin_names.append(_HOOK_PLUGIN_NAME)
                 plugins_by_product[product] = tuple(plugin_names)
@@ -298,7 +299,7 @@ def _product_has_component(config: BridgeConfig, product: Product, component: Co
 
 def _build_digest(config: BridgeConfig, inventory: CatalogInventory, resolved: ResolvedInventory) -> str:
     digest = hashlib.sha256()
-    digest.update(b"agent-config-bridge-render-v6\0")
+    digest.update(b"agent-config-bridge-render-v7\0")
     for product in sorted(_selected_products(config), key=lambda item: item.value):
         digest.update(product.value.encode())
         digest.update(b"\0")
@@ -321,6 +322,11 @@ def _build_digest(config: BridgeConfig, inventory: CatalogInventory, resolved: R
                 digest.update(artifact.name.encode())
                 digest.update(b"\0")
                 _update_tree_digest(digest, artifact.path)
+                if component is Component.HOOKS:
+                    for attribution_path in _hook_attribution_paths(artifact, resolved.report):
+                        digest.update(b"attribution\0")
+                        digest.update(attribution_path.encode())
+                        digest.update(b"\0")
     return digest.hexdigest()[:20]
 
 
@@ -367,6 +373,7 @@ def _render_hook_plugin(
     product: Product,
     destination: Path,
     hook_version: str | None,
+    governance_report: GovernanceReport,
 ) -> None:
     manifest_directory = ".codex-plugin" if product is Product.CODEX else ".claude-plugin"
     (destination / manifest_directory).mkdir(parents=True)
@@ -393,12 +400,67 @@ def _render_hook_plugin(
             scripts = artifact.path / overlay_name / "scripts"
             if scripts.is_dir():
                 _copy_overlay(scripts, scripts_destination, artifact.path, portable_outputs=portable_outputs)
+        _copy_hook_attribution_files(artifact, governance_report, destination)
 
     _write_json(destination / "hooks" / "hooks.json", _merge_hook_documents(documents))
     if hook_version is None:
         raise RenderError("hook catalog has no validated version")
     manifest = _codex_hook_manifest(hook_version) if product is Product.CODEX else _claude_hook_manifest(hook_version)
     _write_json(destination / manifest_directory / "plugin.json", manifest)
+
+
+def _copy_hook_attribution_files(
+    artifact: Artifact,
+    report: GovernanceReport,
+    destination: Path,
+) -> None:
+    """Ship safely declared Hook attribution files with the rendered plugin.
+
+    Governance remains the source of truth. Invalid declarations are already
+    diagnostics and are ignored here in audit mode; required mode rejects them
+    before rendering. Only real, contained regular files are copied.
+    """
+
+    for declared_path in _hook_attribution_paths(artifact, report):
+        relative = Path(declared_path)
+        if relative.is_absolute() or relative == Path(".") or ".." in relative.parts:
+            continue
+        source = artifact.path / relative
+        try:
+            mode = _source_mode(source)
+        except RenderError:
+            continue
+        if not stat.S_ISREG(mode):
+            continue
+        try:
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(artifact.path.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        target = destination / "licenses" / artifact.name / relative
+        _copy_file_checked(source, target)
+
+
+def _hook_attribution_paths(
+    artifact: Artifact,
+    report: GovernanceReport,
+) -> tuple[str, ...]:
+    """Return the normalized declared attribution inputs for one Hook."""
+
+    artifact_ref = f"hooks/{artifact.name}"
+    declared: set[str] = set()
+    for manifest in report.manifests:
+        for governed_artifact in manifest.data.get("artifacts", []):
+            if not isinstance(governed_artifact, dict) or governed_artifact.get("ref") != artifact_ref:
+                continue
+            provenance = governed_artifact.get("provenance")
+            if not isinstance(provenance, dict):
+                continue
+            attribution_files = provenance.get("attribution_files")
+            if not isinstance(attribution_files, list):
+                continue
+            declared.update(value for value in attribution_files if isinstance(value, str) and value.strip())
+    return tuple(sorted(declared))
 
 
 def _codex_hook_manifest(version: str) -> dict[str, Any]:

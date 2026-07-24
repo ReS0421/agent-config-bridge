@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-24
+
+### Added
+
+- Governance now validates the redistribution vocabulary and requires
+  digest-pinned imported-Git provenance, concluded license and rights metadata,
+  and contained regular evidence and attribution files before an artifact may
+  declare `redistribution = "allowed"`.
+- Rendered Hook plugins now include governed attribution files under
+  `licenses/<hook>/`; renderer identity and marketplace digests include that
+  governance input so older builds cannot be reused.
+
+### Changed
+
+- Active security, architecture, onboarding, compatibility, and release
+  documentation now consistently describes all six component classes,
+  Instruction ownership and backup behavior, and the build-once cross-host
+  release workflow.
+- `apply` and `register` command help now names every state class each command
+  reconciles.
+
 ## [0.3.1] - 2026-07-23
 
 ### Added

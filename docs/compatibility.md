@@ -1,7 +1,7 @@
 # Compatibility
 
 This document describes the implemented local projection targets and known
-product boundaries as of 2026-07-15. Vendor behavior changes quickly. An alpha
+product boundaries as of 2026-07-23. Vendor behavior changes quickly. An alpha
 bridge release validates its own catalog and generated-state invariants, but it
 does not infer product capabilities or certify every vendor schema. `doctor`
 does report the exact selected executable's `--version` output and, when Plugin
@@ -63,14 +63,15 @@ same absolute `root` and `marketplaceSource.source` plus
 strict UTF-8. Duplicate entries, relative or malformed paths, mismatched
 expanded paths, undecodable output, and unknown schemas fail closed.
 
-Version 0.2 adds native Settings leaf projection and host-managed recurring CLI
-Schedules. These features use public Settings files and operating-system
-schedulers; they do not turn Codex or Claude's product-native scheduled tasks
-into a common API.
+As a historical baseline, version 0.2 introduced native Settings leaf
+projection and host-managed recurring CLI Schedules. These features use public
+Settings files and operating-system schedulers; they do not turn Codex or
+Claude's product-native scheduled tasks into a common API.
 
-The runtime requires Python 3.11+ and `tomlkit`. Native Windows installations
-also include `tzdata` so regional IANA Schedule timezones remain available when
-the operating system does not provide a Python-readable timezone database.
+The runtime requires Python 3.11+, PyYAML, and `tomlkit`. Native Windows
+installations also include `tzdata` so regional IANA Schedule timezones remain
+available when the operating system does not provide a Python-readable timezone
+database.
 
 ## Surface matrix
 
@@ -169,6 +170,26 @@ Only the user-level public Settings files above are eligible. The bridge does
 not treat project-local settings, `~/.claude.json`, organization-managed policy,
 authentication, trust, or other product-home files as Settings fragments.
 Plugin marketplace registration remains a separate explicit workflow.
+
+## Instructions
+
+Instructions share a file lifecycle, not a cross-product syntax. Canonical
+sources live below `instructions/<bundle>/<product>/`. Claude Code destinations
+are restricted to `CLAUDE.md`, `rules/**`, `agents/**`, and `commands/**`;
+Codex destinations are restricted to `AGENTS.md` and `agents/**`. Two bundles
+cannot claim the same destination for one product. Files must be non-empty
+UTF-8 without BOM; line-ending identity is normalized, but content is not
+merged, translated, or concatenated.
+
+An unmanaged destination conflicts even when its bytes match. Bridge-managed
+files are attributed by target-scoped `instructions.json` ownership state and,
+for managed directories, `AGENTBRIDGE-MANAGED.json`. Root-level `AGENTS.md` and
+`CLAUDE.md` cannot use a directory marker and therefore rely on ownership state
+plus content or link identity. Copy-mode update or deselection creates a
+verified, non-destructive backup below
+`state_dir/backups/<target>/instructions/`; those backups are excluded from
+bounded generated-state pruning and do not authorize replacement of live
+unmanaged content.
 
 ## Plugins and marketplaces
 
@@ -278,11 +299,11 @@ separate targets and heartbeat registrations.
 
 ## Filesystem modes
 
-| Mode      | Current behavior                                        | Limitations                                                 |
-| --------- | ------------------------------------------------------- | ----------------------------------------------------------- |
-| `copy`    | Managed standalone Skill copy with ownership marker     | Re-apply required; source Skill symlinks are rejected       |
-| `symlink` | Live standalone Skill directory symlink                 | Windows privilege/policy and persistent source availability |
-| `auto`    | `copy` for Windows targets; `symlink` for Linux targets | A simple platform rule, not product capability detection    |
+| Mode      | Current behavior                                                           | Limitations                                                 |
+| --------- | -------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `copy`    | Managed standalone Skill directory and allowlisted Instruction file copies | Re-apply required; source Skill symlinks are rejected       |
+| `symlink` | Live standalone Skill directory and allowlisted Instruction file symlinks  | Windows privilege/policy and persistent source availability |
+| `auto`    | `copy` for Windows targets; `symlink` for Linux targets                    | A simple platform rule, not product capability detection    |
 
 The selected operation appears in `plan`. Windows command previews use
 PowerShell syntax; Linux previews use POSIX syntax. Registration itself must run
@@ -309,8 +330,8 @@ and should use user-private locations for product homes and `state_dir`.
 
 ## Ownership and reconciliation
 
-`apply` records standalone Skills and Settings leaves, and publishes Schedule
-snapshots. On a later plan it can:
+`apply` records standalone Skills, Instruction files, and Settings leaves, and
+publishes Schedule snapshots. On a later plan it can:
 
 - remove a recorded symlink only if it still targets the recorded source;
 - update or remove a managed copy only if its marker matches and it has not
@@ -336,7 +357,7 @@ future reconciliation is desired.
 Target names identify ownership records. To rename/delete a target or change its
 product/home identity safely, first keep the old target identity, set
 `components = []`, run `apply` and `register`, and confirm the empty
-reconciliation of all five component classes. Only then change or remove it.
+reconciliation of all six component classes. Only then change or remove it.
 Skipping this sequence leaves an orphan `state_dir/targets/<old-name>` record;
 diagnostics fail and `apply` plus `register` stop because the bridge cannot infer
 which new target, if any, owns the old state. Restore the old identity and
