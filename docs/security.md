@@ -34,8 +34,9 @@ Only six component classes are eligible for projection:
 - explicit product-native `settings` leaves in reviewed fragments;
 - strict `schedules` containing a definition and prompt.
 - reviewed `instructions` overlays restricted to explicit product destinations:
-  Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, and `commands/**`; Codex
-  `AGENTS.md` and `agents/**`.
+  Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`, and direct
+  `model-instructions/*.md`; Codex `AGENTS.md`, `agents/**`, and direct
+  `model-instructions/*.md`.
 
 Everything else is excluded. Never copy or link:
 

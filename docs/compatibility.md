@@ -175,8 +175,9 @@ Plugin marketplace registration remains a separate explicit workflow.
 
 Instructions share a file lifecycle, not a cross-product syntax. Canonical
 sources live below `instructions/<bundle>/<product>/`. Claude Code destinations
-are restricted to `CLAUDE.md`, `rules/**`, `agents/**`, and `commands/**`;
-Codex destinations are restricted to `AGENTS.md` and `agents/**`. Two bundles
+are restricted to `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`, and
+direct `model-instructions/*.md` files; Codex destinations are restricted to
+`AGENTS.md`, `agents/**`, and direct `model-instructions/*.md` files. Two bundles
 cannot claim the same destination for one product. Files must be non-empty
 UTF-8 without BOM; line-ending identity is normalized, but content is not
 merged, translated, or concatenated.

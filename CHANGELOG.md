@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-27
+
+### Added
+
+- Instruction bundles may project direct Markdown files under
+  `model-instructions/` for Codex and Claude Code. Nested paths and non-Markdown
+  files remain rejected by the destination allowlist.
+
 ## [0.3.2] - 2026-07-24
 
 ### Added

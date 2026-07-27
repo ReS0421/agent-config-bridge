@@ -183,8 +183,9 @@ catalog/
 │   ├── schedule.toml
 │   └── PROMPT.md
 └── instructions/<bundle>/
-    ├── codex/                    # AGENTS.md and agents/**
-    └── claude-code/              # CLAUDE.md, rules/**, agents/**, commands/**
+    ├── codex/                    # AGENTS.md, agents/**, model-instructions/*.md
+    └── claude-code/              # CLAUDE.md, rules/**, agents/**, commands/**,
+                                  # model-instructions/*.md
 ```
 
 Artifact identities are lowercase kebab-case and portable to Windows. Discovery

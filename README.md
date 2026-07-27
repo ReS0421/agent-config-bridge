@@ -55,8 +55,9 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   the committed `catalog/governance/policy.toml` (audit implemented)
 - An `instructions` component (ADR-5 in the catalog repo) deploying always-on
   policy files from per-product bundle overlays to a strict destination
-  allowlist (Claude Code: `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`;
-  Codex: `AGENTS.md`, `agents/**`) with per-file single ownership, no
+  allowlist (Claude Code: `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`,
+  `model-instructions/*.md`; Codex: `AGENTS.md`, `agents/**`,
+  `model-instructions/*.md`) with per-file single ownership, no
   render-time merging, newline-normalized drift detection, and
   `AGENTBRIDGE-MANAGED.json` markers on managed instruction directories
 - Canonical Codex Skill destination: `~/.agents/skills`

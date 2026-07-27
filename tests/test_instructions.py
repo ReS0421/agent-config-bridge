@@ -68,8 +68,10 @@ def test_instruction_bundle_discovers_and_enumerates(tmp_path: Path) -> None:
             "claude-code/CLAUDE.md": "# Global\n",
             "claude-code/rules/git-workflow.md": "# Git\n",
             "claude-code/commands/review.md": "# Review\n",
+            "claude-code/model-instructions/mission.md": "# Mission\n",
             "codex/AGENTS.md": "# Agents\n",
             "codex/agents/reviewer.md": "# Reviewer\n",
+            "codex/model-instructions/mission.md": "# Mission\n",
         },
     )
     config = make_config(tmp_path, catalog)
@@ -81,10 +83,15 @@ def test_instruction_bundle_discovers_and_enumerates(tmp_path: Path) -> None:
     assert [file.relpath for file in claude_files] == [
         "CLAUDE.md",
         "commands/review.md",
+        "model-instructions/mission.md",
         "rules/git-workflow.md",
     ]
     codex_files = instruction_files(inventory.instructions[0], Product.CODEX)
-    assert [file.relpath for file in codex_files] == ["AGENTS.md", "agents/reviewer.md"]
+    assert [file.relpath for file in codex_files] == [
+        "AGENTS.md",
+        "agents/reviewer.md",
+        "model-instructions/mission.md",
+    ]
 
 
 def test_instruction_bundle_rejects_unknown_overlay_root(tmp_path: Path) -> None:
@@ -103,7 +110,9 @@ def test_instruction_bundle_rejects_unknown_overlay_root(tmp_path: Path) -> None
     [
         ("claude-code/settings.json", "not allowed for claude-code"),
         ("claude-code/skills/x.md", "outside the allowed claude-code directories"),
+        ("claude-code/model-instructions/nested/x.md", "must be a direct Markdown file"),
         ("codex/rules/x.md", "outside the allowed codex directories"),
+        ("codex/model-instructions/x.txt", "must be a direct Markdown file"),
         ("codex/CLAUDE.md", "not allowed for codex"),
     ],
 )

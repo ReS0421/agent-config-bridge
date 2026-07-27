@@ -41,9 +41,10 @@ _INSTRUCTION_ALLOWED_ROOT_FILES = {
     "codex": frozenset({"AGENTS.md"}),
 }
 _INSTRUCTION_ALLOWED_DIRS = {
-    "claude-code": frozenset({"rules", "agents", "commands"}),
-    "codex": frozenset({"agents"}),
+    "claude-code": frozenset({"rules", "agents", "commands", "model-instructions"}),
+    "codex": frozenset({"agents", "model-instructions"}),
 }
+_INSTRUCTION_DIRECT_MARKDOWN_DIRS = frozenset({"model-instructions"})
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
@@ -389,6 +390,10 @@ def _validate_instruction_destination(relative: Path, product: str, file: Path) 
         raise CatalogError(
             f"instruction destination {relative.as_posix()!r} is outside the allowed {product} "
             f"directories {sorted(_INSTRUCTION_ALLOWED_DIRS[product])}: {file}"
+        )
+    if parts[0] in _INSTRUCTION_DIRECT_MARKDOWN_DIRS and (len(parts) != 2 or relative.suffix != ".md"):
+        raise CatalogError(
+            f"instruction destination {relative.as_posix()!r} must be a direct Markdown file under {parts[0]!r}: {file}"
         )
 
 
