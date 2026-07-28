@@ -22,7 +22,6 @@ from agent_config_bridge.retention import (
     RetentionAction,
     RetentionBlocker,
     RetentionPlan,
-    RetentionResult,
 )
 from agent_config_bridge.state import read_registered_plugins, read_skill_state, write_registered_plugins
 from tests.conftest import make_catalog
@@ -55,7 +54,25 @@ def test_mutating_command_help_names_its_full_reconciliation_scope(
     assert expected in " ".join(capsys.readouterr().out.split())
 
 
+def test_state_prune_help_describes_no_change_validation_and_action_fail_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["state", "prune", "--help"])
+
+    assert raised.value.code == 0
+    output = " ".join(capsys.readouterr().out.split())
+    assert "validate a reviewed no-change plan" in output
+    assert "action-bearing plans fail closed" in output
+    assert "apply the reviewed retention plan" not in output
+    assert "delete the reviewed entries" not in output
+
+
 _CODEX_FIXTURES = Path(__file__).parent / "fixtures" / "codex-marketplace-list"
+_DESTRUCTIVE_RETENTION_DISABLED = (
+    "destructive retention apply is disabled until generation-bound atomic "
+    "candidate capture exists; no entries were deleted"
+)
 
 
 def _write_config(
@@ -1228,22 +1245,69 @@ def test_state_prune_is_a_read_only_json_plan_without_yes(
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
     assert payload["applied"] is False
     assert payload["has_changes"] is True
-    assert payload["actions"][0]["path"] == str(action_path)
+    assert payload["actions"] == [
+        {
+            "bytes": 10,
+            "category": "marketplace_build",
+            "device": 2,
+            "inode": 3,
+            "mtime_ns": 1,
+            "node_kind": "directory",
+            "path": str(action_path),
+        }
+    ]
+    assert payload["deleted"] == []
+    assert payload["reclaimed_bytes"] == 0
     assert payload["converged"] is False
 
 
-def test_state_prune_yes_applies_exact_reviewed_plan(
+def test_state_prune_human_dry_run_labels_candidates_and_disabled_deletion(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     make_catalog(tmp_path / "catalog")
     config_path = _write_config(tmp_path, components=())
+    action_path = tmp_path / "state" / "builds" / ("a" * 20)
+    action = RetentionAction(
+        category="marketplace_build",
+        path=action_path,
+        node_kind="directory",
+        bytes=10,
+        mtime_ns=1,
+        device=2,
+        inode=3,
+    )
+    plan = _retention_plan(config_path, actions=(action,))
+    monkeypatch.setattr(cli, "build_retention_plan", lambda _config: plan)
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path)])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "1 deletion candidates" in captured.out
+    assert f"CANDIDATE  marketplace_build: {action_path}" in captured.out
+    assert "automated deletion is disabled" in captured.out
+    assert captured.err == ""
+
+
+def test_state_prune_yes_rejects_action_plan_without_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    action_path = tmp_path / "state" / "backups" / "local" / "seo" / "20260723-120000-1234abcd"
+    action_path.mkdir(parents=True)
+    sentinel = action_path / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
     action = RetentionAction(
         category="skill_backup",
-        path=tmp_path / "state" / "backups" / "local" / "seo" / "20260723-120000-1234abcd",
+        path=action_path,
         node_kind="directory",
         bytes=10,
         mtime_ns=1,
@@ -1251,26 +1315,51 @@ def test_state_prune_yes_applies_exact_reviewed_plan(
         inode=3,
     )
     reviewed = _retention_plan(config_path, actions=(action,))
-    converged = _retention_plan(config_path)
     monkeypatch.setattr(cli, "build_retention_plan", lambda _config: reviewed)
-    monkeypatch.setattr(
-        cli,
-        "apply_retention_plan",
-        lambda _config, received: (
-            RetentionResult((action,), 10, converged)
-            if received is reviewed
-            else (_ for _ in ()).throw(AssertionError("wrong reviewed plan"))
-        ),
-    )
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: {_DESTRUCTIVE_RETENTION_DISABLED}\n"
+    assert action_path.is_dir()
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_state_prune_yes_validates_no_action_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
 
     exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == 1
     assert payload["applied"] is True
-    assert payload["deleted"][0]["path"] == str(action.path)
-    assert payload["reclaimed_bytes"] == 10
+    assert payload["actions"] == []
+    assert payload["deleted"] == []
+    assert payload["reclaimed_bytes"] == 0
     assert payload["converged"] is True
+
+
+def test_state_prune_yes_human_output_reports_validation_not_deletion(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.out == "retention validation completed: the reviewed no-change plan remains current\n"
+    assert "deleted" not in captured.out
+    assert captured.err == ""
 
 
 def test_state_prune_blocker_fails_closed_without_apply(

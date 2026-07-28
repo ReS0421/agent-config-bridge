@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import os
 import re
-import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,7 +95,7 @@ class RetentionPlan:
 
 @dataclass(frozen=True, slots=True)
 class RetentionResult:
-    """The entries deleted by a successful apply and its converged final plan."""
+    """A successful no-change validation; the retained deleted tuple is empty."""
 
     deleted: tuple[RetentionAction, ...]
     reclaimed_bytes: int
@@ -192,29 +191,27 @@ def apply_retention_plan(
     config: BridgeConfig,
     reviewed_plan: RetentionPlan,
 ) -> RetentionResult:
-    """Apply one reviewed plan under an exclusive lock after full revalidation."""
+    """Validate one no-change plan under a lock; fail closed for destructive actions."""
 
     if reviewed_plan.has_blockers:
         raise RetentionError("retention plan contains blockers; no entries were deleted")
+    if reviewed_plan.actions:
+        raise RetentionError(
+            "destructive retention apply is disabled until generation-bound atomic "
+            "candidate capture exists; no entries were deleted"
+        )
     with _OperationLock(config.state_dir):
-        if reviewed_plan.actions and not shutil.rmtree.avoids_symlink_attacks:
-            raise RetentionError(
-                "this platform lacks descriptor-anchored directory removal; retention apply is blocked"
-            )
         fresh_plan = build_retention_plan(config)
         if fresh_plan != reviewed_plan:
             raise RetentionError("generated state changed after retention planning; review a fresh plan")
         if fresh_plan.has_blockers:
             raise RetentionError("retention state became unsafe; no entries were deleted")
-        for action in fresh_plan.actions:
-            _revalidate_action(config, action)
-        for action in fresh_plan.actions:
-            _revalidate_action(config, action)
-            _remove_action_anchored(config, action)
 
         final_plan = build_retention_plan(config)
         if final_plan.has_blockers or final_plan.has_changes:
-            raise RetentionError("retention did not converge after deleting its reviewed candidates")
+            raise RetentionError(
+                "retention state did not remain unchanged during no-change validation; no entries were deleted"
+            )
         return RetentionResult(
             deleted=fresh_plan.actions,
             reclaimed_bytes=fresh_plan.reclaimable_bytes,
@@ -474,77 +471,6 @@ def _tree_regular_bytes(root: Path, *, allow_symlinks: bool) -> int:
             else:
                 raise RetentionError(f"unsupported or redirected generated entry: {path}")
     return total
-
-
-def _revalidate_action(config: BridgeConfig, action: RetentionAction) -> None:
-    root = config.state_dir / "builds" if action.category == "marketplace_build" else config.state_dir / "backups"
-    _require_real_ancestors(action.path, root)
-    try:
-        current = action.path.lstat()
-    except OSError as exc:
-        raise RetentionError(f"retention candidate changed before deletion: {action.path}") from exc
-    if current.st_dev != action.device or current.st_ino != action.inode or current.st_mtime_ns != action.mtime_ns:
-        raise RetentionError(f"retention candidate identity changed before deletion: {action.path}")
-    if action.node_kind == "symlink":
-        if not stat.S_ISLNK(current.st_mode):
-            raise RetentionError(f"terminal backup link changed before deletion: {action.path}")
-        return
-    if not stat.S_ISDIR(current.st_mode) or _entry_is_reparse(current):
-        raise RetentionError(f"retention directory changed or became redirected: {action.path}")
-    if action.category == "marketplace_build":
-        validate_marketplace_build(config, action.path, action.path.name)
-        return
-    skill = action.path.parent.name
-    marker = read_managed_marker(action.path)
-    if (
-        marker is None
-        or marker.get("source_id") != f"skills/{skill}"
-        or tree_digest(action.path) != marker.get("installed_digest")
-    ):
-        raise RetentionError(f"Skill backup changed before deletion: {action.path}")
-
-
-def _remove_action_anchored(config: BridgeConfig, action: RetentionAction) -> None:
-    """Remove one candidate relative to its verified parent directory handle."""
-
-    parent = action.path.parent
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        parent_fd = os.open(parent, flags)
-    except OSError as exc:
-        raise RetentionError(f"retention candidate parent changed before deletion: {parent}") from exc
-    try:
-        current = os.stat(action.path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if current.st_dev != action.device or current.st_ino != action.inode or current.st_mtime_ns != action.mtime_ns:
-            raise RetentionError(f"retention candidate identity changed before deletion: {action.path}")
-        if action.node_kind == "symlink":
-            if not stat.S_ISLNK(current.st_mode):
-                raise RetentionError(f"terminal backup link changed before deletion: {action.path}")
-            os.unlink(action.path.name, dir_fd=parent_fd)
-        else:
-            if not stat.S_ISDIR(current.st_mode) or _entry_is_reparse(current):
-                raise RetentionError(f"retention directory changed or became redirected: {action.path}")
-            shutil.rmtree(action.path.name, dir_fd=parent_fd)
-    except OSError as exc:
-        raise RetentionError(f"retention candidate could not be removed safely: {action.path}") from exc
-    finally:
-        os.close(parent_fd)
-
-
-def _require_real_ancestors(path: Path, root: Path) -> None:
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise RetentionError(f"retention candidate escapes its generated-state root: {path}") from exc
-    candidate = path.parent
-    while True:
-        if not _is_real_directory(candidate):
-            raise RetentionError(f"retention candidate ancestor is redirected: {candidate}")
-        if candidate == root:
-            return
-        if candidate == candidate.parent:
-            raise RetentionError(f"retention candidate root is unreachable: {path}")
-        candidate = candidate.parent
 
 
 def _scanned_entry(

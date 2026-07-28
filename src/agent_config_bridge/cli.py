@@ -211,11 +211,16 @@ def _build_parser() -> argparse.ArgumentParser:
     state_subparsers = state_parser.add_subparsers(dest="state_command", required=True)
     prune_parser = state_subparsers.add_parser(
         "prune",
-        help="plan bounded generated-state retention, or apply it with --yes",
+        help=("plan bounded generated-state retention; --yes validates no-change plans and fails closed for actions"),
     )
     prune_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
     prune_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
-    prune_parser.add_argument("-y", "--yes", action="store_true", help="apply the reviewed retention plan")
+    prune_parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="validate a reviewed no-change plan; action-bearing plans fail closed",
+    )
 
     for command, help_text in (
         ("validate", "validate config and catalog structure"),
@@ -496,7 +501,7 @@ def _command_state(config: BridgeConfig, args: argparse.Namespace) -> int:
         if args.json:
             _print_json(payload)
         else:
-            print(f"retention applied: {len(result.deleted)} entries deleted, {result.reclaimed_bytes} bytes reclaimed")
+            print("retention validation completed: the reviewed no-change plan remains current")
         return 0
 
     payload = _retention_payload(plan, applied=False)
@@ -547,14 +552,14 @@ def _print_retention_plan(plan: RetentionPlan) -> None:
         "retention plan: "
         f"{plan.build_count} marketplace builds, "
         f"{plan.skill_backup_snapshot_count} Skill backups, "
-        f"{len(plan.actions)} deletions, {len(plan.blockers)} blockers"
+        f"{len(plan.actions)} deletion candidates, {len(plan.blockers)} blockers"
     )
     for blocker in plan.blockers:
         print(f"  BLOCKED {blocker.path}: {blocker.reason}")
     for action in plan.actions:
-        print(f"  DELETE  {action.category}: {action.path}")
+        print(f"  CANDIDATE  {action.category}: {action.path}")
     if plan.has_changes:
-        print("dry run only; rerun with --yes to delete the reviewed entries")
+        print("review only; automated deletion is disabled, and --yes fails closed when the plan contains actions")
 
 
 def _command_init(args: argparse.Namespace) -> int:

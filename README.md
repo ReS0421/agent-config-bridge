@@ -55,8 +55,9 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   the committed `catalog/governance/policy.toml` (audit implemented)
 - An `instructions` component (ADR-5 in the catalog repo) deploying always-on
   policy files from per-product bundle overlays to a strict destination
-  allowlist (Claude Code: `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`;
-  Codex: `AGENTS.md`, `agents/**`) with per-file single ownership, no
+  allowlist (Claude Code: `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`,
+  `model-instructions/*.md`; Codex: `AGENTS.md`, `agents/**`,
+  `model-instructions/*.md`) with per-file single ownership, no
   render-time merging, newline-normalized drift detection, and
   `AGENTBRIDGE-MANAGED.json` markers on managed instruction directories
 - Canonical Codex Skill destination: `~/.agents/skills`
@@ -173,22 +174,23 @@ the local swap partially fails, the Bridge reconstructs and verifies the prior
 destination from the retained backup through a fresh same-filesystem staging
 path; it never restores the damaged swap or consumes the only verified backup.
 
-Generated marketplace builds and managed Skill backups have bounded retention:
+Generated marketplace builds and managed Skill backups expose bounded retention
+planning:
 
 ```bash
 agentbridge state prune -c agentbridge.toml --json
 agentbridge state prune -c agentbridge.toml --yes --json
 ```
 
-The first command is a byte-preserving dry run. The second deletes only the
-reviewed, revalidated candidates. Any malformed entry, redirected ancestor, or
-ownership/digest mismatch found by the locked fresh plan blocks all deletion.
-An identity change detected later stops before deleting that changed candidate;
-earlier candidates from the same reviewed plan may already have been removed.
-The currently published marketplace build is always retained, terminal symlink
-snapshots are unlinked without following their target, and Instruction backups
-are outside this retention policy. Applying deletions also fails closed on a
-platform whose Python runtime lacks descriptor-anchored removal.
+Planning is byte-preserving and reports retention candidates. A blocker-bearing
+plan exits with status 1 without entering apply. Otherwise, `--yes` returns
+status 0 only for locked validation of a no-action plan; a plan with any
+marketplace-build, Skill-directory, or terminal-symlink deletion candidate
+exits with status 2 before mutation and deletes nothing. Automatic destructive
+apply remains disabled until candidates have non-reusable generation identity
+and can be captured atomically before deletion. No backup/build marker
+migration is performed. The currently published marketplace build remains
+pinned, and Instruction backups remain outside this retention policy.
 
 Registration remains deliberately separate:
 
@@ -392,11 +394,11 @@ for the schema and lifecycle.
 - Copy mode updates only when the ownership marker matches and the installed digest has not drifted.
 - Updated or deselected, unchanged managed copies are retained under the
   configured state directory.
-- `state prune` is dry-run by default. Applying retention requires `--yes`,
-  holds an exclusive retention lock, rebuilds the reviewed plan, and
-  revalidates every deletion candidate immediately before descriptor-anchored
-  removal. A later concurrent change stops subsequent deletion but does not
-  roll back candidates already removed.
+- `state prune` is a byte-preserving dry run by default. A blocker-bearing plan
+  exits with status 1 without entering apply. Otherwise, `--yes` returns status
+  0 only after locked no-action validation; an action-bearing plan exits with
+  status 2 before mutation and deletes nothing. Destructive retention remains
+  disabled pending generation-bound atomic candidate capture.
 - Marketplace builds are immutable and addressed by source digest; the stable
   published snapshot is integrity-checked before reuse or replacement.
 - Settings update/remove only while each current value matches its target-scoped

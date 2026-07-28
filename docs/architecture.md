@@ -183,8 +183,9 @@ catalog/
 │   ├── schedule.toml
 │   └── PROMPT.md
 └── instructions/<bundle>/
-    ├── codex/                    # AGENTS.md and agents/**
-    └── claude-code/              # CLAUDE.md, rules/**, agents/**, commands/**
+    ├── codex/                    # AGENTS.md, agents/**, model-instructions/*.md
+    └── claude-code/              # CLAUDE.md, rules/**, agents/**, commands/**,
+                                  # model-instructions/*.md
 ```
 
 Artifact identities are lowercase kebab-case and portable to Windows. Discovery
@@ -519,25 +520,27 @@ state_dir/
     └── scheduler.json               # heartbeat ownership
 ```
 
-`agentbridge state prune` owns bounded cleanup of two generated subtrees.
+`agentbridge state prune` defines bounded retention planning for two generated
+subtrees.
 `bridge.retention.marketplace_builds` defaults to 20, and
 `bridge.retention.skill_backups` defaults to 3 per target/Skill; both must be
-integers of at least one. Planning is read-only. `--yes` acquires an exclusive
-retention lock, rebuilds the complete plan, revalidates candidate identity and
-ownership, then uses descriptor-anchored removal for only the reviewed entries.
-If the Python/platform combination cannot provide that primitive, apply fails
-closed. The published marketplace build is pinned even when it is older than
-the normal cutoff; a missing corresponding immutable build is a blocker.
+integers of at least one. Planning remains read-only and reports candidates
+under those limits. In 0.3.3, `--yes` performs locked validation only when the
+reviewed plan has no actions. If the plan contains any marketplace-build,
+Skill-directory, or terminal-symlink deletion candidate, it fails before
+mutation and deletes nothing. Destructive automatic apply is disabled until
+each candidate has non-reusable generation identity and the selected object can
+be captured atomically before deletion. No backup/build marker schema change or
+migration is implemented in this release. The published marketplace build is
+pinned even when it is older than the normal cutoff; a missing corresponding
+immutable build is a blocker.
 
 Instruction backups below `backups/<target>/instructions/` are deliberately
 excluded because their file-granular layout has a different lifecycle. A
-terminal symlink snapshot is a valid historical Skill backup and is removed by
-unlinking the link itself. Any unexpected name, special node, redirected
-ancestor, invalid build marker, or mismatched Skill marker/digest is a global
-blocker: no retention candidate is deleted.
-An identity change after this fresh-plan gate stops before the changed
-candidate; deletion is not transactionally rolled back if earlier candidates
-were already removed.
+terminal symlink snapshot remains a valid historical Skill backup and may
+appear as a candidate, but it is not unlinked automatically. Any unexpected
+name, special node, redirected ancestor, invalid build marker, or mismatched
+Skill marker/digest remains a global blocker.
 
 This state is designed to be non-secret: the bridge never writes product auth,
 session, trust, cache, or conversation state there. The ownership files contain

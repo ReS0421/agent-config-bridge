@@ -34,8 +34,9 @@ Only six component classes are eligible for projection:
 - explicit product-native `settings` leaves in reviewed fragments;
 - strict `schedules` containing a definition and prompt.
 - reviewed `instructions` overlays restricted to explicit product destinations:
-  Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, and `commands/**`; Codex
-  `AGENTS.md` and `agents/**`.
+  Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`, and direct
+  `model-instructions/*.md`; Codex `AGENTS.md`, `agents/**`, and direct
+  `model-instructions/*.md`.
 
 Everything else is excluded. Never copy or link:
 
@@ -268,9 +269,14 @@ Current alpha limitations matter for threat modeling:
   managed-copy actions have localized snapshot/swap recovery;
 - a later action can fail after an earlier action succeeded;
 - symlink mode is live, so canonical Skill changes become visible immediately;
-- bounded marketplace-build and managed-Skill-backup retention is available
-  through `state prune`; Instruction backups and automatic restore remain out
-  of scope;
+- `state prune` retains byte-preserving planning, but an action-bearing
+  `--yes` invocation fails before mutation across marketplace builds, Skill
+  directories, and terminal symlinks; only locked no-change validation remains
+  available until generation-bound atomic candidate capture is implemented;
+- a future generation token is an object-identity aid, not authorization
+  against a same-account actor that can directly rewrite or delete Bridge
+  state; that actor remains outside the retention race-safety boundary;
+- Instruction backups and automatic restore remain out of scope;
 - the implementation does not provide comprehensive no-follow/reparse-point
   protection against every concurrent filesystem race on POSIX, Windows, or WSL.
 
