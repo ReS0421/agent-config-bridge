@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_config_bridge import retention
 from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.filesystem import MANAGED_MARKER, tree_digest
 from agent_config_bridge.models import Component, RetentionConfig
@@ -23,6 +24,11 @@ from tests.conftest import (
     make_catalog,
     make_config,
     require_directory_symlink_support,
+)
+
+_DESTRUCTIVE_RETENTION_DISABLED = (
+    "destructive retention apply is disabled until generation-bound atomic "
+    "candidate capture exists; no entries were deleted"
 )
 
 
@@ -109,7 +115,7 @@ def _state_snapshot(root: Path) -> tuple[tuple[str, str, int, bytes], ...]:
     return tuple(snapshot)
 
 
-def test_plan_and_apply_keep_twenty_builds_including_old_published_build(
+def test_marketplace_plan_selects_excess_builds_and_disabled_apply_preserves_all(
     tmp_path: Path,
 ) -> None:
     config = _marketplace_config(tmp_path)
@@ -122,18 +128,14 @@ def test_plan_and_apply_keep_twenty_builds_including_old_published_build(
     assert len(plan.actions) == 2
     assert published not in {action.path for action in plan.actions}
 
-    if not shutil.rmtree.avoids_symlink_attacks:
-        with pytest.raises(RetentionError, match="descriptor-anchored"):
-            apply_retention_plan(config, plan)
-        assert all(path.is_dir() for path in builds)
-        return
+    before = _state_snapshot(config.state_dir)
+    with pytest.raises(RetentionError) as raised:
+        apply_retention_plan(config, plan)
 
-    result = apply_retention_plan(config, plan)
-
-    assert len(result.deleted) == 2
-    assert sum(path.is_dir() for path in builds) == 20
+    assert str(raised.value) == _DESTRUCTIVE_RETENTION_DISABLED
+    assert _state_snapshot(config.state_dir) == before
+    assert all(path.is_dir() for path in builds)
     assert published.is_dir()
-    assert not result.final_plan.has_changes
 
 
 def test_missing_build_for_published_marketplace_blocks_all_deletion(
@@ -155,7 +157,7 @@ def test_missing_build_for_published_marketplace_blocks_all_deletion(
     assert all(path.is_dir() for path in builds if path != published)
 
 
-def test_skill_backup_plan_keeps_latest_three_by_snapshot_name_and_applies(
+def test_skill_backup_plan_selects_oldest_and_disabled_apply_preserves_all(
     tmp_path: Path,
 ) -> None:
     catalog = make_catalog(tmp_path / "catalog")
@@ -168,15 +170,13 @@ def test_skill_backup_plan_keeps_latest_three_by_snapshot_name_and_applies(
     plan = build_retention_plan(config)
 
     assert [action.path for action in plan.actions] == backups[:2]
-    if not shutil.rmtree.avoids_symlink_attacks:
-        with pytest.raises(RetentionError, match="descriptor-anchored"):
-            apply_retention_plan(config, plan)
-        assert all(path.is_dir() for path in backups)
-        return
+    before = _state_snapshot(config.state_dir)
+    with pytest.raises(RetentionError) as raised:
+        apply_retention_plan(config, plan)
 
-    result = apply_retention_plan(config, plan)
-    assert [path.exists() for path in backups] == [False, False, True, True, True]
-    assert len(result.deleted) == 2
+    assert str(raised.value) == _DESTRUCTIVE_RETENTION_DISABLED
+    assert _state_snapshot(config.state_dir) == before
+    assert all(path.is_dir() for path in backups)
 
 
 def test_skill_backup_limit_never_deletes_the_only_snapshot(tmp_path: Path) -> None:
@@ -193,7 +193,7 @@ def test_skill_backup_limit_never_deletes_the_only_snapshot(tmp_path: Path) -> N
     assert only.is_dir()
 
 
-def test_terminal_symlink_snapshot_is_unlinked_without_following_target(
+def test_terminal_symlink_plan_selects_link_and_disabled_apply_preserves_target(
     tmp_path: Path,
 ) -> None:
     require_directory_symlink_support(tmp_path)
@@ -215,15 +215,13 @@ def test_terminal_symlink_snapshot_is_unlinked_without_following_target(
     plan = build_retention_plan(config)
 
     assert [action.path for action in plan.actions] == [old_link]
-    if not shutil.rmtree.avoids_symlink_attacks:
-        with pytest.raises(RetentionError, match="descriptor-anchored"):
-            apply_retention_plan(config, plan)
-        assert old_link.is_symlink()
-        assert sentinel.read_text(encoding="utf-8") == "keep\n"
-        return
+    before = _state_snapshot(config.state_dir)
+    with pytest.raises(RetentionError) as raised:
+        apply_retention_plan(config, plan)
 
-    apply_retention_plan(config, plan)
-    assert not old_link.is_symlink()
+    assert str(raised.value) == _DESTRUCTIVE_RETENTION_DISABLED
+    assert _state_snapshot(config.state_dir) == before
+    assert old_link.is_symlink()
     assert newest.is_dir()
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
 
@@ -312,7 +310,7 @@ def test_special_backup_node_is_a_global_blocker(tmp_path: Path) -> None:
     assert fifo.exists()
 
 
-def test_candidate_identity_replacement_after_plan_deletes_nothing(
+def test_recreated_candidate_survives_global_action_plan_fail_closed(
     tmp_path: Path,
 ) -> None:
     catalog = make_catalog(tmp_path / "catalog")
@@ -326,15 +324,17 @@ def test_candidate_identity_replacement_after_plan_deletes_nothing(
     shutil.rmtree(candidate)
     replacement = _make_backup(config, 0)
 
-    expected = "changed after retention planning" if shutil.rmtree.avoids_symlink_attacks else "descriptor-anchored"
-    with pytest.raises(RetentionError, match=expected):
+    before = _state_snapshot(config.state_dir)
+    with pytest.raises(RetentionError) as raised:
         apply_retention_plan(config, plan)
 
+    assert str(raised.value) == _DESTRUCTIVE_RETENTION_DISABLED
+    assert _state_snapshot(config.state_dir) == before
     assert replacement.is_dir()
     assert all(path.is_dir() for path in backups[1:])
 
 
-def test_apply_blocks_before_deletion_without_descriptor_safe_rmtree(
+def test_disabled_action_plan_fails_before_lock_and_preserves_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -345,12 +345,44 @@ def test_apply_blocks_before_deletion_without_descriptor_safe_rmtree(
     )
     backups = [_make_backup(config, index) for index in range(3)]
     plan = build_retention_plan(config)
-    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", False)
+    lock_path = config.state_dir / ".agentbridge-retention.lock"
 
-    with pytest.raises(RetentionError, match="descriptor-anchored"):
+    def unexpected_lock(_state_dir: Path) -> None:
+        raise AssertionError("action-bearing apply must fail before lock acquisition")
+
+    monkeypatch.setattr(retention, "_OperationLock", unexpected_lock)
+
+    before = _state_snapshot(config.state_dir)
+    with pytest.raises(RetentionError) as raised:
         apply_retention_plan(config, plan)
 
+    assert str(raised.value) == _DESTRUCTIVE_RETENTION_DISABLED
+    assert _state_snapshot(config.state_dir) == before
     assert all(path.is_dir() for path in backups)
+    assert not lock_path.exists()
+
+
+def test_no_action_apply_succeeds_and_releases_lock(tmp_path: Path) -> None:
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog)
+    plan = build_retention_plan(config)
+
+    assert not plan.has_blockers
+    assert not plan.has_changes
+
+    first = apply_retention_plan(config, plan)
+    second = apply_retention_plan(config, plan)
+
+    for result in (first, second):
+        assert result.deleted == ()
+        assert result.reclaimed_bytes == 0
+        assert not result.final_plan.has_changes
+        assert not result.final_plan.has_blockers
+
+    lock_path = config.state_dir / ".agentbridge-retention.lock"
+    assert lock_path.is_file()
+    lock_path.unlink()
+    assert not lock_path.exists()
 
 
 def test_dry_run_is_byte_and_metadata_invariant_and_excludes_instructions(

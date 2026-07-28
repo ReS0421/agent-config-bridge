@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `model-instructions/` for Codex and Claude Code. Nested paths and non-Markdown
   files remain rejected by the destination allowlist.
 
+### Security
+
+- `agentbridge state prune --yes` now fails closed before mutation whenever the
+  reviewed plan contains deletion candidates. A filesystem candidate
+  ABA/path-generation gap could otherwise allow a byte-identical replacement
+  to reuse observable metadata and be deleted as the reviewed object. Read-only
+  planning and locked no-change validation remain available; generation-bound
+  atomic candidate capture is deferred.
+
 ## [0.3.2] - 2026-07-24
 
 ### Added
