@@ -23,9 +23,9 @@ from agent_config_bridge.state import read_instruction_state
 from tests.conftest import make_catalog, make_config
 
 
-def _write(path: Path, text: str, *, newline: str | None = None) -> None:
+def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline=newline)
+    path.write_bytes(text.encode("utf-8"))
 
 
 def _profile_bundle(
