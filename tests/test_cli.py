@@ -399,6 +399,104 @@ def test_validate_json_reports_catalog_inventory(
     }
 
 
+def _write_instruction_profile_projection(catalog: Path) -> Path:
+    bundle = catalog / "instructions" / "team-policy"
+    source = bundle / "codex" / "model-instructions" / "team-lead.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Team Lead\n", encoding="utf-8")
+    (bundle / "projections.toml").write_text(
+        (
+            "schema_version = 1\n\n"
+            "[[codex_profiles]]\n"
+            'name = "team-lead"\n'
+            'source = "codex/model-instructions/team-lead.md"\n'
+        ),
+        encoding="utf-8",
+    )
+    return bundle / "codex" / "team-lead.config.toml"
+
+
+def test_instructions_generate_and_check_report_json_and_read_only_drift(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = make_catalog(tmp_path / "catalog", skills=())
+    output = _write_instruction_profile_projection(catalog)
+    config_path = _write_config(tmp_path, components=("instructions",))
+
+    assert cli.main(["instructions", "generate", "--config", str(config_path), "--json"]) == 0
+    generated = json.loads(capsys.readouterr().out)
+    assert generated["schema_version"] == 1
+    assert generated["command"] == "generate"
+    assert generated["changed"] == 1
+    assert generated["valid"] is True
+    assert generated["profiles"] == [
+        {
+            "bundle": "team-policy",
+            "destination": "codex/team-lead.config.toml",
+            "name": "team-lead",
+            "source": "codex/model-instructions/team-lead.md",
+            "status": "created",
+        }
+    ]
+
+    assert cli.main(["instructions", "check", "--config", str(config_path), "--json"]) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked["command"] == "check"
+    assert checked["changed"] == 0
+    assert checked["valid"] is True
+    assert checked["profiles"][0]["status"] == "current"
+
+    output.write_bytes(output.read_bytes() + b"# drift\n")
+    drifted = output.read_bytes()
+    assert cli.main(["instructions", "check", "--config", str(config_path)]) == 1
+    assert "DRIFT" in capsys.readouterr().out
+    assert output.read_bytes() == drifted
+
+
+def test_instructions_cli_reports_descriptor_error_without_writing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = make_catalog(tmp_path / "catalog", skills=())
+    output = _write_instruction_profile_projection(catalog)
+    descriptor = output.parent.parent / "projections.toml"
+    descriptor.write_text("schema_version = 9\n", encoding="utf-8")
+    config_path = _write_config(tmp_path, components=("instructions",))
+
+    assert cli.main(["instructions", "generate", "--config", str(config_path), "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "schema_version" in captured.err
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("command", ["validate", "plan"])
+@pytest.mark.parametrize("state", ["missing", "stale"])
+def test_normal_read_only_commands_reject_profile_projection_drift(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    state: str,
+) -> None:
+    catalog = make_catalog(tmp_path / "catalog", skills=())
+    output = _write_instruction_profile_projection(catalog)
+    config_path = _write_config(tmp_path, components=("instructions",))
+    assert cli.main(["instructions", "generate", "--config", str(config_path)]) == 0
+    capsys.readouterr()
+    if state == "missing":
+        output.unlink()
+    else:
+        output.write_bytes(output.read_bytes() + b"# stale\n")
+    observed = output.read_bytes() if output.exists() else None
+
+    assert cli.main([command, "--config", str(config_path), "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert state in captured.err
+    assert (output.read_bytes() if output.exists() else None) == observed
+
+
 def test_plan_json_returns_one_for_unmanaged_destination_conflict(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

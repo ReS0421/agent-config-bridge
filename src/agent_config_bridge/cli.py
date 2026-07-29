@@ -29,6 +29,12 @@ from agent_config_bridge.governance import (
     run_governance,
     serialize_registry,
 )
+from agent_config_bridge.instruction_profiles import (
+    InstructionProfileError,
+    InstructionProfileReport,
+    check_instruction_profiles,
+    generate_instruction_profiles,
+)
 from agent_config_bridge.marketplace_registry import (
     MarketplaceRegistryError,
     probe_marketplace_source,
@@ -97,6 +103,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "state":
             config = load_config(Path(args.config))
             return _command_state(config, args)
+        if args.command == "instructions":
+            config = load_config(Path(args.config))
+            return _command_instructions(config, args.instructions_command, args.json)
         config, inventory = _load_context(Path(args.config))
         if args.command == "registry":
             return _command_registry(inventory, args.registry_command, args.json)
@@ -128,6 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ConfigError,
         FilesystemError,
         GovernanceError,
+        InstructionProfileError,
         RenderError,
         BridgeStateError,
         ScheduleBackendError,
@@ -221,6 +231,25 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate a reviewed no-change plan; action-bearing plans fail closed",
     )
+
+    instructions_parser = subparsers.add_parser(
+        "instructions",
+        help="generate or drift-check declared Codex instruction profiles",
+    )
+    instructions_subparsers = instructions_parser.add_subparsers(
+        dest="instructions_command",
+        required=True,
+    )
+    for instructions_command, help_text in (
+        ("generate", "atomically generate declared developer-instruction-only Codex profiles"),
+        ("check", "strictly byte-compare declared Codex profiles without writing"),
+    ):
+        instructions_command_parser = instructions_subparsers.add_parser(
+            instructions_command,
+            help=help_text,
+        )
+        instructions_command_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+        instructions_command_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
 
     for command, help_text in (
         ("validate", "validate config and catalog structure"),
@@ -340,6 +369,46 @@ def _command_registry(inventory: CatalogInventory, registry_command: str, as_jso
         else:
             print("registry not written: resolve manifest errors first")
     return 1 if errors else 0
+
+
+def _command_instructions(
+    config: BridgeConfig,
+    instructions_command: str,
+    as_json: bool,
+) -> int:
+    if instructions_command == "generate":
+        report = generate_instruction_profiles(config.catalog)
+    elif instructions_command == "check":
+        report = check_instruction_profiles(config.catalog)
+    else:  # pragma: no cover - argparse constrains this value
+        raise InstructionProfileError(f"unknown instructions command: {instructions_command}")
+
+    payload = _instruction_profile_payload(report, instructions_command)
+    if as_json:
+        _print_json(payload)
+    else:
+        state = "CURRENT" if report.valid else "DRIFT"
+        print(
+            f"instructions {instructions_command}: {state}  profiles={len(report.profiles)}  "
+            f"changed={report.changed}  catalog={report.catalog}"
+        )
+        for profile in report.profiles:
+            print(f"  {profile.status.upper():7} {profile.bundle}:{profile.destination} <- {profile.source}")
+    return 0 if report.valid else 1
+
+
+def _instruction_profile_payload(
+    report: InstructionProfileReport,
+    command: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "command": command,
+        "catalog": str(report.catalog),
+        "profiles": [asdict(profile) for profile in report.profiles],
+        "changed": report.changed,
+        "valid": report.valid,
+    }
 
 
 def _command_migrate_skills(args: argparse.Namespace) -> int:

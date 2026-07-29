@@ -14,6 +14,7 @@ decision.
 | [0003](0003-use-dual-marketplace-packages.md)                | Use dual marketplace packages             | Accepted | 2026-07-14 |
 | [0004](0004-manage-declarative-settings-by-owned-leaf.md)    | Manage declarative settings by owned leaf | Accepted | 2026-07-14 |
 | [0005](0005-use-host-scheduler-adapters.md)                  | Use host scheduler adapters               | Accepted | 2026-07-14 |
+| [0006](0006-generate-codex-instruction-profiles.md)          | Generate Codex instruction profiles       | Accepted | 2026-07-29 |
 
 ## Statuses
 

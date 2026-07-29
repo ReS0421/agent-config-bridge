@@ -183,7 +183,9 @@ catalog/
 │   ├── schedule.toml
 │   └── PROMPT.md
 └── instructions/<bundle>/
-    ├── codex/                    # AGENTS.md, agents/**, model-instructions/*.md
+    ├── projections.toml          # optional Codex profile projection metadata
+    ├── codex/                    # AGENTS.md, agents/**, model-instructions/*.md,
+    │                             # generated <name>.config.toml profiles
     └── claude-code/              # CLAUDE.md, rules/**, agents/**, commands/**,
                                   # model-instructions/*.md
 ```
@@ -207,6 +209,49 @@ non-empty product fragment. A Schedule contains exactly its two declared files.
 An Instruction bundle contains one or both product overlays. Each source is
 non-empty UTF-8 without BOM, every destination is on the product allowlist, and
 only one bundle may own a destination for a product.
+
+### Codex instruction profile projection
+
+An optional Instruction-bundle `projections.toml` is a closed, versioned
+generation contract:
+
+```toml
+schema_version = 1
+
+[[codex_profiles]]
+name = "team-lead"
+source = "codex/model-instructions/team-lead.md"
+```
+
+The document has exactly `schema_version` and `codex_profiles`; every profile
+entry has exactly `name` and `source`. Names are portable lowercase kebab-case.
+Sources must be contained, real, non-symlink, direct
+`codex/model-instructions/*.md` files. Each declaration derives exactly one
+`codex/<name>.config.toml` output. The base `codex/config.toml` and undeclared
+profile outputs are forbidden.
+
+`agentbridge instructions generate` LF-normalizes the source and atomically
+creates or updates the declared profile. The renderer emits deterministic UTF-8
+and LF bytes, a source SHA-256 comment, and exactly one TOML data key:
+`developer_instructions`. TOML escaping round-trips Unicode, quotes,
+backslashes, control characters, and the source's trailing newline. Parsed
+`developer_instructions` must equal the normalized source exactly.
+
+`agentbridge instructions check` is strictly read-only and byte-compares the
+committed output with a fresh in-memory render. Catalog discovery additionally
+rejects a missing, stale, malformed, symlinked, or undeclared output; extra TOML
+data keys and blank or non-string prompts are errors. This makes `validate`,
+`plan`, and the apply-time rediscovery gate fail closed when the source and
+profile drift. Generated-output line endings are not normalized during this
+comparison: a CRLF-materialized profile is stale, so the Catalog repository
+must enforce LF checkout for `codex/*.config.toml` generated profiles.
+
+The descriptor is generation metadata and is never an `InstructionFile`.
+Generated profiles are ordinary Codex Instruction files, so planning, target
+ownership, symlink/copy delivery, drift detection, backup, update, and removal
+all reuse the existing per-file lifecycle. A pre-existing runtime
+`<config_home>/<name>.config.toml` remains unmanaged and conflicts even when its
+bytes equal the generated source.
 
 ## Product-specific rendering
 
@@ -344,9 +389,10 @@ not read or write any of those private or product-managed lifecycle records.
 
 ## Planning
 
-`validate`, `plan`, and `doctor` are read-only. Planning reads configuration,
-catalog content, destination paths, generated marketplace integrity metadata,
-and bridge ownership records. It reports:
+`instructions check`, `validate`, `plan`, and `doctor` are read-only.
+`instructions generate` is a separate, explicit Catalog-generation step.
+Planning reads configuration, catalog content, destination paths, generated
+marketplace integrity metadata, and bridge ownership records. It reports:
 
 - Skill link/copy creates, updates, removals, no-ops, and conflicts;
 - Instruction file link/copy creates, updates, removals, no-ops, and conflicts;
@@ -407,6 +453,8 @@ Actions then run sequentially:
 - Windows `auto` mode creates managed standalone Skill copies;
 - Instruction destinations use the same selected copy/symlink mode at the
   allowlisted file level;
+- generated Codex profiles use that same Instruction path; apply never invokes
+  the profile generator or repairs Catalog drift;
 - a replacement managed copy is staged and verified next to its destination;
 - before a managed-copy update or removal, the old destination is copied
   non-destructively into its final `state_dir/backups/<target>/...` path and
@@ -599,7 +647,7 @@ merely sharing a `user_home` ancestor is allowed. See
 - [OpenAI: Build plugins](https://learn.chatgpt.com/docs/build-plugins)
 - [OpenAI: Hooks](https://learn.chatgpt.com/docs/hooks)
 - [OpenAI: Scheduled tasks](https://learn.chatgpt.com/docs/automations)
-- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/basic-config)
+- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/config-basic)
 - [Anthropic: Extend Claude with skills](https://code.claude.com/docs/en/skills)
 - [Anthropic: Create plugins](https://code.claude.com/docs/en/plugins)
 - [Anthropic: Plugin marketplaces](https://code.claude.com/docs/en/plugin-marketplaces)

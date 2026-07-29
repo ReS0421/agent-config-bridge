@@ -177,17 +177,35 @@ Instructions share a file lifecycle, not a cross-product syntax. Canonical
 sources live below `instructions/<bundle>/<product>/`. Claude Code destinations
 are restricted to `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`, and
 direct `model-instructions/*.md` files; Codex destinations are restricted to
-`AGENTS.md`, `agents/**`, and direct `model-instructions/*.md` files. Two bundles
-cannot claim the same destination for one product. Files must be non-empty
-UTF-8 without BOM; line-ending identity is normalized, but content is not
-merged, translated, or concatenated.
+`AGENTS.md`, `agents/**`, direct `model-instructions/*.md` files, and declared
+generated root `<name>.config.toml` profiles. Two bundles cannot claim the same
+destination for one product. Files must be non-empty UTF-8 without BOM;
+line-ending identity is normalized, but content is not merged, translated, or
+concatenated.
+
+Codex profile generation is intentionally one-way and product-specific. An
+Instruction bundle's strict version-1 `projections.toml` maps a real direct
+`codex/model-instructions/*.md` source to
+`codex/<portable-name>.config.toml`. The output contains only
+`developer_instructions`, parsed exactly from the LF-normalized Markdown.
+`agentbridge instructions generate` writes the Catalog output;
+`agentbridge instructions check` only compares it. Normal Catalog discovery
+rejects missing or stale output, and apply never generates it implicitly.
+`projections.toml` is not deployed.
+
+At runtime the generated file becomes
+`<config_home>/<portable-name>.config.toml`, suitable for explicit Codex
+profile selection such as `codex --profile <portable-name>`. The bridge does
+not change the product launch command or select a profile automatically. It
+never projects `<config_home>/config.toml` through Instructions and does not
+claim support for analogous Claude Code profile TOML.
 
 An unmanaged destination conflicts even when its bytes match. Bridge-managed
 files are attributed by target-scoped `instructions.json` ownership state and,
 for managed directories, `AGENTBRIDGE-MANAGED.json`. Root-level `AGENTS.md` and
-`CLAUDE.md` cannot use a directory marker and therefore rely on ownership state
-plus content or link identity. Copy-mode update or deselection creates a
-verified, non-destructive backup below
+`CLAUDE.md` and root Codex profile files cannot use a directory marker and
+therefore rely on ownership state plus content or link identity. Copy-mode
+update or deselection creates a verified, non-destructive backup below
 `state_dir/backups/<target>/instructions/`; those backups are excluded from
 bounded generated-state pruning and do not authorize replacement of live
 unmanaged content.
@@ -400,7 +418,7 @@ reconcile it to empty.
 - [OpenAI: Build skills](https://learn.chatgpt.com/docs/build-skills)
 - [OpenAI: Build plugins](https://learn.chatgpt.com/docs/build-plugins)
 - [OpenAI: Hooks](https://learn.chatgpt.com/docs/hooks)
-- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/basic-config)
+- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/config-basic)
 - [OpenAI: Scheduled tasks](https://learn.chatgpt.com/docs/automations)
 - [OpenAI: ChatGPT desktop app for Windows](https://learn.chatgpt.com/docs/windows/windows-app)
 - [OpenAI: WSL](https://learn.chatgpt.com/docs/windows/wsl)
