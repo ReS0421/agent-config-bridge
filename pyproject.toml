@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-config-bridge"
-version = "0.3.3"
+version = "0.3.4"
 description = "Share canonical skills, plugins, hooks, settings, schedules, and instructions across Codex and Claude Code."
 readme = "README.md"
 requires-python = ">=3.11"

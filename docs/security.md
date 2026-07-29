@@ -36,7 +36,8 @@ Only six component classes are eligible for projection:
 - reviewed `instructions` overlays restricted to explicit product destinations:
   Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`, and direct
   `model-instructions/*.md`; Codex `AGENTS.md`, `agents/**`, and direct
-  `model-instructions/*.md`.
+  `model-instructions/*.md`, plus declared generated `<name>.config.toml`
+  profiles containing only `developer_instructions`.
 
 Everything else is excluded. Never copy or link:
 
@@ -54,6 +55,14 @@ Settings eligibility is deliberately narrow: Codex `config.toml` and Claude
 Code `settings.json` at the configured user home. It does not include
 credentials, `~/.claude.json`, project-local configuration, managed policy, or
 any other file merely because it is beneath a product home.
+
+Codex profile projection does not expand that Settings boundary. The generated
+`<name>.config.toml` is a standalone Instruction file; the base
+`<config_home>/config.toml` is never eligible through this path. A profile
+cannot set a model, permission, sandbox, MCP, approval, tool, or other Codex
+setting because any TOML data key besides `developer_instructions` is rejected.
+The instruction text itself grants no authority and does not bypass product
+approval, sandbox, managed-policy, or tool controls.
 
 This remains true even if vendor tools can be pointed at one home. Dedicated
 credential-management or whole-home synchronization is outside this project's
@@ -94,10 +103,10 @@ homes and `state_dir` locations and review their ACLs separately.
 
 This design does not sanitize catalog content. Generated packages and backups
 reproduce the canonical files, so a secret committed to a Skill, Plugin, Hook,
-script, manifest, or `.mcp.json` will also appear in generated state. Keep the
-catalog and `state_dir` in user-controlled locations and reference secrets
-through product-supported environment/configuration mechanisms rather than
-embedding values.
+Instruction, script, manifest, or `.mcp.json` will also appear in generated
+state or a product configuration home. Keep the catalog and `state_dir` in
+user-controlled locations and reference secrets through product-supported
+environment/configuration mechanisms rather than embedding values.
 
 The same warning applies to Settings values and Schedule prompts. Rendered
 Schedule snapshots reproduce the prompt, and product or host scheduler logs may
@@ -126,6 +135,10 @@ Implemented validation includes:
   IANA timezone, bounded timeout, and a portable relative worktree path;
 - non-empty UTF-8 Instruction files without BOM, exact product overlay roots,
   destination allowlisting, and single-bundle ownership of each destination;
+- an exact version-1 Instruction projection descriptor, portable unique profile
+  names, contained real direct Markdown sources, deterministic LF output,
+  source/value equality, and rejection of missing, stale, malformed, symlinked,
+  undeclared, base-config, extra-key, blank, or non-string Codex profiles;
 - a closed `allowed`/`blocked` redistribution vocabulary; an allowed artifact
   requires its upstream SHA-256, commit-pinned imported-Git source, concluded
   license and rights basis, and non-symlink evidence/attribution files contained
@@ -165,9 +178,13 @@ so automation never needs to split human status text from machine output.
 
 ## Plan before mutation
 
-`validate`, `plan`, and `doctor` do not write Bridge or product state. `doctor`
-does execute the selected product CLI with `--version` and, when marketplace
-registration is relevant, `plugin marketplace list --json`. An explicit target
+`instructions check`, `validate`, `plan`, and `doctor` do not write Catalog,
+Bridge, or product state. `instructions generate` is an explicit Catalog write:
+it renders only declared Codex profile outputs, refuses output symlinks, stages
+each file beside its destination, fsyncs it, and atomically replaces that single
+generated file. It does not write a runtime home. `doctor` does execute
+the selected product CLI with `--version` and, when marketplace registration is
+relevant, `plugin marketplace list --json`. An explicit target
 `executable` therefore remains executable supply-chain input and must be
 reviewed before running diagnostics. Marketplace JSON stdout is decoded as
 strict UTF-8. Codex's absolute root-only local record and its expanded local
@@ -229,8 +246,9 @@ digest mismatches:
   match;
 - Instruction files use the same link/copy ownership checks at file grain.
   Managed Instruction directories carry `AGENTBRIDGE-MANAGED.json`; root-level
-  `AGENTS.md` and `CLAUDE.md` remain attributable through per-target
-  `instructions.json` state because their product root cannot carry a marker;
+  `AGENTS.md`, `CLAUDE.md`, and generated Codex profiles remain attributable
+  through per-target `instructions.json` state because their product root
+  cannot carry a marker;
 - before managed-copy update/removal, a non-destructive final backup snapshot is
   created below `state_dir/backups` and verified by marker, source identity, and
   installed digest;
@@ -418,7 +436,7 @@ issue.
 
 - [OpenAI: Hook review and trust](https://learn.chatgpt.com/docs/hooks)
 - [OpenAI: Plugin-bundled Hooks](https://learn.chatgpt.com/docs/build-plugins)
-- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/basic-config)
+- [OpenAI: Codex configuration](https://learn.chatgpt.com/docs/config-file/config-basic)
 - [OpenAI: Scheduled tasks](https://learn.chatgpt.com/docs/automations)
 - [Anthropic: Hook security best practices](https://code.claude.com/docs/en/hooks#security-best-practices)
 - [Anthropic: Plugin marketplace caching](https://code.claude.com/docs/en/plugin-marketplaces)

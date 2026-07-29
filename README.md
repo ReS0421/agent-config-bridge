@@ -12,8 +12,10 @@ can usually be shared directly. Plugins and Hooks are rendered into
 product-specific packages, Settings are merged into public product files by
 owned leaf, Schedules are executed through host schedulers and product CLIs,
 and Instructions are per-product policy files linked or copied file-by-file
-into the product configuration home. All six component classes still come from
-one version-controlled catalog.
+into the product configuration home. A reviewed Codex Markdown instruction can
+also be projected deterministically into a developer-instructions-only profile
+without replacing Codex's base system instructions. All six component classes
+still come from one version-controlled catalog.
 
 > **Status: alpha.** The safety model and core workflow are implemented, but product schemas continue to evolve. Always review `agentbridge plan` before applying or registering anything.
 
@@ -57,9 +59,14 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   policy files from per-product bundle overlays to a strict destination
   allowlist (Claude Code: `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`,
   `model-instructions/*.md`; Codex: `AGENTS.md`, `agents/**`,
-  `model-instructions/*.md`) with per-file single ownership, no
-  render-time merging, newline-normalized drift detection, and
+  `model-instructions/*.md`, and declared generated `<name>.config.toml`
+  profiles) with per-file single ownership, no render-time merging,
+  newline-normalized drift detection, and
   `AGENTBRIDGE-MANAGED.json` markers on managed instruction directories
+- Deterministic `instructions generate` and strictly read-only
+  `instructions check` commands for Codex profiles whose only TOML data key is
+  `developer_instructions`; normal validation and planning reject missing,
+  stale, malformed, or undeclared profile outputs
 - Canonical Codex Skill destination: `~/.agents/skills`
 - Claude Code Skill destination: `~/.claude/skills`
 - Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`
@@ -125,13 +132,23 @@ before applying the migrated catalog. See the
 [Windows, Linux, and WSL onboarding guide](docs/onboarding.md) for the complete
 workflow and four-root migration example.
 
-Add canonical artifacts below `catalog/`, then inspect everything before writing:
+Add canonical artifacts below `catalog/`. If an Instruction bundle declares
+Codex profiles, generate and drift-check those committed projections before
+normal validation:
 
 ```bash
+agentbridge instructions generate -c agentbridge.toml
+agentbridge instructions check -c agentbridge.toml
 agentbridge validate
 agentbridge doctor
 agentbridge plan
 ```
+
+`instructions generate` is the one Catalog-writing command in this sequence. It
+atomically creates or updates only declared profile outputs and refuses symlink
+destinations. `instructions check`, `validate`, `doctor`, and `plan` do not
+repair output drift. Commit the canonical Markdown, descriptor, and generated
+profile together.
 
 Apply standalone Skill links/copies, merge selected Settings, publish the local
 marketplace, and render per-target Schedule snapshots:
@@ -322,11 +339,14 @@ catalog/
 │       └── PROMPT.md            # prompt passed on standard input
 └── instructions/
     └── global-policy/
+        ├── projections.toml       # generated Codex profile declarations
         ├── claude-code/         # optional product overlay (no common/)
         │   ├── CLAUDE.md
         │   └── rules/git-workflow.md
         └── codex/
-            └── AGENTS.md
+            ├── AGENTS.md
+            ├── model-instructions/team-lead.md
+            └── team-lead.config.toml # generated; never hand-edit
 ```
 
 Instruction bundles have no `common/` overlay and are never merged: each
@@ -334,6 +354,29 @@ destination file below the product configuration home has exactly one owning
 bundle, and an existing unmanaged destination file is a conflict even when its
 content matches. Sources must be non-empty UTF-8 without BOM; content identity
 normalizes CRLF/CR to LF so a line-ending-only difference never reads as drift.
+
+`projections.toml` has the exact top-level schema below. Each entry has only
+`name` and `source`; names are portable lowercase kebab-case and sources are
+real, non-symlink, direct `codex/model-instructions/*.md` files:
+
+```toml
+schema_version = 1
+
+[[codex_profiles]]
+name = "team-lead"
+source = "codex/model-instructions/team-lead.md"
+```
+
+The generated `codex/team-lead.config.toml` contains comments plus exactly one
+TOML data key, `developer_instructions`, whose parsed value equals the
+LF-normalized Markdown source including its trailing newline. The source digest
+comment and bytes are deterministic. `projections.toml` is metadata and is
+never deployed. The generated profile is deployed to
+`<config_home>/team-lead.config.toml` through the existing Instruction
+ownership and backup lifecycle. Codex's base `<config_home>/config.toml` is
+never a permitted Instruction destination. Because checking is intentionally
+byte-strict, the Catalog's Git attributes must materialize generated
+`codex/*.config.toml` profiles with LF endings on every platform.
 
 `common/` is copied into each package, followed by only that product's overlay.
 Overlay files must be identical or non-overlapping; conflicting target files
@@ -381,7 +424,8 @@ for the schema and lifecycle.
 
 ## Safety model
 
-- `plan` and `doctor` never write Bridge or product state. `doctor` invokes the
+- `instructions check`, `validate`, `plan`, and `doctor` never write Catalog,
+  Bridge, or product state. `doctor` invokes the
   selected product executable with `--version`, so review explicit executable
   paths as code before running it.
 - Existing unmanaged destinations are conflicts, even when their content happens to match.

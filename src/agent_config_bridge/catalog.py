@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_config_bridge.instruction_profiles import (
+    InstructionProfileError,
+    check_instruction_profile_bundle,
+)
 from agent_config_bridge.models import BridgeConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point
 
@@ -45,6 +49,7 @@ _INSTRUCTION_ALLOWED_DIRS = {
     "codex": frozenset({"agents", "model-instructions"}),
 }
 _INSTRUCTION_DIRECT_MARKDOWN_DIRS = frozenset({"model-instructions"})
+_INSTRUCTION_PROJECTIONS_FILENAME = "projections.toml"
 _WINDOWS_DEVICE_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
@@ -350,7 +355,7 @@ def _validate_instructions(path: Path) -> None:
 
     allowed_roots = set(_INSTRUCTION_ALLOWED_ROOT_FILES)
     children = {child.name for child in path.iterdir()}
-    unknown = sorted(children - allowed_roots)
+    unknown = sorted(children - allowed_roots - {_INSTRUCTION_PROJECTIONS_FILENAME})
     if unknown:
         raise CatalogError(
             f"instruction bundle contains unsupported roots {', '.join(repr(name) for name in unknown)}: {path}"
@@ -359,17 +364,34 @@ def _validate_instructions(path: Path) -> None:
     if not overlays:
         raise CatalogError(f"instruction bundle must contain a codex/ or claude-code/ product overlay: {path}")
 
+    try:
+        projections = check_instruction_profile_bundle(path)
+    except InstructionProfileError as exc:
+        raise CatalogError(str(exc)) from exc
+    declared_codex_profiles = frozenset(projection.destination.name for projection in projections)
+
     for overlay in overlays:
         files = tuple(sorted(candidate for candidate in overlay.rglob("*") if not candidate.is_dir()))
         if not files:
             raise CatalogError(f"instruction product overlay contains no files: {overlay}")
         for file in files:
             relative = file.relative_to(overlay)
-            _validate_instruction_destination(relative, overlay.name, file)
+            _validate_instruction_destination(
+                relative,
+                overlay.name,
+                file,
+                declared_codex_profiles=declared_codex_profiles,
+            )
             _validate_instruction_content(file)
 
 
-def _validate_instruction_destination(relative: Path, product: str, file: Path) -> None:
+def _validate_instruction_destination(
+    relative: Path,
+    product: str,
+    file: Path,
+    *,
+    declared_codex_profiles: frozenset[str],
+) -> None:
     # Only the top-level segment needs allowlisting here: byte-level path
     # safety for every nested segment (Windows-invalid characters, reserved
     # device names, case-insensitive collisions) is guaranteed earlier by
@@ -379,6 +401,12 @@ def _validate_instruction_destination(relative: Path, product: str, file: Path) 
     if relative.name == _INSTRUCTION_ROOT_MARKER:
         raise CatalogError(f"instruction file name is reserved for bridge provenance markers: {file}")
     if len(parts) == 1:
+        if product == "codex" and relative.name.casefold().endswith(".config.toml"):
+            if relative.name.casefold() == "config.toml":
+                raise CatalogError(f"Codex base config.toml is never allowed as Instruction content: {file}")
+            if relative.name not in declared_codex_profiles:
+                raise CatalogError(f"undeclared generated Codex profile output: {file}")
+            return
         if parts[0] not in _INSTRUCTION_ALLOWED_ROOT_FILES[product]:
             raise CatalogError(
                 f"instruction destination {relative.as_posix()!r} is not allowed for {product} "

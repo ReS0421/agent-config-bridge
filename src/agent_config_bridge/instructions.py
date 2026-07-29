@@ -1,11 +1,12 @@
 """Per-file instruction deployment machinery (ADR-5).
 
 Instructions are always-loaded policy files (Claude ``CLAUDE.md``/``rules``/
-``agents``/``commands``, Codex ``AGENTS.md``/``agents``) deployed from
-``catalog/instructions/<bundle>/<product>/`` overlays to overlay-relative
-paths under a target ``config_home``. Delivery reuses the standalone Skill
-link/copy semantics at file granularity: Linux targets link, Windows targets
-receive managed copies, and removal touches only bridge-recorded files.
+``agents``/``commands``, Codex ``AGENTS.md``/``agents`` and generated
+developer-instruction profiles) deployed from
+``catalog/instructions/<bundle>/<product>/`` overlays to overlay-relative paths
+under a target ``config_home``. Delivery reuses the standalone Skill link/copy
+semantics at file granularity: Linux targets link, Windows targets receive
+managed copies, and removal touches only bridge-recorded files.
 
 Content identity normalizes CRLF/CR to LF (like Schedule prompts) so a
 line-ending-only difference between checkouts never reads as drift; the

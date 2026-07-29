@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-07-29
+
+### Added
+
+- Instruction bundles may declare strict version-1 Codex profile projections
+  from canonical direct `codex/model-instructions/*.md` sources. The new
+  `agentbridge instructions generate` command writes deterministic,
+  developer-instructions-only TOML profiles atomically, while
+  `agentbridge instructions check` performs a strictly read-only byte drift
+  check.
+
+### Security
+
+- Catalog discovery, validation, planning, and apply-time rediscovery now fail
+  closed on missing, stale, malformed, symlinked, undeclared, escaping, or
+  colliding profile outputs; the Codex base `config.toml`, extra TOML keys, and
+  blank or non-string instructions remain forbidden. Generated profiles use the
+  existing Instruction ownership and backup lifecycle, so an unmanaged runtime
+  destination is never adopted or overwritten.
+
 ## [0.3.3] - 2026-07-28
 
 ### Added
