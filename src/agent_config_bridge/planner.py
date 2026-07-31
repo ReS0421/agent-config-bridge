@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -13,6 +14,8 @@ from agent_config_bridge.filesystem import read_managed_marker, tree_digest
 from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
 from agent_config_bridge.instructions import (
     InstructionFile,
+    codex_profile_allows_runtime_hook_state,
+    inspect_instruction_copy,
     instruction_digest,
     instruction_files,
     instruction_source_id,
@@ -25,9 +28,10 @@ from agent_config_bridge.platforms import (
     product_home_environment_unsets,
 )
 from agent_config_bridge.renderer import (
-    marketplace_build_path,
-    marketplace_is_current,
+    MarketplaceSourceSnapshot,
+    capture_marketplace_sources,
     marketplace_publish_path,
+    published_marketplace_digest,
 )
 from agent_config_bridge.schedule_store import (
     read_schedule_set,
@@ -168,6 +172,7 @@ def build_plan(
     _validate_skill_root_reservations(enabled_targets, previous_skills_by_target)
     schedule_catalog = discover_schedules(config)
     settings_fragments = discover_settings_fragments(inventory.root)
+    marketplace_snapshot: MarketplaceSourceSnapshot | None = None
 
     for target_name in find_orphaned_target_states(config):
         warnings.append(
@@ -178,13 +183,16 @@ def build_plan(
     if any(
         Component.PLUGINS in target.components or Component.HOOKS in target.components for target in enabled_targets
     ):
-        build_path = marketplace_build_path(config, inventory, resolved=resolved)
+        marketplace_snapshot = capture_marketplace_sources(config, inventory, resolved=resolved)
+        build_path = config.state_dir / "builds" / marketplace_snapshot.digest
         publish_path = marketplace_publish_path(config)
         if not os.path.lexists(publish_path):
             disposition = Disposition.CREATE
         else:
             disposition = (
-                Disposition.NOOP if marketplace_is_current(config, inventory, resolved=resolved) else Disposition.UPDATE
+                Disposition.NOOP
+                if published_marketplace_digest(config) == marketplace_snapshot.digest
+                else Disposition.UPDATE
             )
         rendered_component = (
             Component.PLUGINS
@@ -343,9 +351,19 @@ def build_plan(
             # Review the product-wide union actually delivered to this target,
             # not just its own gated set — a same-product sibling target can
             # pull additional hooks into the shared plugin.
-            reviews.extend(_hook_reviews(target, resolved.hooks_for_product(config, target.product)))
+            if marketplace_snapshot is None:
+                raise AssertionError("Hook planning requires a marketplace source snapshot")
+            reviews.extend(
+                _hook_reviews(
+                    target,
+                    resolved.hooks_for_product(config, target.product),
+                    marketplace_snapshot,
+                )
+            )
         if Component.PLUGINS in target.components:
-            reviews.extend(_plugin_reviews(target, inventory))
+            if marketplace_snapshot is None:
+                raise AssertionError("Plugin planning requires a marketplace source snapshot")
+            reviews.extend(_plugin_reviews(target, inventory, marketplace_snapshot))
 
         if (
             target.product is Product.CLAUDE_CODE
@@ -1026,14 +1044,25 @@ def _plan_instruction_copy(
             disposition=Disposition.CONFLICT,
             detail="existing copy destination has no matching target ownership state",
         )
-    current_digest = instruction_digest(destination)
-    if current_digest != previous.installed_digest:
+    allows_runtime_state = codex_profile_allows_runtime_hook_state(
+        target.product,
+        instruction.relpath,
+    )
+    inspection = inspect_instruction_copy(
+        destination,
+        installed_digest=previous.installed_digest,
+        allow_runtime_hook_state=allows_runtime_state,
+    )
+    if not inspection.managed_matches:
         return replace(
             base,
             disposition=Disposition.CONFLICT,
             detail="managed instruction copy was modified after installation",
         )
-    if source_digest == current_digest:
+    permissions_are_private = (
+        not allows_runtime_state or os.name == "nt" or stat.S_IMODE(destination.stat().st_mode) == 0o600
+    )
+    if source_digest == previous.installed_digest and permissions_are_private:
         return replace(
             base,
             disposition=Disposition.NOOP,
@@ -1042,7 +1071,11 @@ def _plan_instruction_copy(
     return replace(
         base,
         disposition=Disposition.UPDATE,
-        detail="update unchanged managed instruction copy and retain backup",
+        detail=(
+            "repair managed Codex profile permissions and retain backup"
+            if source_digest == previous.installed_digest
+            else "update unchanged managed instruction copy and retain backup"
+        ),
     )
 
 
@@ -1113,7 +1146,14 @@ def _plan_instruction_removal(
             disposition=Disposition.CONFLICT,
             detail="previously managed instruction copy was replaced by another path type",
         )
-    if previous.installed_digest is None or instruction_digest(destination) != previous.installed_digest:
+    if (
+        previous.installed_digest is None
+        or not inspect_instruction_copy(
+            destination,
+            installed_digest=previous.installed_digest,
+            allow_runtime_hook_state=codex_profile_allows_runtime_hook_state(target.product, previous.relpath),
+        ).managed_matches
+    ):
         return replace(
             base,
             disposition=Disposition.CONFLICT,
@@ -1122,37 +1162,89 @@ def _plan_instruction_removal(
     return base
 
 
-def _hook_reviews(target: TargetConfig, hooks: tuple[Artifact, ...]) -> list[str]:
+def _hook_reviews(
+    target: TargetConfig,
+    hooks: tuple[Artifact, ...],
+    source_snapshot: MarketplaceSourceSnapshot,
+) -> list[str]:
     reviews: list[str] = []
     for artifact in hooks:
         for overlay in ("common", target.product.value):
-            path = artifact.path / overlay / "hooks.json"
-            if path.is_file():
-                reviews.extend(_hook_document_reviews(target.name, artifact.name, overlay, path))
+            relative = Path(overlay) / "hooks.json"
+            source_bytes = source_snapshot.file_bytes(Component.HOOKS, artifact.name, relative)
+            if source_bytes is not None:
+                reviews.extend(
+                    _hook_document_reviews(
+                        target.name,
+                        artifact.name,
+                        overlay,
+                        artifact.path / relative,
+                        source_bytes=source_bytes,
+                    )
+                )
     return reviews
 
 
-def _plugin_reviews(target: TargetConfig, inventory: CatalogInventory) -> list[str]:
+def _plugin_reviews(
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    source_snapshot: MarketplaceSourceSnapshot,
+) -> list[str]:
     reviews: list[str] = []
     for artifact in inventory.plugins:
+        files = source_snapshot.files(Component.PLUGINS, artifact.name)
         for overlay in ("common", target.product.value):
-            root = artifact.path / overlay
-            if not root.is_dir():
-                continue
-            for path in sorted(root.rglob("hooks.json")):
-                reviews.extend(_hook_document_reviews(target.name, artifact.name, overlay, path))
-            for path in sorted(root.rglob(".mcp.json")):
-                reviews.extend(_sensitive_json_reviews(target.name, artifact.name, "MCP", path))
+            overlay_files = tuple(
+                (relative, content) for relative, content in files if relative.parts and relative.parts[0] == overlay
+            )
+            for relative, source_bytes in overlay_files:
+                if relative.name == "hooks.json":
+                    reviews.extend(
+                        _hook_document_reviews(
+                            target.name,
+                            artifact.name,
+                            overlay,
+                            artifact.path / relative,
+                            source_bytes=source_bytes,
+                        )
+                    )
+            for relative, source_bytes in overlay_files:
+                if relative.name == ".mcp.json":
+                    reviews.extend(
+                        _sensitive_json_reviews(
+                            target.name,
+                            artifact.name,
+                            "MCP",
+                            artifact.path / relative,
+                            source_bytes=source_bytes,
+                        )
+                    )
             manifest_directory = ".codex-plugin" if target.product is Product.CODEX else ".claude-plugin"
-            manifest = root / manifest_directory / "plugin.json"
-            if manifest.is_file():
-                reviews.extend(_sensitive_json_reviews(target.name, artifact.name, "manifest", manifest))
+            manifest_relative = Path(overlay) / manifest_directory / "plugin.json"
+            manifest_bytes = source_snapshot.file_bytes(Component.PLUGINS, artifact.name, manifest_relative)
+            if manifest_bytes is not None:
+                reviews.extend(
+                    _sensitive_json_reviews(
+                        target.name,
+                        artifact.name,
+                        "manifest",
+                        artifact.path / manifest_relative,
+                        source_bytes=manifest_bytes,
+                    )
+                )
     return reviews
 
 
-def _hook_document_reviews(target: str, artifact: str, overlay: str, path: Path) -> list[str]:
+def _hook_document_reviews(
+    target: str,
+    artifact: str,
+    overlay: str,
+    path: Path,
+    *,
+    source_bytes: bytes | None = None,
+) -> list[str]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes() if source_bytes is None else source_bytes)
     except (OSError, json.JSONDecodeError):
         return [f"{target}: inspect unreadable hook document {path}"]
     hooks = payload.get("hooks") if isinstance(payload, dict) else None
@@ -1177,17 +1269,29 @@ def _hook_document_reviews(target: str, artifact: str, overlay: str, path: Path)
                 if not isinstance(handler, dict):
                     continue
                 handler_type = handler.get("type", "unknown")
-                executable = handler.get("command") or handler.get("url") or handler.get("prompt") or "<inline>"
-                reviews.append(
-                    f"{target}: hook {artifact}/{overlay} event={event} matcher={matcher!r} "
-                    f"type={handler_type!r} handler={executable!r}"
-                )
+                review_values = tuple(
+                    (field, handler[field])
+                    for field in ("command", "commandWindows", "url", "prompt")
+                    if field in handler
+                ) or (("handler", "<inline>"),)
+                for field, value in review_values:
+                    reviews.append(
+                        f"{target}: hook {artifact}/{overlay} event={event} matcher={matcher!r} "
+                        f"type={handler_type!r} {field}={value!r}"
+                    )
     return reviews
 
 
-def _sensitive_json_reviews(target: str, artifact: str, kind: str, path: Path) -> list[str]:
+def _sensitive_json_reviews(
+    target: str,
+    artifact: str,
+    kind: str,
+    path: Path,
+    *,
+    source_bytes: bytes | None = None,
+) -> list[str]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes() if source_bytes is None else source_bytes)
     except (OSError, json.JSONDecodeError):
         return [f"{target}: inspect invalid {kind} JSON for plugin {artifact}: {path}"]
 

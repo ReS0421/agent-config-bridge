@@ -17,6 +17,7 @@ from agent_config_bridge.instructions import (
     apply_instruction_copy,
     apply_instruction_link,
     apply_instruction_remove,
+    codex_profile_allows_runtime_hook_state,
     instruction_digest,
     instruction_files,
     instruction_source_id,
@@ -301,7 +302,14 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                         )
                     )
                 else:
-                    marketplace = render_marketplace(config, inventory, resolved=resolved)
+                    if action.source_digest is None:
+                        raise ApplyError("marketplace action is missing its reviewed source digest")
+                    marketplace = render_marketplace(
+                        config,
+                        inventory,
+                        resolved=resolved,
+                        expected_digest=action.source_digest,
+                    )
             continue
         if action.disposition not in {Disposition.CREATE, Disposition.UPDATE, Disposition.REMOVE}:
             continue
@@ -322,7 +330,14 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     )
                 )
             else:
-                marketplace = render_marketplace(config, inventory, resolved=resolved)
+                if action.source_digest is None:
+                    raise ApplyError("marketplace action is missing its reviewed source digest")
+                marketplace = render_marketplace(
+                    config,
+                    inventory,
+                    resolved=resolved,
+                    expected_digest=action.source_digest,
+                )
         elif action.operation is Operation.PATCH:
             if action.component is not Component.SETTINGS:
                 raise ApplyError(f"unsupported patch component: {action.component.value}")
@@ -362,6 +377,10 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     target_name=action.target,
                     relpath=action.name,
                     update=action.disposition is Disposition.UPDATE,
+                    allow_runtime_hook_state=codex_profile_allows_runtime_hook_state(
+                        targets_by_name[action.target].product,
+                        action.name,
+                    ),
                 )
             else:
                 backup = apply_copy(
@@ -404,6 +423,10 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     target_name=action.target,
                     relpath=action.name,
                     windows_path_semantics=windows_path_semantics,
+                    allow_runtime_hook_state=codex_profile_allows_runtime_hook_state(
+                        target.product,
+                        action.name,
+                    ),
                 )
             else:
                 backup = apply_remove(

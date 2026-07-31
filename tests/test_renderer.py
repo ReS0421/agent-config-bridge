@@ -10,7 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_config_bridge.catalog import discover_catalog
+from agent_config_bridge import renderer as renderer_module
+from agent_config_bridge.catalog import Artifact, CatalogError, discover_catalog
 from agent_config_bridge.models import Component, Product
 from agent_config_bridge.renderer import (
     RenderError,
@@ -63,6 +64,84 @@ def test_render_marketplace_builds_both_product_catalogs(tmp_path: Path) -> None
     assert codex_hooks == claude_hooks
     assert (codex_hook_plugin / "scripts/audit-event/allow.py").is_file()
     assert (claude_hook_plugin / "scripts/audit-event/allow.py").is_file()
+
+
+def test_render_hook_plugin_adds_only_the_selected_product_overlay(tmp_path: Path) -> None:
+    """Shared groups remain additive while product-specific groups stay isolated."""
+
+    catalog = make_catalog(tmp_path / "catalog", hooks=("native-event",))
+    hook_root = catalog / "hooks/native-event"
+    common_document = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "shared",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "python shared.py",
+                            "commandWindows": "py shared.py",
+                            "timeout": 5,
+                            "statusMessage": "Loading shared context",
+                            "additionalContextLimit": 0,
+                            "async": False,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    (hook_root / "common/hooks.json").write_text(json.dumps(common_document), encoding="utf-8")
+    overlays = {
+        "codex": ("codex-only", "python codex.py"),
+        "claude-code": ("claude-only", "python claude.py"),
+    }
+    for product, (matcher, command) in overlays.items():
+        overlay = hook_root / product
+        (overlay / "scripts").mkdir(parents=True)
+        (overlay / "scripts" / f"{matcher}.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+        (overlay / "hooks.json").write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "matcher": matcher,
+                                "hooks": [{"type": "command", "command": command}],
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    components = frozenset({Component.HOOKS})
+    config = make_config(tmp_path, catalog, components=components)
+    claude_target = replace(
+        config.targets[0],
+        name="claude",
+        product=Product.CLAUDE_CODE,
+        config_home=tmp_path / "home/.claude",
+    )
+    config = replace(config, targets=(config.targets[0], claude_target))
+
+    rendered = render_marketplace(config, discover_catalog(config))
+
+    product_expectations = {
+        "codex": ("codex-only", "claude-only"),
+        "claude-code": ("claude-only", "codex-only"),
+    }
+    for product, (included, excluded) in product_expectations.items():
+        plugin = rendered.root / "plugins" / product / "agent-config-bridge-hooks"
+        document = json.loads((plugin / "hooks/hooks.json").read_text(encoding="utf-8"))
+        groups = document["hooks"]["SessionStart"]
+        assert [group["matcher"] for group in groups] == ["shared", included]
+        assert groups[0]["hooks"][0]["commandWindows"] == "py shared.py"
+        assert groups[0]["hooks"][0]["statusMessage"] == "Loading shared context"
+        assert groups[0]["hooks"][0]["additionalContextLimit"] == 0
+        assert groups[0]["hooks"][0]["async"] is False
+        assert (plugin / f"scripts/native-event/{included}.py").is_file()
+        assert not (plugin / f"scripts/native-event/{excluded}.py").exists()
 
 
 def test_rendered_hook_plugin_includes_governed_attribution(tmp_path: Path) -> None:
@@ -361,6 +440,67 @@ def test_render_marketplace_allows_identical_file_in_both_overlays(tmp_path: Pat
     rendered = render_marketplace(config, discover_catalog(config))
 
     assert (rendered.root / "plugins/codex/shared-plugin/shared.txt").read_text(encoding="utf-8") == "same\n"
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_render_marketplace_materializes_frozen_contained_file_symlink(
+    tmp_path: Path,
+    absolute: bool,
+) -> None:
+    """Contained source links render from their captured target entry bytes."""
+
+    catalog = make_catalog(tmp_path / "catalog", plugins=("shared-plugin",))
+    common = catalog / "plugins/shared-plugin/common"
+    target = common / "assets/actual.txt"
+    target.parent.mkdir()
+    target.write_text("captured target\n", encoding="utf-8")
+    link = common / "alias.txt"
+    try:
+        link.symlink_to(target.resolve() if absolute else Path("assets/actual.txt"))
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    config = make_config(tmp_path, catalog, components=frozenset({Component.PLUGINS}))
+
+    rendered = render_marketplace(config, discover_catalog(config))
+
+    alias = rendered.root / "plugins/codex/shared-plugin/alias.txt"
+    assert alias.read_text(encoding="utf-8") == "captured target\n"
+    assert not alias.is_symlink()
+
+
+def test_marketplace_digest_rejects_invalid_frozen_plugin_manifest_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live-valid manifest cannot authorize invalid bytes captured by freeze."""
+
+    catalog = make_catalog(tmp_path / "catalog", plugins=("shared-plugin",))
+    config = make_config(tmp_path, catalog, components=frozenset({Component.PLUGINS}))
+    inventory = discover_catalog(config)
+    manifest = catalog / "plugins/shared-plugin/codex/.codex-plugin/plugin.json"
+    original_bytes = manifest.read_bytes()
+    payload = json.loads(original_bytes)
+    payload["version"] = "not-semver"
+    invalid_bytes = json.dumps(payload).encode()
+    original_freeze = renderer_module._freeze_artifact_tree
+    freeze_calls = 0
+
+    def freeze_invalid_b_then_restore_a(artifact: Artifact) -> renderer_module._FrozenArtifactTree:
+        nonlocal freeze_calls
+        freeze_calls += 1
+        manifest.write_bytes(invalid_bytes)
+        try:
+            return original_freeze(artifact)
+        finally:
+            manifest.write_bytes(original_bytes)
+
+    monkeypatch.setattr(renderer_module, "_freeze_artifact_tree", freeze_invalid_b_then_restore_a)
+
+    with pytest.raises(CatalogError, match="strict SemVer"):
+        marketplace_digest(config, inventory)
+
+    assert freeze_calls == 1
+    assert manifest.read_bytes() == original_bytes
 
 
 def test_render_marketplace_rejects_cross_overlay_windows_file_alias(tmp_path: Path) -> None:

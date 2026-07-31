@@ -44,7 +44,9 @@ Everything else is excluded. Never copy or link:
 - OAuth tokens, API keys, credential stores, cookies, or connector secrets;
 - session transcripts, conversation history, memories, checkpoints, or task
   databases;
-- trust hashes, Hook approvals, workspace-trust decisions, or permission grants;
+- trust hashes, Hook approvals, workspace-trust decisions, or permission grants
+  as Catalog inputs or state synchronized between homes (the same-file,
+  destination-only preservation exception is defined below);
 - private Codex/Claude Desktop scheduler databases, Claude loop session state,
   or Remote Routine account state;
 - telemetry, logs, caches, Plugin install caches, temporary product files, or
@@ -63,6 +65,31 @@ cannot set a model, permission, sandbox, MCP, approval, tool, or other Codex
 setting because any TOML data key besides `developer_instructions` is rejected.
 The instruction text itself grants no authority and does not bypass product
 approval, sandbox, managed-policy, or tool controls.
+
+Codex may append its own Hook trust decisions to a deployed generated profile
+COPY. This destination-only exception does not widen the Catalog schema:
+generation and discovery still require exactly `developer_instructions`.
+Bridge planning accepts only a suffix whose parsed data is exactly
+`hooks.state`, with non-empty child identifiers whose sole leaf is
+`trusted_hash = "sha256:<64 lowercase hexadecimal digits>"`. The Bridge never
+creates, grants, edits, or synchronizes those entries. It preserves a validated
+suffix byte-for-byte during managed updates and in Instruction backups; any
+other added data or malformed state remains a conflict. The literal
+`[hooks.state]` header must begin at column zero on its own line without a
+trailing comment; alternate TOML header formatting is intentionally outside
+the accepted subset. The exception does not apply to unmanaged files,
+symlinks, other Instructions, or base `config.toml`. On POSIX, generated Codex
+profile copies and their retained backups are created or repaired to mode
+`0600`; on Windows, inherited ACLs remain authoritative. Update/removal bind
+parsing, the exact digest, and file identity to one descriptor observation,
+then revalidate the exact atomically displaced bytes. The displaced file keeps
+a private local name while its backup is created and while a replacement is
+published and checked. Hard links are used when supported; cross-filesystem or
+unsupported-link paths use verified exclusive copies. Recovery never removes
+or overwrites an occupied active destination. An absent destination is restored
+only by no-replace hard link or exclusive creation; a concurrent creator wins
+while the old candidates remain available and the operation fails closed.
+See [ADR-0007](adr/0007-preserve-codex-profile-hook-trust-state.md).
 
 This remains true even if vendor tools can be pointed at one home. Dedicated
 credential-management or whole-home synchronization is outside this project's
@@ -89,9 +116,12 @@ canonical catalog. Configuration loading rejects physical equal/nested overlap
 between generated state, the canonical catalog, enabled product homes, and
 Skill discovery roots, including symlink aliases and Windows case variants.
 
-The bridge never writes product auth, session, conversation, trust, or cache
-state there. Ownership records contain artifact identities, paths, link/copy
-modes, and content/value digests, not credentials or displaced Settings values.
+The bridge never originates product auth, session, conversation, trust, or
+cache state there. Ownership records contain artifact identities, paths,
+link/copy modes, and content/value digests, not credentials or displaced
+Settings values. A retained generated-profile Instruction backup can contain
+Codex-owned Hook trust state already present in the displaced runtime file; the
+Bridge preserves those opaque bytes but does not interpret them as authority.
 
 On POSIX, newly created ownership files, Schedule snapshots/runtime files, and
 new vendor Settings files use mode `0600`; bridge-managed state/runtime
@@ -128,7 +158,9 @@ Implemented validation includes:
   dots/spaces, and case-insensitive sibling collisions;
 - exact `SKILL.md` entry points and basic portable frontmatter requirements;
 - required product Plugin manifests, matching names, and matching strict SemVer;
-- Hook matcher/handler structure and a strict-SemVer `hooks/.version`;
+- Hook matcher/handler structure, typed `commandWindows`,
+  `additionalContextLimit`, `statusMessage`, and `async` handler fields, and a
+  strict-SemVer `hooks/.version`;
 - strict native Settings documents, unique owned leaf paths, and rejection of
   symlinked or special fragment files;
 - exact Schedule file sets, bounded source sizes, numeric five-field cron,
@@ -249,21 +281,44 @@ digest mismatches:
   `AGENTS.md`, `CLAUDE.md`, and generated Codex profiles remain attributable
   through per-target `instructions.json` state because their product root
   cannot carry a marker;
-- before managed-copy update/removal, a non-destructive final backup snapshot is
-  created below `state_dir/backups` and verified by marker, source identity, and
-  installed digest;
-- the live destination is revalidated after snapshot creation and immediately
-  before mutation; drift aborts without beginning the swap;
-- updates install through a same-filesystem destination swap only after the
-  backup is verified; handled install failures atomically restore that swap;
-- removals also use a same-filesystem swap. A partially deleted swap is never
-  restored: the destination is reconstructed through a fresh same-filesystem
-  restore staging path from the retained, reverified backup, which is not
-  consumed;
+- a managed generated Codex profile COPY may have only the closed, validated
+  provider-owned `hooks.state` suffix described above; drift checks ignore that
+  suffix, updates preserve it byte-for-byte, and any broader runtime data fails
+  closed;
+- generated-profile updates capture managed parsing, the exact old bytes, and
+  old-file identity in one descriptor-backed observation, keep the exact
+  displaced old file named while retaining and validating its backup, and
+  recheck it after replacement publication;
+- Instruction backup, installation, and absent-path recovery use a no-replace
+  hard link when supported and an exact, exclusively created byte copy
+  otherwise. Recovery never unlinks an occupied active path, so a raced
+  destination and the recoverable old candidates are preserved together;
+- before a managed Skill-copy update/removal, a non-destructive final backup
+  snapshot is created below `state_dir/backups` and verified by marker, source
+  identity, and installed digest;
+- the live Skill destination is revalidated after snapshot creation and
+  immediately before mutation; drift aborts without beginning the swap;
+- managed Instruction-copy update/removal instead revalidates one exact
+  descriptor observation, renames that destination to a private sibling as its
+  first namespace mutation, verifies the displaced bytes and identity, and
+  only then retains the final backup from that displaced file;
+- managed Skill-copy updates install through a same-filesystem destination swap
+  only after the backup is verified; handled install failures atomically restore
+  that Skill swap;
+- managed Skill-copy removals also use a same-filesystem swap. A partially
+  deleted Skill swap is never restored: the destination is reconstructed
+  through a fresh same-filesystem restore staging path from the retained,
+  reverified backup, which is not consumed;
 - managed Instruction updates and removals retain their own verified snapshots
   below `state_dir/backups/<target>/instructions/`; retention pruning excludes
   that tree, and backups never confer ownership over a live destination;
-- marketplace builds are immutable and content-addressed;
+- marketplace builds are immutable and content-addressed; selected Plugin/Hook
+  trees are frozen first and privately materialized for the same artifact-tree,
+  Plugin manifest, and Hook document validation used by Catalog discovery. The
+  action digest and human review text, including distinct `command` and
+  `commandWindows` items, are derived from those same validated entries;
+  apply/register require a fresh validated snapshot to hash to that reviewed
+  digest, and only the matching snapshot is rendered;
 - the published marketplace is rehashed before reuse/replacement, copied through
   a temporary sibling, and checked before publication;
 - ownership state paths are target-scoped and reject a parent symlink that would
@@ -294,9 +349,20 @@ Current alpha limitations matter for threat modeling:
 - a future generation token is an object-identity aid, not authorization
   against a same-account actor that can directly rewrite or delete Bridge
   state; that actor remains outside the retention race-safety boundary;
-- Instruction backups and automatic restore remain out of scope;
+- transaction-wide Instruction recovery after process interruption remains out
+  of scope; the update/remove paths provide only localized fail-closed recovery;
+- Instruction copy, backup, and install checks do not fsync their file contents
+  or parent directories and make no power-loss durability guarantee;
 - the implementation does not provide comprehensive no-follow/reparse-point
   protection against every concurrent filesystem race on POSIX, Windows, or WSL.
+
+Path replacement also cannot revoke a writable descriptor that another
+same-user process opened beforehand. Instruction update checks detect changes
+visible before the final old-inode and backup checks. A same-filesystem
+hard-linked backup continues to receive writes to that inode. A
+cross-filesystem byte-copy backup cannot receive a write made after the final
+old-inode check and local-name cleanup. Direct same-user replacement or deletion
+of Bridge private candidates is likewise outside this retention boundary.
 
 After an interrupted operation, inspect a fresh `plan`. Restore a retained
 managed-copy backup manually only after reviewing both the destination and

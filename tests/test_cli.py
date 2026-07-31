@@ -12,12 +12,14 @@ from unittest.mock import Mock
 import pytest
 
 from agent_config_bridge import cli, marketplace_registry
-from agent_config_bridge.catalog import discover_catalog
+from agent_config_bridge import renderer as renderer_module
+from agent_config_bridge.catalog import Artifact, CatalogError, discover_catalog
 from agent_config_bridge.config import load_config
 from agent_config_bridge.marketplace_registry import MarketplaceRegistryError
 from agent_config_bridge.models import Platform, Product
 from agent_config_bridge.planner import CommandHint, build_plan
 from agent_config_bridge.platforms import current_platform
+from agent_config_bridge.renderer import RenderError
 from agent_config_bridge.retention import (
     RetentionAction,
     RetentionBlocker,
@@ -653,6 +655,132 @@ def test_register_requires_confirmation_before_running_product_commands(
 
     assert cli.main(["register", "--config", str(config_path), "--target", "local"]) == 2
     run.assert_not_called()
+
+
+def test_register_rejects_stale_hook_source_before_first_product_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Register rechecks reviewed Hook sources before rendering or invoking a provider."""
+
+    make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config_path = _write_config(tmp_path, components=("hooks",))
+    config = load_config(config_path)
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    hook = tmp_path / "catalog/hooks/native-event/common/hooks.json"
+    payload = json.loads(hook.read_text(encoding="utf-8"))
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "python changed-before-register.py"
+    hook.write_text(json.dumps(payload), encoding="utf-8")
+    run = Mock(side_effect=AssertionError("stale Hook plans must not invoke a product command"))
+    render = Mock(side_effect=AssertionError("stale Hook plans must fail before render"))
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "render_marketplace", render)
+
+    with pytest.raises(cli.ConfigError, match="review a fresh plan"):
+        cli._command_register(config, inventory, plan, ("local",), True)
+
+    render.assert_not_called()
+    run.assert_not_called()
+
+
+def test_register_never_renders_or_invokes_transient_hook_source_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registration stops before rendering or invoking reviewed A -> B -> A."""
+
+    make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config_path = _write_config(tmp_path, components=("hooks",))
+    config = load_config(config_path)
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    hook = tmp_path / "catalog/hooks/native-event/common/hooks.json"
+    original_bytes = hook.read_bytes()
+    payload = json.loads(original_bytes)
+    transient_command = "python transient-b-must-never-run.py"
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["command"] = transient_command
+    transient_bytes = json.dumps(payload).encode()
+    original_freeze = renderer_module._freeze_artifact_tree
+    freeze_calls = 0
+    injected = False
+
+    def freeze_with_source_aba(artifact: Artifact) -> renderer_module._FrozenArtifactTree:
+        nonlocal freeze_calls, injected
+        freeze_calls += 1
+        if freeze_calls == 2 and artifact.name == "native-event":
+            hook.write_bytes(transient_bytes)
+            try:
+                return original_freeze(artifact)
+            finally:
+                hook.write_bytes(original_bytes)
+                injected = True
+        return original_freeze(artifact)
+
+    run = Mock(side_effect=AssertionError("transient Hook B must not invoke a product command"))
+    unexpected_render = Mock(side_effect=AssertionError("digest-mismatched B must not reach Hook rendering"))
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(renderer_module, "_freeze_artifact_tree", freeze_with_source_aba)
+    monkeypatch.setattr(renderer_module, "_render_hook_plugin", unexpected_render)
+
+    with pytest.raises(RenderError, match="reviewed marketplace digest"):
+        cli._command_register(config, inventory, plan, ("local",), True)
+
+    assert injected is True
+    assert freeze_calls == 2
+    assert hook.read_bytes() == original_bytes
+    unexpected_render.assert_not_called()
+    run.assert_not_called()
+    assert not (config.state_dir / "marketplace").exists()
+    assert not any(
+        transient_command.encode() in path.read_bytes() for path in config.state_dir.rglob("*") if path.is_file()
+    )
+
+
+def test_register_rejects_invalid_frozen_hook_snapshot_before_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registration rejects frozen invalid B even when live Catalog A is valid."""
+
+    make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config_path = _write_config(tmp_path, components=("hooks",))
+    config = load_config(config_path)
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    hook = tmp_path / "catalog/hooks/native-event/common/hooks.json"
+    original_bytes = hook.read_bytes()
+    payload = json.loads(original_bytes)
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["async"] = "NOT_A_BOOLEAN"
+    invalid_bytes = json.dumps(payload).encode()
+    original_freeze = renderer_module._freeze_artifact_tree
+    freeze_calls = 0
+
+    def freeze_invalid_b_then_restore_a(artifact: Artifact) -> renderer_module._FrozenArtifactTree:
+        nonlocal freeze_calls
+        if artifact.name == "native-event":
+            freeze_calls += 1
+            hook.write_bytes(invalid_bytes)
+            try:
+                return original_freeze(artifact)
+            finally:
+                hook.write_bytes(original_bytes)
+        return original_freeze(artifact)
+
+    run = Mock(side_effect=AssertionError("invalid frozen Hook B must not invoke a product command"))
+    unexpected_render = Mock(side_effect=AssertionError("invalid frozen Hook B must not reach rendering"))
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "render_marketplace", unexpected_render)
+    monkeypatch.setattr(renderer_module, "_freeze_artifact_tree", freeze_invalid_b_then_restore_a)
+
+    with pytest.raises(CatalogError, match="hook async.*boolean"):
+        cli._command_register(config, inventory, plan, ("local",), True)
+
+    assert freeze_calls == 1
+    assert hook.read_bytes() == original_bytes
+    unexpected_render.assert_not_called()
+    run.assert_not_called()
+    assert not (config.state_dir / "marketplace").exists()
 
 
 def test_register_confirmed_passes_scoped_home_to_product_commands(

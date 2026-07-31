@@ -200,6 +200,18 @@ not change the product launch command or select a profile automatically. It
 never projects `<config_home>/config.toml` through Instructions and does not
 claim support for analogous Claude Code profile TOML.
 
+A managed regular-file COPY of that generated root profile may contain a
+provider-owned `[hooks.state]` suffix after Codex records Hook approvals. The
+Bridge accepts only non-empty child identifiers with exactly one lowercase
+SHA-256 `trusted_hash` leaf, preserves the validated suffix byte-for-byte on
+update and backup, and never creates or edits trust. The `[hooks.state]` header
+must begin at column zero on its own line without a trailing comment. Any other
+extra data, alternate header formatting, other Instruction destination,
+symlink, or unmanaged file remains a conflict. On POSIX, apply creates or
+repairs managed profile copies and their retained backups to `0600`. On
+Windows, inherited ACLs are authoritative; POSIX-style mode assertions are not
+an ACL substitute.
+
 An unmanaged destination conflicts even when its bytes match. Bridge-managed
 files are attributed by target-scoped `instructions.json` ownership state and,
 for managed directories, `AGENTBRIDGE-MANAGED.json`. Root-level `AGENTS.md` and
@@ -343,9 +355,11 @@ an explicit interpreter and use product metadata for execution intent.
 This portable content rule is distinct from local state confidentiality. On
 POSIX, the bridge restricts new ownership files, Schedule snapshots/runtime
 files, and new Settings files to `0600`, with managed state/runtime directories
-at `0700`; existing Settings files retain their mode. Windows POSIX-style mode
-bits do not prove a private DACL, so Windows deployments rely on inherited ACLs
-and should use user-private locations for product homes and `state_dir`.
+at `0700`; generated Codex profile copies and their retained backups are also
+created or repaired to `0600`, while existing Settings files retain their mode.
+Windows POSIX-style mode bits do not prove a private DACL, so Windows
+deployments rely on inherited ACLs and should use user-private locations for
+product homes and `state_dir`.
 
 ## Ownership and reconciliation
 
