@@ -576,7 +576,10 @@ def _chmod_regular_file_identity(
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != expected_identity:
             raise FilesystemError(f"managed instruction file changed before permission repair: {path}")
-        os.fchmod(descriptor, mode)
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is None:
+            raise FilesystemError("descriptor-bound permission repair is unavailable on this platform")
+        fchmod(descriptor, mode)
         repaired = os.fstat(descriptor)
         if (
             not stat.S_ISREG(repaired.st_mode)
