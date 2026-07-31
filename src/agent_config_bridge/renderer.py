@@ -22,7 +22,7 @@ from agent_config_bridge.catalog import (
 )
 from agent_config_bridge.governance import GovernanceReport, ResolvedInventory, resolve_inventory
 from agent_config_bridge.models import BridgeConfig, Component, Product
-from agent_config_bridge.path_safety import is_directory_reparse_point
+from agent_config_bridge.path_safety import is_directory_reparse_point, target_path_comparison_key
 
 __all__ = [
     "MarketplaceSourceSnapshot",
@@ -588,13 +588,12 @@ def _resolve_frozen_link_target(
         raw_target = Path(current.link_target)
         candidate = raw_target if raw_target.is_absolute() else root / current.relative.parent / raw_target
         normalized = Path(os.path.normpath(candidate))
-        try:
-            relative = normalized.relative_to(root)
-        except ValueError as exc:
+        relative = _frozen_relative_to_root(normalized, root)
+        if relative is None:
             raise RenderError(
                 f"source symlink escapes artifact root in frozen snapshot: "
                 f"{root / current.relative} -> {current.link_target}"
-            ) from exc
+            )
         matched = _frozen_entry_at(entries, relative)
         if matched is None:
             raise RenderError(
@@ -610,6 +609,24 @@ def _resolve_frozen_link_target(
                 f"{root / current.relative} -> {current.link_target}"
             )
         current = target
+
+
+def _frozen_relative_to_root(candidate: Path, root: Path) -> Path | None:
+    """Return a lexical contained path without reopening frozen source names."""
+
+    if os.name != "nt":
+        try:
+            return candidate.relative_to(root)
+        except ValueError:
+            return None
+
+    root_key = target_path_comparison_key(os.fspath(root), windows=True).rstrip("/")
+    candidate_key = target_path_comparison_key(os.fspath(candidate), windows=True)
+    prefix = root_key + "/"
+    if not candidate_key.startswith(prefix):
+        return None
+    suffix = candidate_key[len(prefix) :]
+    return Path(*suffix.split("/"))
 
 
 def _frozen_entry_at(
