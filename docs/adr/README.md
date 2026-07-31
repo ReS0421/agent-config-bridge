@@ -15,6 +15,7 @@ decision.
 | [0004](0004-manage-declarative-settings-by-owned-leaf.md)    | Manage declarative settings by owned leaf | Accepted | 2026-07-14 |
 | [0005](0005-use-host-scheduler-adapters.md)                  | Use host scheduler adapters               | Accepted | 2026-07-14 |
 | [0006](0006-generate-codex-instruction-profiles.md)          | Generate Codex instruction profiles       | Accepted | 2026-07-29 |
+| [0007](0007-preserve-codex-profile-hook-trust-state.md)      | Preserve Codex profile Hook trust state   | Accepted | 2026-07-30 |
 
 ## Statuses
 

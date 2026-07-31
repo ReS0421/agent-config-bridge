@@ -25,6 +25,7 @@ __all__ = [
     "CatalogInventory",
     "discover_catalog",
     "is_windows_portable_path_component",
+    "validate_marketplace_inventory",
 ]
 
 _ARTIFACT_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
@@ -118,6 +119,42 @@ def discover_catalog(config: BridgeConfig) -> CatalogInventory:
         schedules=schedules,
         hook_version=hook_version,
         instructions=instructions,
+    )
+
+
+def validate_marketplace_inventory(inventory: CatalogInventory) -> CatalogInventory:
+    """Validate one materialized Plugin/Hook snapshot under Catalog contracts.
+
+    The caller supplies an isolated tree produced from already-frozen bytes.
+    Validation deliberately discovers only that tree and never reopens the
+    live Catalog paths represented by the original inventory.
+    """
+
+    root = _strict_resolve(inventory.root, "materialized marketplace snapshot")
+    if not root.is_dir():
+        raise CatalogError(f"materialized marketplace snapshot is not a directory: {inventory.root}")
+    plugins = _discover_group(root / "plugins", root, _validate_plugin)
+    hooks = _discover_group(root / "hooks", root, _validate_hook)
+    expected_plugins = tuple(artifact.name for artifact in inventory.plugins)
+    expected_hooks = tuple(artifact.name for artifact in inventory.hooks)
+    if tuple(artifact.name for artifact in plugins) != expected_plugins:
+        raise CatalogError("materialized marketplace Plugin inventory does not match its frozen selection")
+    if tuple(artifact.name for artifact in hooks) != expected_hooks:
+        raise CatalogError("materialized marketplace Hook inventory does not match its frozen selection")
+    hook_version = _validate_hook_version_value(
+        inventory.hook_version,
+        root / "hooks" / ".version",
+        required=bool(hooks),
+    )
+    return CatalogInventory(
+        root=root,
+        skills=(),
+        plugins=plugins,
+        hooks=hooks,
+        settings=(),
+        schedules=(),
+        hook_version=hook_version,
+        instructions=(),
     )
 
 
@@ -281,6 +318,22 @@ def _validate_hook_groups(hooks: dict[Any, Any], path: Path) -> None:
                     isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
                 ):
                     raise CatalogError(f"hook timeout for event {event!r} must be a positive number: {path}")
+                command_windows = handler.get("commandWindows")
+                if "commandWindows" in handler and (not isinstance(command_windows, str) or not command_windows):
+                    raise CatalogError(f"hook commandWindows for event {event!r} must be a non-empty string: {path}")
+                context_limit = handler.get("additionalContextLimit")
+                if "additionalContextLimit" in handler and (
+                    isinstance(context_limit, bool) or not isinstance(context_limit, int) or context_limit < 0
+                ):
+                    raise CatalogError(
+                        f"hook additionalContextLimit for event {event!r} must be a non-negative integer: {path}"
+                    )
+                status_message = handler.get("statusMessage")
+                if "statusMessage" in handler and not isinstance(status_message, str):
+                    raise CatalogError(f"hook statusMessage for event {event!r} must be a string: {path}")
+                async_handler = handler.get("async")
+                if "async" in handler and not isinstance(async_handler, bool):
+                    raise CatalogError(f"hook async for event {event!r} must be a boolean: {path}")
 
 
 def _validate_settings(path: Path) -> None:
@@ -503,7 +556,20 @@ def _read_hook_version(group: Path, catalog_root: Path, *, required: bool) -> st
         version = resolved.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise CatalogError(f"cannot read hooks .version file {version_file}: {exc}") from exc
-    if not _SEMVER.fullmatch(version):
+    return _validate_hook_version_value(version, version_file, required=required)
+
+
+def _validate_hook_version_value(
+    version: str | None,
+    version_file: Path,
+    *,
+    required: bool,
+) -> str | None:
+    if version is None:
+        if required:
+            raise CatalogError(f"hooks catalog is missing required strict-SemVer .version file: {version_file}")
+        return None
+    if not isinstance(version, str) or not _SEMVER.fullmatch(version):
         raise CatalogError(f"hooks .version must contain strict SemVer: {version_file}")
     return version
 

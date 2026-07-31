@@ -920,7 +920,19 @@ def _command_register(
     if _scheduler_review_keys(fresh_scheduler_registrations) != _scheduler_review_keys(scheduler_registrations):
         raise ConfigError("host scheduler state changed; review a fresh registration plan")
     if commands:
-        render_marketplace(config, fresh_inventory, resolved=fresh_resolved)
+        marketplace_action = next(
+            (action for action in fresh_plan.actions if action.target == "marketplace"),
+            None,
+        )
+        if marketplace_action is not None:
+            if marketplace_action.source_digest is None:
+                raise ConfigError("registration plan is missing its reviewed marketplace source digest")
+            render_marketplace(
+                config,
+                fresh_inventory,
+                resolved=fresh_resolved,
+                expected_digest=marketplace_action.source_digest,
+            )
 
     commands_by_target: dict[str, tuple[CommandHint, ...]] = {}
     for name in sorted(target_names):

@@ -7,20 +7,28 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from agent_config_bridge.catalog import Artifact, CatalogInventory, discover_catalog
+from agent_config_bridge.catalog import (
+    Artifact,
+    CatalogInventory,
+    discover_catalog,
+    validate_marketplace_inventory,
+)
 from agent_config_bridge.governance import GovernanceReport, ResolvedInventory, resolve_inventory
 from agent_config_bridge.models import BridgeConfig, Component, Product
-from agent_config_bridge.path_safety import is_directory_reparse_point
+from agent_config_bridge.path_safety import is_directory_reparse_point, target_path_comparison_key
 
 __all__ = [
+    "MarketplaceSourceSnapshot",
     "RenderError",
     "RenderedMarketplace",
+    "capture_marketplace_sources",
     "marketplace_build_path",
     "marketplace_digest",
     "marketplace_is_current",
@@ -50,10 +58,90 @@ class RenderedMarketplace:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketplaceSourceSnapshot:
+    """Exact selected source entries that define one reviewed marketplace."""
+
+    digest: str
+    _trees: tuple[tuple[Component, str, _FrozenArtifactTree], ...]
+
+    def file_bytes(
+        self,
+        component: Component,
+        artifact_name: str,
+        relative: Path,
+    ) -> bytes | None:
+        """Return materialized bytes for one frozen regular file or file link."""
+
+        tree = self._tree(component, artifact_name)
+        entries = {entry.relative: entry for entry in tree.entries}
+        matched = _frozen_entry_at(entries, relative)
+        if matched is None:
+            return None
+        _matched_path, entry = matched
+        return _materialized_entry_bytes(entries, entry)
+
+    def files(
+        self,
+        component: Component,
+        artifact_name: str,
+    ) -> tuple[tuple[Path, bytes], ...]:
+        """Return every materializable file from one frozen artifact tree."""
+
+        tree = self._tree(component, artifact_name)
+        entries = {entry.relative: entry for entry in tree.entries}
+        files: list[tuple[Path, bytes]] = []
+        for entry in tree.entries:
+            content = _materialized_entry_bytes(entries, entry)
+            if content is not None:
+                files.append((entry.relative, content))
+        return tuple(files)
+
+    def tree_map(self) -> dict[tuple[Component, str], _FrozenArtifactTree]:
+        """Return an operation-local map consumed by the renderer."""
+
+        return {(component, name): tree for component, name, tree in self._trees}
+
+    def _tree(self, component: Component, artifact_name: str) -> _FrozenArtifactTree:
+        for candidate_component, candidate_name, tree in self._trees:
+            if candidate_component is component and candidate_name == artifact_name:
+                return tree
+        raise RenderError(f"frozen marketplace snapshot is missing {component.value}/{artifact_name}")
+
+
+@dataclass(frozen=True, slots=True)
 class _PortableOutputEntry:
     raw_parts: tuple[str, ...]
     is_directory: bool
     source: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenSourceEntry:
+    """One exact source-tree node used for both digesting and rendering."""
+
+    relative: Path
+    kind: bytes
+    digest_payload: bytes = b""
+    content: bytes | None = None
+    mode: int | None = None
+    link_target: str | None = None
+    resolved_target: Path | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenArtifactTree:
+    """An artifact tree captured before any renderer consumes its bytes."""
+
+    artifact: Artifact
+    entries: tuple[_FrozenSourceEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenRegularFile:
+    """A no-follow descriptor-backed regular-file observation."""
+
+    data: bytes
+    mode: int
 
 
 class _PortableOutputRegistry:
@@ -120,6 +208,7 @@ def render_marketplace(
     inventory: CatalogInventory,
     *,
     resolved: ResolvedInventory | None = None,
+    expected_digest: str | None = None,
 ) -> RenderedMarketplace:
     """Render selected plugin and hook artifacts into an immutable dual marketplace.
 
@@ -132,6 +221,8 @@ def render_marketplace(
         resolved: Governance-gated inventory to reuse; resolved internally when
             omitted. Callers in one operation should thread a single resolved
             object so render and ownership writes reflect the same read.
+        expected_digest: Reviewed RENDER action digest, when this render is part
+            of apply or registration.
 
     Returns:
         Metadata for the rendered marketplace.
@@ -142,7 +233,11 @@ def render_marketplace(
 
     if resolved is None:
         resolved = resolve_inventory(inventory)
-    digest = marketplace_digest(config, inventory, resolved=resolved)
+    source_snapshot = capture_marketplace_sources(config, inventory, resolved=resolved)
+    frozen_trees = source_snapshot.tree_map()
+    digest = source_snapshot.digest
+    if expected_digest is not None and digest != expected_digest:
+        raise RenderError("frozen marketplace sources do not match the reviewed marketplace digest; retry")
     builds_dir = config.state_dir / "builds"
     build_root = builds_dir / digest
     _validate_state_directory(config, builds_dir, "marketplace builds directory")
@@ -155,24 +250,32 @@ def render_marketplace(
     else:
         builds_dir.mkdir(parents=True, exist_ok=True)
         temporary_root = builds_dir / f".{digest}.{uuid.uuid4().hex}.tmp"
+        temporary_sources = builds_dir / f".{digest}.{uuid.uuid4().hex}.sources"
         temporary_root.mkdir(parents=False)
         try:
+            temporary_sources.mkdir(parents=False)
+            frozen_inventory = _materialize_and_validate_frozen_inventory(
+                inventory,
+                frozen_trees,
+                temporary_sources,
+            )
+            frozen_resolved = replace(resolved, inventory=frozen_inventory)
             plugins_by_product: dict[Product, tuple[str, ...]] = {}
             for product in sorted(_selected_products(config), key=lambda item: item.value):
                 plugin_names: list[str] = []
                 product_root = temporary_root / "plugins" / product.value
                 if _product_has_component(config, product, Component.PLUGINS):
-                    for plugin in inventory.plugins:
+                    for plugin in frozen_inventory.plugins:
                         _render_plugin(plugin, product, product_root / plugin.name)
                         plugin_names.append(plugin.name)
-                gated_hooks = resolved.hooks_for_product(config, product)
+                gated_hooks = frozen_resolved.hooks_for_product(config, product)
                 if _product_has_component(config, product, Component.HOOKS) and gated_hooks:
                     _render_hook_plugin(
                         gated_hooks,
                         product,
                         product_root / _HOOK_PLUGIN_NAME,
-                        inventory.hook_version,
-                        resolved.report,
+                        frozen_inventory.hook_version,
+                        frozen_resolved.report,
                     )
                     plugin_names.append(_HOOK_PLUGIN_NAME)
                 plugins_by_product[product] = tuple(plugin_names)
@@ -195,6 +298,8 @@ def render_marketplace(
         except Exception:
             shutil.rmtree(temporary_root, ignore_errors=True)
             raise
+        finally:
+            shutil.rmtree(temporary_sources, ignore_errors=True)
 
     fresh_inventory = discover_catalog(config)
     if marketplace_digest(config, fresh_inventory, resolved=resolve_inventory(fresh_inventory)) != digest:
@@ -218,9 +323,37 @@ def marketplace_digest(
 ) -> str:
     """Return the deterministic digest for the selected marketplace inputs."""
 
+    return capture_marketplace_sources(config, inventory, resolved=resolved).digest
+
+
+def capture_marketplace_sources(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    *,
+    resolved: ResolvedInventory | None = None,
+) -> MarketplaceSourceSnapshot:
+    """Freeze selected renderer inputs and derive their shared digest."""
+
     if resolved is None:
         resolved = resolve_inventory(inventory)
-    return _build_digest(config, inventory, resolved)
+    frozen_trees = _freeze_marketplace_sources(config, inventory, resolved)
+    with tempfile.TemporaryDirectory(prefix="agentbridge-marketplace-snapshot-") as temporary:
+        _materialize_and_validate_frozen_inventory(
+            inventory,
+            frozen_trees,
+            Path(temporary),
+        )
+    digest = _build_digest(config, inventory, resolved, frozen_trees=frozen_trees)
+    return MarketplaceSourceSnapshot(
+        digest=digest,
+        _trees=tuple(
+            (component, name, tree)
+            for (component, name), tree in sorted(
+                frozen_trees.items(),
+                key=lambda item: (item[0][0].value, item[0][1]),
+            )
+        ),
+    )
 
 
 def marketplace_build_path(
@@ -297,7 +430,13 @@ def _product_has_component(config: BridgeConfig, product: Product, component: Co
     )
 
 
-def _build_digest(config: BridgeConfig, inventory: CatalogInventory, resolved: ResolvedInventory) -> str:
+def _build_digest(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    resolved: ResolvedInventory,
+    *,
+    frozen_trees: dict[tuple[Component, str], _FrozenArtifactTree] | None = None,
+) -> str:
     digest = hashlib.sha256()
     digest.update(b"agent-config-bridge-render-v7\0")
     for product in sorted(_selected_products(config), key=lambda item: item.value):
@@ -321,13 +460,336 @@ def _build_digest(config: BridgeConfig, inventory: CatalogInventory, resolved: R
             for artifact in artifacts:
                 digest.update(artifact.name.encode())
                 digest.update(b"\0")
-                _update_tree_digest(digest, artifact.path)
+                if frozen_trees is None:
+                    _update_tree_digest(digest, artifact.path)
+                else:
+                    frozen = frozen_trees.get((component, artifact.name))
+                    if frozen is None:
+                        raise RenderError(f"frozen marketplace snapshot is missing {component.value}/{artifact.name}")
+                    _update_frozen_tree_digest(digest, frozen)
                 if component is Component.HOOKS:
                     for attribution_path in _hook_attribution_paths(artifact, resolved.report):
                         digest.update(b"attribution\0")
                         digest.update(attribution_path.encode())
                         digest.update(b"\0")
     return digest.hexdigest()[:20]
+
+
+def _freeze_marketplace_sources(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    resolved: ResolvedInventory,
+) -> dict[tuple[Component, str], _FrozenArtifactTree]:
+    """Capture every selected renderer input before output materialization."""
+
+    selected: dict[tuple[Component, str], Artifact] = {}
+    for product in sorted(_selected_products(config), key=lambda item: item.value):
+        if _product_has_component(config, product, Component.PLUGINS):
+            selected.update({(Component.PLUGINS, artifact.name): artifact for artifact in inventory.plugins})
+        if _product_has_component(config, product, Component.HOOKS):
+            selected.update(
+                {(Component.HOOKS, artifact.name): artifact for artifact in resolved.hooks_for_product(config, product)}
+            )
+    return {
+        key: _freeze_artifact_tree(artifact)
+        for key, artifact in sorted(
+            selected.items(),
+            key=lambda item: (item[0][0].value, item[0][1]),
+        )
+    }
+
+
+def _freeze_artifact_tree(artifact: Artifact) -> _FrozenArtifactTree:
+    """Capture one exact tree whose digest inputs also drive rendering."""
+
+    root = artifact.path
+    root_mode = _source_mode(root)
+    if not stat.S_ISDIR(root_mode):
+        raise RenderError(f"source tree root must be a real directory: {root}")
+    entries: list[_FrozenSourceEntry] = []
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(root)
+        mode = _source_mode(path)
+        if stat.S_ISLNK(mode):
+            entries.append(_freeze_source_symlink(path, root, relative))
+        elif stat.S_ISREG(mode):
+            snapshot = _read_frozen_regular_file(path)
+            entries.append(
+                _FrozenSourceEntry(
+                    relative=relative,
+                    kind=b"F",
+                    digest_payload=snapshot.data,
+                    content=snapshot.data,
+                    mode=snapshot.mode,
+                )
+            )
+        elif stat.S_ISDIR(mode):
+            entries.append(_FrozenSourceEntry(relative=relative, kind=b"D"))
+        else:
+            raise RenderError(f"source tree contains an unsupported filesystem node: {path}")
+
+    by_relative = {entry.relative: entry for entry in entries}
+    resolved_entries: list[_FrozenSourceEntry] = []
+    for entry in entries:
+        if entry.kind != b"L":
+            resolved_entries.append(entry)
+            continue
+        resolved_target = _resolve_frozen_link_target(root, entry, by_relative)
+        target = by_relative.get(resolved_target)
+        if target is None or target.kind != b"F" or target.content is None:
+            raise RenderError(
+                f"source symlink target is missing from frozen artifact snapshot: {root / entry.relative}"
+            )
+        resolved_entries.append(replace(entry, resolved_target=resolved_target))
+    return _FrozenArtifactTree(artifact=artifact, entries=tuple(resolved_entries))
+
+
+def _freeze_source_symlink(path: Path, root: Path, relative: Path) -> _FrozenSourceEntry:
+    """Capture a stable link identity; resolve it only through frozen entries."""
+
+    try:
+        before = path.lstat()
+        raw_target = os.readlink(path)
+        after = path.lstat()
+        if (
+            not stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISLNK(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or os.readlink(path) != raw_target
+        ):
+            raise RenderError(f"source symlink changed while freezing marketplace inputs: {path}")
+    except RenderError:
+        raise
+    except OSError as exc:
+        raise RenderError(f"cannot freeze source symlink {path}: {exc}") from exc
+    return _FrozenSourceEntry(
+        relative=relative,
+        kind=b"L",
+        digest_payload=raw_target.encode(),
+        link_target=raw_target,
+    )
+
+
+def _resolve_frozen_link_target(
+    root: Path,
+    link: _FrozenSourceEntry,
+    entries: dict[Path, _FrozenSourceEntry],
+) -> Path:
+    """Resolve a link chain from captured names, never the live filesystem."""
+
+    current = link
+    seen: set[Path] = set()
+    while True:
+        if current.relative in seen:
+            raise RenderError(f"source symlink cycle in frozen artifact snapshot: {root / link.relative}")
+        seen.add(current.relative)
+        if current.link_target is None:
+            raise RenderError(f"frozen source symlink has no target: {root / current.relative}")
+        raw_target = Path(current.link_target)
+        candidate = raw_target if raw_target.is_absolute() else root / current.relative.parent / raw_target
+        normalized = Path(os.path.normpath(candidate))
+        relative = _frozen_relative_to_root(normalized, root)
+        if relative is None:
+            raise RenderError(
+                f"source symlink escapes artifact root in frozen snapshot: "
+                f"{root / current.relative} -> {current.link_target}"
+            )
+        matched = _frozen_entry_at(entries, relative)
+        if matched is None:
+            raise RenderError(
+                f"source symlink target is missing from frozen artifact snapshot: "
+                f"{root / current.relative} -> {current.link_target}"
+            )
+        relative, target = matched
+        if target.kind == b"F":
+            return relative
+        if target.kind != b"L":
+            raise RenderError(
+                f"source symlink target must be a contained regular file: "
+                f"{root / current.relative} -> {current.link_target}"
+            )
+        current = target
+
+
+def _frozen_relative_to_root(candidate: Path, root: Path) -> Path | None:
+    """Return a lexical contained path without reopening frozen source names."""
+
+    if os.name != "nt":
+        try:
+            return candidate.relative_to(root)
+        except ValueError:
+            return None
+
+    root_key = target_path_comparison_key(os.fspath(root), windows=True).rstrip("/")
+    candidate_key = target_path_comparison_key(os.fspath(candidate), windows=True)
+    prefix = root_key + "/"
+    if not candidate_key.startswith(prefix):
+        return None
+    suffix = candidate_key[len(prefix) :]
+    return Path(*suffix.split("/"))
+
+
+def _frozen_entry_at(
+    entries: dict[Path, _FrozenSourceEntry],
+    relative: Path,
+) -> tuple[Path, _FrozenSourceEntry] | None:
+    direct = entries.get(relative)
+    if direct is not None:
+        return relative, direct
+    if os.name != "nt":
+        return None
+    portable = tuple(part.rstrip(" .").casefold() for part in relative.parts)
+    return next(
+        (
+            (candidate, entry)
+            for candidate, entry in entries.items()
+            if tuple(part.rstrip(" .").casefold() for part in candidate.parts) == portable
+        ),
+        None,
+    )
+
+
+def _read_frozen_regular_file(path: Path) -> _FrozenRegularFile:
+    """Read source bytes without following a raced path replacement."""
+
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise RenderError(f"cannot inspect source path {path}: {exc}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise RenderError(f"source path is not a real regular file: {path}")
+    expected_identity = before.st_dev, before.st_ino
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RenderError(f"cannot open source file while freezing marketplace inputs: {path}: {exc}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != expected_identity:
+            raise RenderError(f"source file changed while opening marketplace inputs: {path}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        after_read = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after_read.st_mode)
+            or (after_read.st_dev, after_read.st_ino) != expected_identity
+            or after_read.st_size != len(data)
+        ):
+            raise RenderError(f"source file changed while reading marketplace inputs: {path}")
+    except RenderError:
+        raise
+    except OSError as exc:
+        raise RenderError(f"cannot read source file while freezing marketplace inputs: {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise RenderError(f"cannot recheck frozen source file {path}: {exc}") from exc
+    if not stat.S_ISREG(after.st_mode) or (after.st_dev, after.st_ino) != expected_identity:
+        raise RenderError(f"source file changed after freezing marketplace inputs: {path}")
+    return _FrozenRegularFile(data=data, mode=stat.S_IMODE(opened.st_mode))
+
+
+def _update_frozen_tree_digest(digest: Any, frozen: _FrozenArtifactTree) -> None:
+    """Hash the exact entries later materialized for the renderer."""
+
+    for entry in frozen.entries:
+        digest.update(entry.relative.as_posix().encode())
+        digest.update(b"\0")
+        digest.update(entry.kind)
+        digest.update(entry.digest_payload)
+
+
+def _materialize_frozen_inventory(
+    inventory: CatalogInventory,
+    frozen_trees: dict[tuple[Component, str], _FrozenArtifactTree],
+    snapshot_root: Path,
+) -> CatalogInventory:
+    """Write frozen inputs to private temporary roots for existing renderers."""
+
+    materialized: dict[tuple[Component, str], Artifact] = {}
+    for key, frozen in frozen_trees.items():
+        component, name = key
+        destination = snapshot_root / component.value / name
+        _materialize_frozen_tree(frozen, destination)
+        materialized[key] = Artifact(name=name, path=destination)
+    return CatalogInventory(
+        root=snapshot_root,
+        skills=(),
+        plugins=tuple(
+            materialized[(Component.PLUGINS, artifact.name)]
+            for artifact in inventory.plugins
+            if (Component.PLUGINS, artifact.name) in materialized
+        ),
+        hooks=tuple(
+            materialized[(Component.HOOKS, artifact.name)]
+            for artifact in inventory.hooks
+            if (Component.HOOKS, artifact.name) in materialized
+        ),
+        settings=(),
+        schedules=(),
+        hook_version=inventory.hook_version,
+        instructions=(),
+    )
+
+
+def _materialize_and_validate_frozen_inventory(
+    inventory: CatalogInventory,
+    frozen_trees: dict[tuple[Component, str], _FrozenArtifactTree],
+    snapshot_root: Path,
+) -> CatalogInventory:
+    """Materialize and validate only the exact captured marketplace entries."""
+
+    return validate_marketplace_inventory(
+        _materialize_frozen_inventory(
+            inventory,
+            frozen_trees,
+            snapshot_root,
+        )
+    )
+
+
+def _materialize_frozen_tree(frozen: _FrozenArtifactTree, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=False)
+    by_relative = {entry.relative: entry for entry in frozen.entries}
+    for entry in frozen.entries:
+        if entry.kind == b"D":
+            (destination / entry.relative).mkdir(parents=True, exist_ok=False)
+    for entry in frozen.entries:
+        if entry.kind == b"D":
+            continue
+        content_entry = _materialized_entry(by_relative, entry)
+        if content_entry is None or content_entry.content is None or content_entry.mode is None:
+            raise RenderError(
+                f"frozen marketplace source has no materializable bytes: {frozen.artifact.path / entry.relative}"
+            )
+        target = destination / entry.relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content_entry.content)
+        target.chmod(content_entry.mode)
+
+
+def _materialized_entry(
+    entries: dict[Path, _FrozenSourceEntry],
+    entry: _FrozenSourceEntry,
+) -> _FrozenSourceEntry | None:
+    if entry.kind == b"F":
+        return entry
+    if entry.kind == b"L" and entry.resolved_target is not None:
+        return entries.get(entry.resolved_target)
+    return None
+
+
+def _materialized_entry_bytes(
+    entries: dict[Path, _FrozenSourceEntry],
+    entry: _FrozenSourceEntry,
+) -> bytes | None:
+    materialized = _materialized_entry(entries, entry)
+    return None if materialized is None else materialized.content
 
 
 def _update_tree_digest(digest: Any, root: Path) -> None:

@@ -253,6 +253,18 @@ all reuse the existing per-file lifecycle. A pre-existing runtime
 `<config_home>/<name>.config.toml` remains unmanaged and conflicts even when its
 bytes equal the generated source.
 
+For a managed regular-file COPY only, Codex may append its provider-owned
+`[hooks.state]` suffix. The planner treats it as outside the managed content
+only when every child contains exactly one lowercase SHA-256 `trusted_hash`
+leaf and no other data exists. The table header must start at column zero on
+its own line without a trailing comment. Updates and backups preserve the
+validated suffix byte-for-byte; the Bridge never creates or edits trust state.
+Other Instructions, symlinks, unmanaged profiles, alternate header formatting,
+malformed state, and all other extra profile data still conflict. POSIX apply
+creates or repairs these profile copies and their retained backups to mode
+`0600`; Windows uses inherited ACLs instead of treating POSIX mode bits as an
+access-control guarantee.
+
 ## Product-specific rendering
 
 For each selected product, the renderer copies `common/` and then that product's
@@ -278,7 +290,23 @@ Hook bundles are combined into a generated `agent-config-bridge-hooks` package
 for each selected product. Hook event arrays from `common/hooks.json` and the
 matching product overlay are appended. This is a structural merge only: the
 bridge does not infer event equivalence, rewrite handlers, or verify blocking
-semantics. Authors must keep non-portable declarations in product overlays.
+semantics. It type-checks the known optional `commandWindows`,
+`additionalContextLimit`, `statusMessage`, and `async` fields but does not infer
+runtime support from their presence. Authors must keep non-portable
+declarations in product overlays.
+
+Rendering first captures every selected Plugin/Hook artifact as an exact
+descriptor-checked frozen tree. Planning derives both the marketplace action
+digest and human review strings from those same captured entries, listing
+`command` and `commandWindows` separately. Before either planning or rendering
+uses a snapshot, the captured entries are privately materialized and passed
+through the existing artifact-tree, Plugin manifest, and Hook document Catalog
+validators. Apply/register freeze the inputs again and require that validated
+snapshot to equal the reviewed RENDER action before any captured file reaches
+the package renderer. Contained source symlinks resolve only through captured
+tree entries. A live catalog rediscovery and digest check still runs after
+rendering, so the frozen-input binding supplements rather than replaces normal
+staleness detection.
 
 Every immutable build contains both marketplace documents and an integrity
 marker. Before reuse, the complete generated tree is rehashed and its Plugin
@@ -456,13 +484,18 @@ Actions then run sequentially:
 - generated Codex profiles use that same Instruction path; apply never invokes
   the profile generator or repairs Catalog drift;
 - a replacement managed copy is staged and verified next to its destination;
-- before a managed-copy update or removal, the old destination is copied
+- before a managed Skill-copy update or removal, the old destination is copied
   non-destructively into its final `state_dir/backups/<target>/...` path and
   that snapshot's marker, source identity, and installed digest are verified;
+- a managed Instruction-copy update or removal instead binds parsing, exact
+  bytes, and identity to one descriptor observation, revalidates that
+  observation, atomically renames the destination to a private sibling, and
+  only then retains and verifies the backup from that exact displaced file;
 - a symlink-to-copy migration similarly recreates and verifies the old link in
   the final backup path rather than moving the live link across filesystems;
-- after snapshot creation, the live destination is revalidated immediately
-  before mutation so drift during backup copying aborts without swapping it;
+- for managed Skill copies, after snapshot creation the live destination is
+  revalidated immediately before mutation so drift during backup copying
+  aborts without swapping it;
 - updates use a same-filesystem destination swap, atomically install the staged
   copy, and then remove the redundant swap;
 - deselection unlinks a still-matching recorded symlink;
@@ -487,7 +520,9 @@ temporary paths and local replacement checks, but a later action can fail after
 an earlier one succeeded. Managed-copy operations perform the localized
 snapshot/swap recovery described above, but there is no transaction-wide
 rollback or recovery log. Run a fresh `plan` after an interrupted apply;
-retained managed-copy backups remain available for manual recovery.
+retained managed-copy backups remain available for manual recovery. The
+Instruction copy/backup/install path does not fsync file contents or parent
+directories and therefore makes no power-loss durability claim.
 
 ## Plugin, Hook, and Schedule registration
 

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from agent_config_bridge import applier, filesystem
+from agent_config_bridge import renderer as renderer_module
 from agent_config_bridge.applier import ApplyError, apply_plan, apply_skill_plan
-from agent_config_bridge.catalog import discover_catalog
+from agent_config_bridge.catalog import Artifact, CatalogError, discover_catalog
 from agent_config_bridge.filesystem import MANAGED_MARKER, FilesystemError, tree_digest
 from agent_config_bridge.models import Component, LinkMode, Platform
 from agent_config_bridge.planner import Disposition, Operation, build_plan
 from agent_config_bridge.provenance import read_skill_root_marker
+from agent_config_bridge.renderer import RenderError
 from agent_config_bridge.state import BridgeStateError, read_skill_state
 from tests.conftest import make_catalog, make_config, require_directory_symlink_support
 
@@ -679,6 +683,210 @@ def test_apply_rejects_stale_plan_after_source_change(tmp_path: Path) -> None:
         apply_plan(config, inventory, plan)
 
     assert not (tmp_path / "home/.agents/skills/hello").exists()
+
+
+def test_apply_rejects_stale_hook_source_before_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reviewed Hook plan is invalidated before rendering any marketplace."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        components=frozenset({Component.HOOKS}),
+    )
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    hook = catalog / "hooks/native-event/common/hooks.json"
+    payload = json.loads(hook.read_text(encoding="utf-8"))
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "python changed-after-plan.py"
+    hook.write_text(json.dumps(payload), encoding="utf-8")
+    render = Mock(side_effect=AssertionError("stale Hook plans must fail before render"))
+    monkeypatch.setattr(applier, "render_marketplace", render)
+
+    with pytest.raises(ApplyError, match="changed after planning"):
+        apply_plan(config, inventory, plan)
+
+    render.assert_not_called()
+    assert not config.state_dir.exists()
+
+
+def test_apply_never_renders_transient_hook_source_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reviewed A -> transient B -> A Hook tree cannot publish B."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        components=frozenset({Component.HOOKS}),
+    )
+    inventory = discover_catalog(config)
+    plan = build_plan(config, inventory)
+    hook = catalog / "hooks/native-event/common/hooks.json"
+    original_bytes = hook.read_bytes()
+    payload = json.loads(original_bytes)
+    transient_command = "python transient-b-must-never-render.py"
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["command"] = transient_command
+    transient_bytes = json.dumps(payload).encode()
+    original_freeze = renderer_module._freeze_artifact_tree
+    freeze_calls = 0
+    injected = False
+
+    def freeze_with_source_aba(artifact: Artifact) -> renderer_module._FrozenArtifactTree:
+        nonlocal freeze_calls, injected
+        freeze_calls += 1
+        if freeze_calls == 2 and artifact.name == "native-event":
+            hook.write_bytes(transient_bytes)
+            try:
+                return original_freeze(artifact)
+            finally:
+                hook.write_bytes(original_bytes)
+                injected = True
+        return original_freeze(artifact)
+
+    unexpected_render = Mock(side_effect=AssertionError("digest-mismatched B must not reach Hook rendering"))
+    monkeypatch.setattr(renderer_module, "_freeze_artifact_tree", freeze_with_source_aba)
+    monkeypatch.setattr(renderer_module, "_render_hook_plugin", unexpected_render)
+
+    with pytest.raises(RenderError, match="reviewed marketplace digest"):
+        apply_plan(config, inventory, plan)
+
+    assert injected is True
+    assert freeze_calls == 2
+    assert hook.read_bytes() == original_bytes
+    unexpected_render.assert_not_called()
+    assert not (config.state_dir / "marketplace").exists()
+    assert not any(
+        transient_command.encode() in path.read_bytes() for path in config.state_dir.rglob("*") if path.is_file()
+    )
+
+
+def test_plan_marketplace_digest_and_review_share_frozen_hook_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reviewed Hook command comes from the exact tree behind its digest."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        components=frozenset({Component.HOOKS}),
+    )
+    inventory = discover_catalog(config)
+    hook = catalog / "hooks/native-event/common/hooks.json"
+    original_bytes = hook.read_bytes()
+    payload = json.loads(original_bytes)
+    original_command = payload["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+    transient_command = "python reviewed-transient-b.py"
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["command"] = transient_command
+    transient_bytes = json.dumps(payload).encode()
+    original_freeze = renderer_module._freeze_artifact_tree
+    injected = False
+
+    def freeze_with_source_aba(artifact: Artifact) -> renderer_module._FrozenArtifactTree:
+        nonlocal injected
+        if not injected and artifact.name == "native-event":
+            hook.write_bytes(transient_bytes)
+            try:
+                return original_freeze(artifact)
+            finally:
+                hook.write_bytes(original_bytes)
+                injected = True
+        return original_freeze(artifact)
+
+    monkeypatch.setattr(renderer_module, "_freeze_artifact_tree", freeze_with_source_aba)
+
+    plan = build_plan(config, inventory)
+    marketplace_action = next(action for action in plan.actions if action.target == "marketplace")
+    live_digest = renderer_module.marketplace_digest(config, discover_catalog(config))
+
+    assert injected is True
+    assert marketplace_action.source_digest != live_digest
+    assert any(transient_command in review for review in plan.reviews)
+    assert not any(original_command in review for review in plan.reviews)
+
+
+def test_plan_and_apply_reject_invalid_frozen_hook_snapshot_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live-valid A cannot authorize an invalid frozen B that later reverts to A."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    config = make_config(
+        tmp_path,
+        catalog,
+        components=frozenset({Component.HOOKS}),
+    )
+    inventory = discover_catalog(config)
+    reviewed_plan = build_plan(config, inventory)
+    hook = catalog / "hooks/native-event/common/hooks.json"
+    original_bytes = hook.read_bytes()
+    payload = json.loads(original_bytes)
+    payload["hooks"]["SessionStart"][0]["hooks"][0]["async"] = "NOT_A_BOOLEAN"
+    invalid_bytes = json.dumps(payload).encode()
+    original_freeze = renderer_module._freeze_artifact_tree
+    freeze_calls = 0
+
+    def freeze_invalid_b_then_restore_a(artifact: Artifact) -> renderer_module._FrozenArtifactTree:
+        nonlocal freeze_calls
+        if artifact.name == "native-event":
+            freeze_calls += 1
+            hook.write_bytes(invalid_bytes)
+            try:
+                return original_freeze(artifact)
+            finally:
+                hook.write_bytes(original_bytes)
+        return original_freeze(artifact)
+
+    unexpected_render = Mock(side_effect=AssertionError("invalid frozen Hook B must not reach rendering"))
+    monkeypatch.setattr(renderer_module, "_freeze_artifact_tree", freeze_invalid_b_then_restore_a)
+    monkeypatch.setattr(applier, "render_marketplace", unexpected_render)
+
+    with pytest.raises(CatalogError, match="hook async.*boolean"):
+        build_plan(config, discover_catalog(config))
+    assert hook.read_bytes() == original_bytes
+
+    with pytest.raises(CatalogError, match="hook async.*boolean"):
+        apply_plan(config, inventory, reviewed_plan)
+
+    assert freeze_calls == 2
+    assert hook.read_bytes() == original_bytes
+    unexpected_render.assert_not_called()
+    assert not (config.state_dir / "marketplace").exists()
+
+
+def test_windows_hook_review_lists_command_and_command_windows_from_common_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A Windows override is a separate labeled review item beside command."""
+
+    catalog = make_catalog(tmp_path / "catalog", skills=(), hooks=("native-event",))
+    hook = catalog / "hooks/native-event/common/hooks.json"
+    payload = json.loads(hook.read_text(encoding="utf-8"))
+    handler = payload["hooks"]["SessionStart"][0]["hooks"][0]
+    handler["command"] = "python benign.py"
+    handler["commandWindows"] = "powershell -File dangerous.ps1"
+    hook.write_text(json.dumps(payload), encoding="utf-8")
+    config = make_config(
+        tmp_path,
+        catalog,
+        platform=Platform.WINDOWS,
+        components=frozenset({Component.HOOKS}),
+    )
+
+    plan = build_plan(config, discover_catalog(config))
+    hook_reviews = tuple(review for review in plan.reviews if "hook native-event/common event=SessionStart" in review)
+
+    assert any("command='python benign.py'" in review for review in hook_reviews)
+    assert any("commandWindows='powershell -File dangerous.ps1'" in review for review in hook_reviews)
+    assert len(hook_reviews) == 2
 
 
 def test_apply_removes_deselected_managed_symlink(tmp_path: Path) -> None:

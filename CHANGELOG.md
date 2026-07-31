@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-07-31
+
+- Preserve only Codex-owned, strictly validated `[hooks.state]` trust metadata
+  appended to a generated profile copy while keeping canonical Catalog output
+  developer-instructions-only and all other profile drift fail-closed. Codex
+  profile copies are created and repaired to `0600` on POSIX, including retained
+  profile backups; Windows confidentiality remains governed by inherited ACLs.
+  Backup, install, and recovery use no-replace hard links when available and
+  verified exclusive-copy fallbacks otherwise. The displaced inode remains
+  named through backup and replacement validation, while recovery never removes
+  or overwrites an occupied active destination.
+- Validate the known additive Hook handler fields `commandWindows`,
+  `additionalContextLimit`, `statusMessage`, and `async` by their documented
+  types. Render, apply, and provider registration now consume only an exact
+  frozen Plugin/Hook source snapshot validated under the normal Catalog
+  contracts. Planning derives the action digest and human review strings,
+  including a distinct `commandWindows` item, from the same snapshot;
+  apply/register require a fresh validated snapshot with that reviewed digest,
+  closing transient source A→B→A races while retaining the existing post-render
+  catalog staleness check.
+
 ## [0.3.4] - 2026-07-29
 
 ### Added

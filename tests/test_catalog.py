@@ -112,6 +112,18 @@ def test_discover_catalog_rejects_hook_without_hooks_object(tmp_path: Path) -> N
         {"SessionStart": [{"hooks": [{"type": "command"}]}]},
         {"SessionStart": [{"matcher": 42, "hooks": []}]},
         {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "timeout": 0}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "commandWindows": ""}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "commandWindows": 42}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "commandWindows": None}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "additionalContextLimit": -1}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "additionalContextLimit": 1.5}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "additionalContextLimit": True}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "additionalContextLimit": None}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "statusMessage": 42}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "statusMessage": None}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "async": 1}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "async": "true"}]}]},
+        {"SessionStart": [{"hooks": [{"type": "command", "command": "ok", "async": None}]}]},
     ],
 )
 def test_discover_catalog_rejects_malformed_hook_groups(tmp_path: Path, hooks: object) -> None:

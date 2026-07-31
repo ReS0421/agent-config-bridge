@@ -66,7 +66,9 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
 - Deterministic `instructions generate` and strictly read-only
   `instructions check` commands for Codex profiles whose only TOML data key is
   `developer_instructions`; normal validation and planning reject missing,
-  stale, malformed, or undeclared profile outputs
+  stale, malformed, or undeclared profile outputs. A deployed managed COPY may
+  preserve only Codex's closed, provider-owned `hooks.state` trust suffix;
+  Bridge never creates or edits those entries
 - Canonical Codex Skill destination: `~/.agents/skills`
 - Claude Code Skill destination: `~/.claude/skills`
 - Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`
@@ -378,18 +380,43 @@ never a permitted Instruction destination. Because checking is intentionally
 byte-strict, the Catalog's Git attributes must materialize generated
 `codex/*.config.toml` profiles with LF endings on every platform.
 
+The deployed COPY may later gain a Codex-owned `[hooks.state]` suffix. Bridge
+accepts it only when every non-empty child has exactly one lowercase
+`sha256:<64 hex>` `trusted_hash`; it ignores that validated suffix for managed
+content drift and preserves the exact bytes on update and backup. The
+`[hooks.state]` header itself is a strict subset: it must begin at column zero
+on its own line with no trailing comment. Bridge never creates or modifies
+trust entries. Other extra data, alternate header formatting, malformed state,
+other Instruction files, symlinks, and unmanaged destinations remain
+conflicts. On POSIX, apply creates profile copies as `0600`, repairs legacy
+managed profile modes through a reviewed update, and tightens the retained
+profile backup to `0600`; Windows relies on user-private inherited ACLs rather
+than POSIX mode bits.
+
 `common/` is copied into each package, followed by only that product's overlay.
 Overlay files must be identical or non-overlapping; conflicting target files
 fail rendering. Hook event arrays from `common/` and the selected product
 overlay are additive. The bridge does not translate hook semantics between
 products, so catalog authors must put only truly portable declarations in
-`common/hooks.json`.
+`common/hooks.json`. Structural validation type-checks the known optional
+handler fields `commandWindows`, `additionalContextLimit`, `statusMessage`, and
+`async` without claiming that every target product/version implements their
+behavior; in particular, accepting a boolean `async` field is not an
+asynchronous-execution guarantee.
 
 Rendered packages are separated by product under the immutable path
 `<state_dir>/builds/<digest>/plugins/{codex,claude-code}/`. An
 integrity-checked copy is published at the stable `<state_dir>/marketplace` path
 registered with product CLIs, and each product marketplace lists only the
-components selected for that product. Do not edit either generated location.
+components selected for that product. Before a new build, the renderer freezes
+the exact selected Plugin/Hook trees. Planning derives both its marketplace
+digest and human review strings from one such snapshot, with `command` and
+`commandWindows` shown as distinct review items. Every frozen snapshot is
+materialized privately and checked under the normal Hook, Plugin manifest, and
+artifact-tree Catalog contracts. Apply/register freeze again, require the
+validated bytes to match that reviewed digest, and render only from the
+matching snapshot. The normal post-render catalog rediscovery remains an
+additional staleness check. Do not edit either generated location.
 
 Plugin manifests must use strict SemVer and the Codex and Claude Code versions
 for a canonical plugin must match. If any rendered plugin content changes, bump
