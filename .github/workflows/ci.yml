@@ -68,7 +68,7 @@ jobs:
 
       - name: Validate distribution metadata
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
-        run: uvx --from twine==6.2.0 twine check dist/*
+        run: uvx --from twine==7.0.0 twine check dist/*
 
       - name: Smoke test wheel entrypoint
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'

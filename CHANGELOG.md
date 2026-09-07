@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Update CI's pinned Twine distribution validator to 7.0.0 so valid Core
+  Metadata 2.5 from current Hatchling builds passes the wheel and source
+  distribution checks. Keep validation failures blocking, align the release
+  instructions, and add offline workflow regression guards. Runtime dependencies
+  and package metadata are unchanged.
 - Preserve an existing managed Codex profile COPY's bounded model/reasoning
   preferences, project trust, optional Hook enablement, and TUI model state
   byte-for-byte through no-op, update, backup, and deselection. Canonical
