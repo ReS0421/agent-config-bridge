@@ -61,20 +61,34 @@ any other file merely because it is beneath a product home.
 Codex profile projection does not expand that Settings boundary. The generated
 `<name>.config.toml` is a standalone Instruction file; the base
 `<config_home>/config.toml` is never eligible through this path. A profile
-cannot set a model, permission, sandbox, MCP, approval, tool, or other Codex
-setting because any TOML data key besides `developer_instructions` is rejected.
+generated in the Catalog cannot set a model, permission, sandbox, MCP,
+approval, tool, or other Codex setting because any TOML data key besides
+`developer_instructions` is rejected.
 The instruction text itself grants no authority and does not bypass product
 approval, sandbox, managed-policy, or tool controls.
 
-Codex may append its own Hook trust decisions to a deployed generated profile
-COPY. This destination-only exception does not widen the Catalog schema:
+An existing managed generated profile COPY may carry product/user-owned runtime
+data. This destination-only exception does not widen the Catalog schema:
 generation and discovery still require exactly `developer_instructions`.
-Bridge planning accepts only a suffix whose parsed data is exactly
-`hooks.state`, with non-empty child identifiers whose sole leaf is
-`trusted_hash = "sha256:<64 lowercase hexadecimal digits>"`. The Bridge never
-creates, grants, edits, or synchronizes those entries. It preserves a validated
-suffix byte-for-byte during managed updates and in Instruction backups; any
-other added data or malformed state remains a conflict. The literal
+The closed suffix permits only nonblank string `model`,
+`model_reasoning_effort`, and `plan_mode_reasoning_effort`; `projects`
+identifiers whose sole leaf is `trust_level` (`trusted` or `untrusted`);
+`hooks.state` identifiers with required
+`trusted_hash = "sha256:<64 lowercase hexadecimal digits>"` and optional
+boolean `enabled`; and `tui.model_availability_nux` identifiers with nonnegative
+integer values (not booleans). Identifiers and scalar strings must be nonblank
+and C0/C1-control-free. Unknown fields/nested leaves, commands, MCP, permission,
+approval, sandbox settings, duplicate TOML keys, and malformed types conflict.
+
+Incremental newline-normalized hashing must match the recorded managed prefix;
+the managed document, suffix, and complete TOML boundary are all validated.
+Matching runtime data never rewrites the managed ownership digest. No-op never
+rewrites the file. Bridge preserves the existing suffix byte-for-byte through
+update, backup, and deselection, including comments, CRLF, and `enabled=false`.
+It does not generate, edit, grant, infer, or synchronize runtime settings or
+trust, and never copies them back into Catalog. Representation acceptance does
+not prove the origin, authority, safety, or intended semantics of existing
+settings, and does not authorize a new approval. The literal
 `[hooks.state]` header must begin at column zero on its own line without a
 trailing comment; alternate TOML header formatting is intentionally outside
 the accepted subset. The exception does not apply to unmanaged files,
@@ -120,8 +134,9 @@ The bridge never originates product auth, session, conversation, trust, or
 cache state there. Ownership records contain artifact identities, paths,
 link/copy modes, and content/value digests, not credentials or displaced
 Settings values. A retained generated-profile Instruction backup can contain
-Codex-owned Hook trust state already present in the displaced runtime file; the
-Bridge preserves those opaque bytes but does not interpret them as authority.
+local model preferences, project trust, Hook state, and TUI metadata already
+present in the displaced runtime file. The Bridge preserves those opaque bytes
+but does not interpret them as authority or synchronize them to another target.
 
 On POSIX, newly created ownership files, Schedule snapshots/runtime files, and
 new vendor Settings files use mode `0600`; bridge-managed state/runtime
@@ -282,9 +297,9 @@ digest mismatches:
   through per-target `instructions.json` state because their product root
   cannot carry a marker;
 - a managed generated Codex profile COPY may have only the closed, validated
-  provider-owned `hooks.state` suffix described above; drift checks ignore that
-  suffix, updates preserve it byte-for-byte, and any broader runtime data fails
-  closed;
+  product/user-owned runtime suffix described above; drift checks exclude only
+  that validated suffix, updates preserve it byte-for-byte, and unknown data
+  fails closed without rewriting the recorded managed digest;
 - generated-profile updates capture managed parsing, the exact old bytes, and
   old-file identity in one descriptor-backed observation, keep the exact
   displaced old file named while retaining and validating its backup, and

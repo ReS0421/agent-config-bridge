@@ -121,7 +121,10 @@ def instruction_digest(path: Path) -> str:
 
 
 def codex_profile_allows_runtime_hook_state(product: Product, relpath: str) -> bool:
-    """Return whether one deployed COPY may carry Codex-owned Hook trust state."""
+    """Return whether one deployed COPY may preserve bounded Codex runtime data.
+
+    The historical helper name is retained for planner/applier compatibility.
+    """
 
     path = PurePosixPath(relpath)
     return (
@@ -141,9 +144,9 @@ def inspect_instruction_copy(
     """Match managed instruction bytes while validating a narrow runtime suffix.
 
     Generated Catalog profiles remain developer-instruction-only. A deployed
-    Codex profile COPY may additionally carry an opaque, provider-owned
-    ``[hooks.state]`` suffix. The suffix is accepted only when every child is
-    exactly one lowercase SHA-256 ``trusted_hash`` leaf.
+    Codex profile COPY may additionally carry an opaque, provider-owned suffix
+    of explicitly typed model preferences, project trust, Hook state, and TUI
+    metadata. Acceptance validates representation, never runtime authority.
     """
 
     return _observe_instruction_copy(
@@ -187,14 +190,11 @@ def _inspect_instruction_copy_bytes(
     if not allow_runtime_hook_state:
         return InstructionCopyInspection(managed_matches=False)
 
-    for marker_start in _hook_state_marker_offsets(data):
-        for managed_end in _possible_managed_ends(data, marker_start):
-            managed = _normalize_newlines(data[:managed_end])
-            if hashlib.sha256(managed).hexdigest() != installed_digest:
-                continue
-            suffix = data[managed_end:]
-            if _valid_runtime_hook_state_suffix(suffix):
-                return InstructionCopyInspection(managed_matches=True, runtime_suffix=suffix)
+    managed_end = _matching_managed_prefix_end(data, installed_digest)
+    if managed_end is not None:
+        suffix = data[managed_end:]
+        if _valid_runtime_profile_suffix(data[:managed_end], suffix):
+            return InstructionCopyInspection(managed_matches=True, runtime_suffix=suffix)
     return InstructionCopyInspection(managed_matches=False)
 
 
@@ -288,7 +288,7 @@ def apply_instruction_copy(
                 stream.write(observation.inspection.runtime_suffix)
         except OSError as exc:
             temporary.unlink(missing_ok=True)
-            raise FilesystemError(f"failed to preserve product-owned Hook state: {destination}: {exc}") from exc
+            raise FilesystemError(f"failed to preserve product-owned runtime data: {destination}: {exc}") from exc
         staged = inspect_instruction_copy(
             temporary,
             installed_digest=source_digest,
@@ -296,7 +296,7 @@ def apply_instruction_copy(
         )
         if not staged.managed_matches or staged.runtime_suffix != observation.inspection.runtime_suffix:
             temporary.unlink(missing_ok=True)
-            raise FilesystemError(f"staged copy did not preserve product-owned Hook state: {destination}")
+            raise FilesystemError(f"staged copy did not preserve product-owned runtime data: {destination}")
 
     if not _exact_regular_file_matches(
         destination,
@@ -862,39 +862,99 @@ def _hook_state_marker_offsets(data: bytes) -> tuple[int, ...]:
     return tuple(match.start() for match in re.finditer(rb"(?m)^\[hooks\.state\](?:\r?\n|\Z)", data))
 
 
-def _possible_managed_ends(data: bytes, marker_start: int) -> tuple[int, ...]:
-    """Return boundaries that retain zero or more separator newlines in suffix."""
+def _matching_managed_prefix_end(data: bytes, installed_digest: str) -> int | None:
+    """Find the recorded LF-normalized prefix in one incremental hashing pass.
 
-    ends = [marker_start]
-    cursor = marker_start
-    while cursor > 0 and data[cursor - 1] == 0x0A:
-        cursor -= 1
-        if cursor > 0 and data[cursor - 1] == 0x0D:
-            cursor -= 1
-        ends.append(cursor)
-    return tuple(ends)
+    Generated profiles end with a newline. Retain the corresponding raw-byte
+    boundary so CRLF and all subsequent suffix formatting survive unchanged.
+    No growing prefix is rehashed for each line or separator candidate.
+    """
+
+    digest = hashlib.sha256()
+    cursor = 0
+    for newline in re.finditer(rb"\r\n|\r|\n", data):
+        digest.update(data[cursor : newline.start()])
+        digest.update(b"\n")
+        cursor = newline.end()
+        if digest.hexdigest() == installed_digest:
+            return cursor
+    return None
 
 
-def _valid_runtime_hook_state_suffix(suffix: bytes) -> bool:
+def _runtime_string(value: object) -> bool:
+    """Accept nonblank runtime strings/identifiers without Unicode C0/C1 controls."""
+
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)
+    )
+
+
+def _valid_runtime_profile_suffix(managed: bytes, suffix: bytes) -> bool:
+    """Validate a closed destination-only TOML shape and its complete boundary."""
+
     try:
+        managed_payload = tomllib.loads(_normalize_newlines(managed).decode("utf-8"))
         payload = tomllib.loads(suffix.decode("utf-8"))
+        complete = tomllib.loads(_normalize_newlines(managed + suffix).decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError):
         return False
-    if set(payload) != {"hooks"}:
+    if set(managed_payload) != {"developer_instructions"} or not isinstance(
+        managed_payload["developer_instructions"], str
+    ):
         return False
-    hooks = payload["hooks"]
+    if not managed_payload["developer_instructions"].strip():
+        return False
+    scalar_keys = {"model", "model_reasoning_effort", "plan_mode_reasoning_effort"}
+    if not payload or not set(payload) <= scalar_keys | {"projects", "hooks", "tui"}:
+        return False
+    if complete != managed_payload | payload:
+        return False
+    if any(not _runtime_string(payload[key]) for key in scalar_keys & payload.keys()):
+        return False
+    if "projects" in payload:
+        projects = payload["projects"]
+        if not isinstance(projects, dict) or not all(
+            _runtime_string(identifier)
+            and isinstance(entry, dict)
+            and set(entry) == {"trust_level"}
+            and isinstance(entry["trust_level"], str)
+            and entry["trust_level"] in {"trusted", "untrusted"}
+            for identifier, entry in projects.items()
+        ):
+            return False
+    if "hooks" in payload and (
+        not _hook_state_marker_offsets(suffix) or not _valid_runtime_hook_state(payload["hooks"])
+    ):
+        return False
+    if "tui" in payload:
+        tui = payload["tui"]
+        if not isinstance(tui, dict) or set(tui) != {"model_availability_nux"}:
+            return False
+        nux = tui["model_availability_nux"]
+        if not isinstance(nux, dict) or not all(
+            _runtime_string(identifier) and type(value) is int and value >= 0 for identifier, value in nux.items()
+        ):
+            return False
+    return True
+
+
+def _valid_runtime_hook_state(hooks: object) -> bool:
+    """Preserve existing trust/enablement representation without granting it."""
+
     if not isinstance(hooks, dict) or set(hooks) != {"state"}:
         return False
     state = hooks["state"]
     if not isinstance(state, dict):
         return False
     return all(
-        isinstance(identifier, str)
-        and bool(identifier)
+        _runtime_string(identifier)
         and isinstance(entry, dict)
-        and set(entry) == {"trusted_hash"}
+        and {"trusted_hash"} <= set(entry) <= {"trusted_hash", "enabled"}
         and isinstance(entry["trusted_hash"], str)
         and _TRUSTED_HOOK_HASH.fullmatch(entry["trusted_hash"]) is not None
+        and ("enabled" not in entry or type(entry["enabled"]) is bool)
         for identifier, entry in state.items()
     )
 

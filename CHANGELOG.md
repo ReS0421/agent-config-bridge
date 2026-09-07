@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve an existing managed Codex profile COPY's bounded model/reasoning
+  preferences, project trust, optional Hook enablement, and TUI model state
+  byte-for-byte through no-op, update, backup, and deselection. Canonical
+  generated profiles remain developer-instructions-only; unknown fields,
+  invalid types, modified managed prefixes, and unowned destinations still
+  fail closed. Destination parsing validates the complete TOML boundary,
+  preserves the strict Hook-header subset and existing race/recovery checks,
+  and finds recorded prefixes using linear incremental hashing. Representation
+  validation never grants authority, edits settings, or synchronizes runtime
+  state across targets.
+
 ## [0.3.5] - 2026-07-31
 
 - Preserve only Codex-owned, strictly validated `[hooks.state]` trust metadata

@@ -253,14 +253,27 @@ all reuse the existing per-file lifecycle. A pre-existing runtime
 `<config_home>/<name>.config.toml` remains unmanaged and conflicts even when its
 bytes equal the generated source.
 
-For a managed regular-file COPY only, Codex may append its provider-owned
-`[hooks.state]` suffix. The planner treats it as outside the managed content
-only when every child contains exactly one lowercase SHA-256 `trusted_hash`
-leaf and no other data exists. The table header must start at column zero on
-its own line without a trailing comment. Updates and backups preserve the
-validated suffix byte-for-byte; the Bridge never creates or edits trust state.
-Other Instructions, symlinks, unmanaged profiles, alternate header formatting,
-malformed state, and all other extra profile data still conflict. POSIX apply
+For a managed regular-file COPY only, a destination may retain a bounded
+product/user-owned runtime suffix. Its only optional top-level fields are
+`model`, `model_reasoning_effort`, `plan_mode_reasoning_effort` (nonblank
+strings), `projects` (each identifier maps to exactly `trust_level` with value
+`trusted` or `untrusted`), `hooks.state` (each identifier has a lowercase SHA-256
+`trusted_hash` and optional boolean `enabled`), and
+`tui.model_availability_nux` (identifiers map to nonnegative integers, not
+booleans). Identifiers and scalar strings are nonblank and C0/C1-control-free.
+No model/reasoning enum or runtime authority is inferred. Hook state retains
+the literal column-zero `[hooks.state]` header without a trailing comment.
+
+An incremental normalized-prefix hash identifies the recorded managed bytes
+even when model preferences precede Hook state. The parser checks the managed
+developer-instructions-only document, closed suffix, and complete TOML
+boundary, including duplicate-key rejection. The recorded digest is never
+changed to adopt runtime data. A no-op does not rewrite the file; updates,
+backups, and deselection preserve the suffix byte-for-byte. This is preservation
+of existing local state, not generation, editing, authority validation, or
+cross-target synchronization. Other Instructions, base config, symlinks,
+unmanaged profiles, alternate Hook-header formatting, malformed state, and
+unknown extra data still conflict. POSIX apply
 creates or repairs these profile copies and their retained backups to mode
 `0600`; Windows uses inherited ACLs instead of treating POSIX mode bits as an
 access-control guarantee.

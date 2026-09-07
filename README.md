@@ -67,8 +67,9 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
   `instructions check` commands for Codex profiles whose only TOML data key is
   `developer_instructions`; normal validation and planning reject missing,
   stale, malformed, or undeclared profile outputs. A deployed managed COPY may
-  preserve only Codex's closed, provider-owned `hooks.state` trust suffix;
-  Bridge never creates or edits those entries
+  preserve only a closed, typed Codex runtime suffix (model preferences,
+  project trust, Hook state, and TUI metadata); Bridge never creates or edits
+  those entries
 - Canonical Codex Skill destination: `~/.agents/skills`
 - Claude Code Skill destination: `~/.claude/skills`
 - Dual plugin source overlays with `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`
@@ -380,15 +381,33 @@ never a permitted Instruction destination. Because checking is intentionally
 byte-strict, the Catalog's Git attributes must materialize generated
 `codex/*.config.toml` profiles with LF endings on every platform.
 
-The deployed COPY may later gain a Codex-owned `[hooks.state]` suffix. Bridge
-accepts it only when every non-empty child has exactly one lowercase
-`sha256:<64 hex>` `trusted_hash`; it ignores that validated suffix for managed
-content drift and preserves the exact bytes on update and backup. The
-`[hooks.state]` header itself is a strict subset: it must begin at column zero
-on its own line with no trailing comment. Bridge never creates or modifies
-trust entries. Other extra data, alternate header formatting, malformed state,
-other Instruction files, symlinks, and unmanaged destinations remain
-conflicts. On POSIX, apply creates profile copies as `0600`, repairs legacy
+The deployed managed COPY may later gain a product/user-owned runtime suffix.
+After finding the recorded newline-normalized managed prefix with incremental
+hashing, Bridge validates the complete TOML boundary and only these optional
+suffix fields:
+
+| Runtime field | Accepted representation |
+| --- | --- |
+| `model`, `model_reasoning_effort`, `plan_mode_reasoning_effort` | Nonblank strings; no model/effort enum is inferred |
+| `projects.<identifier>` | Exactly `trust_level = "trusted"` or `"untrusted"` |
+| `hooks.state.<identifier>` | Required lowercase `sha256:<64 hex>` `trusted_hash`, optional boolean `enabled` |
+| `tui.model_availability_nux.<identifier>` | Nonnegative integer, never boolean |
+
+Identifiers are nonblank strings; identifiers and scalar strings cannot contain
+C0/C1 controls. If Hook state is present, the literal `[hooks.state]` header
+must still begin at column zero on its own line without a trailing comment.
+Model preferences may precede this header. Duplicate keys, malformed TOML,
+unknown fields/nested leaves, commands, MCP, approval/sandbox settings, or a
+changed managed prefix remain conflicts. This exception never applies to
+other Instructions, base config, symlinks, or unmanaged destinations.
+
+A no-op never rewrites the profile or changes its recorded managed digest.
+Update, backup, and deselection retain validated suffix bytes exactly, including
+comments, CRLF formatting, and an existing `enabled = false`. Bridge neither
+creates nor edits preferences/trust, copies them into Catalog, synchronizes
+them across targets, nor treats representation validation as approval or proof
+of authority. See [ADR-0007](docs/adr/0007-preserve-codex-profile-hook-trust-state.md).
+On POSIX, apply creates profile copies as `0600`, repairs legacy
 managed profile modes through a reviewed update, and tightens the retained
 profile backup to `0600`; Windows relies on user-private inherited ACLs rather
 than POSIX mode bits.
