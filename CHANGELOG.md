@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-09-07
+
 ### Fixed
 
 - Update CI's pinned Twine distribution validator to 7.0.0 so valid Core
