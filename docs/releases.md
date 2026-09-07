@@ -55,6 +55,19 @@ Do not promote artifacts built from a branch name, a dirty worktree, or a
 commit merely adjacent to the tag. A failed artifact or upload gate is fixed
 under a new version; it is not replaced by a second build with the same tag.
 
+After building, validate both the wheel and source distribution with the same
+pinned checker used by CI, before hashing or uploading either artifact:
+
+```console
+uvx --from twine==7.0.0 twine check dist/*
+```
+
+Twine 7.0.0 includes support for Core Metadata 2.5 emitted by current Hatchling
+builds; Twine 6.2.0 rejects that valid metadata version. See the
+[Twine release notes](https://twine.readthedocs.io/en/latest/changelog.html#twine-7-0-0-2026-07-27).
+This command validates artifacts without uploading them. A validation failure
+still stops the release; do not rewrite generated metadata or skip the check.
+
 ## Record artifact identity
 
 Create a `SHA256SUMS` manifest that records the SHA-256 and filename of every

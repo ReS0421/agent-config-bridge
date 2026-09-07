@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import shutil
 import tomllib
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
@@ -22,7 +24,7 @@ from agent_config_bridge.instruction_profiles import (
     check_instruction_profiles,
     generate_instruction_profiles,
 )
-from agent_config_bridge.models import Component, LinkMode
+from agent_config_bridge.models import Component, LinkMode, Product
 from agent_config_bridge.planner import Disposition, build_plan
 from agent_config_bridge.state import read_instruction_state
 from tests.conftest import make_catalog, make_config
@@ -60,6 +62,18 @@ def _runtime_hook_state_suffix(trusted_hash: str = "a" * 64) -> bytes:
     return (
         f'\n[hooks.state]\n\n[hooks.state."hooks.json:pre_tool_use:0:0"]\ntrusted_hash = "sha256:{trusted_hash}"\n'
     ).encode()
+
+
+def _runtime_configuration_suffix(trusted_hash: str = "a" * 64) -> bytes:
+    """Synthetic product settings, with exact comments/CRLF bytes to retain."""
+
+    return (
+        b'\n# Keep product-owned formatting and preferences.\nmodel = "synthetic-model"\n'
+        b'model_reasoning_effort = "synthetic-effort"\nplan_mode_reasoning_effort = "synthetic-plan"\n'
+        b'\n[projects."/synthetic/project"]\ntrust_level = "trusted"\n'
+        + _runtime_hook_state_suffix(trusted_hash)
+        + b'enabled = false\n\n[tui.model_availability_nux]\n"synthetic-model" = 2\n'
+    ).replace(b"\n", b"\r\n")
 
 
 def _assert_posix_private_mode(path: Path) -> None:
@@ -317,10 +331,12 @@ def test_generated_root_profile_uses_existing_copy_state_backup_and_unmanaged_co
     assert os.path.samefile(unmanaged, unmanaged)
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_generated_profile_copy_preserves_valid_runtime_hook_state_across_lifecycle(
     tmp_path: Path,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
-    """Provider-owned trust stays opaque across no-op, update, backup, and removal."""
+    """Existing runtime data stays opaque across no-op, update, backup, and removal."""
 
     catalog = make_catalog(tmp_path / "catalog", skills=())
     _bundle, source, output = _profile_bundle(catalog)
@@ -343,14 +359,30 @@ def test_generated_profile_copy_preserves_valid_runtime_hook_state_across_lifecy
     _assert_posix_private_mode(installed)
     assert set(tomllib.loads(output.read_text(encoding="utf-8"))) == {"developer_instructions"}
 
-    suffix = _runtime_hook_state_suffix()
+    suffix = suffix_factory("a" * 64)
     installed.write_bytes(installed.read_bytes() + suffix)
     with_runtime_state = installed.read_bytes()
+    before_noop = installed.stat()
+    recorded_digest = next(
+        entry.installed_digest
+        for entry in read_instruction_state(config, target)
+        if entry.relpath == "team-lead.config.toml"
+    )
     noop = build_plan(config, discover_catalog(config))
     noop_action = next(action for action in noop.actions if action.name == "team-lead.config.toml")
     assert noop_action.disposition is Disposition.NOOP
     apply_plan(config, discover_catalog(config), noop)
     assert installed.read_bytes() == with_runtime_state
+    assert (installed.stat().st_ino, installed.stat().st_mtime_ns) == (before_noop.st_ino, before_noop.st_mtime_ns)
+    assert (
+        next(
+            entry.installed_digest
+            for entry in read_instruction_state(config, target)
+            if entry.relpath == "team-lead.config.toml"
+        )
+        == recorded_digest
+        == instruction_module.instruction_digest(output)
+    )
 
     source.write_text("# Team Lead v2\n", encoding="utf-8")
     generate_instruction_profiles(catalog)
@@ -376,9 +408,11 @@ def test_generated_profile_copy_preserves_valid_runtime_hook_state_across_lifecy
     assert profile_backup.read_bytes() == output.read_bytes() + suffix
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_profile_update_rejects_managed_inspection_aba_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """A foreign A -> managed B -> foreign A read cannot install B's suffix."""
 
@@ -387,7 +421,7 @@ def test_profile_update_rejects_managed_inspection_aba_snapshot(
     destination = tmp_path / "profile.config.toml"
     old_source.write_bytes(b'developer_instructions = "old"\n')
     new_source.write_bytes(b'developer_instructions = "new"\n')
-    runtime_suffix = _runtime_hook_state_suffix()
+    runtime_suffix = suffix_factory("a" * 64)
     managed_b = old_source.read_bytes() + runtime_suffix
     foreign_a = b'foreign = "same bytes before and after observation"\n'
     destination.write_bytes(foreign_a)
@@ -430,16 +464,18 @@ def test_profile_update_rejects_managed_inspection_aba_snapshot(
     assert not tuple(tmp_path.glob(".profile.config.toml.agentbridge.*.old"))
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_profile_removal_rejects_managed_inspection_aba_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """Removal cannot parse managed B but displace and retain foreign A."""
 
     old_source = tmp_path / "old.config.toml"
     destination = tmp_path / "profile.config.toml"
     old_source.write_bytes(b'developer_instructions = "old"\n')
-    managed_b = old_source.read_bytes() + _runtime_hook_state_suffix()
+    managed_b = old_source.read_bytes() + suffix_factory("a" * 64)
     foreign_a = b'foreign = "same bytes before and after observation"\n'
     destination.write_bytes(foreign_a)
     original_snapshot = instruction_module._read_exact_regular_file_snapshot
@@ -514,9 +550,11 @@ def test_profile_apply_repairs_legacy_permissions_for_copy_and_backup(tmp_path: 
     _assert_posix_private_mode(backup)
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_profile_update_restores_concurrent_hook_trust_change_and_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """A trust append racing the swap is never silently replaced by stale state."""
 
@@ -532,8 +570,8 @@ def test_profile_update_restores_concurrent_hook_trust_change_and_fails_closed(
     inventory = discover_catalog(config)
     apply_plan(config, inventory, build_plan(config, inventory))
     installed = config.targets[0].config_home / "team-lead.config.toml"
-    original_suffix = _runtime_hook_state_suffix("a" * 64)
-    latest_suffix = _runtime_hook_state_suffix("b" * 64)
+    original_suffix = suffix_factory("a" * 64)
+    latest_suffix = suffix_factory("b" * 64)
     installed.write_bytes(installed.read_bytes() + original_suffix)
 
     source.write_text("# Team Lead v2\n", encoding="utf-8")
@@ -566,9 +604,11 @@ def test_profile_update_restores_concurrent_hook_trust_change_and_fails_closed(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows file sharing prevents replacing an open destination")
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_profile_update_preserves_open_fd_change_after_replacement_install(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """A late old-inode write is retained without deleting the active replacement."""
 
@@ -584,8 +624,8 @@ def test_profile_update_preserves_open_fd_change_after_replacement_install(
     inventory = discover_catalog(config)
     apply_plan(config, inventory, build_plan(config, inventory))
     installed = config.targets[0].config_home / "team-lead.config.toml"
-    original_suffix = _runtime_hook_state_suffix("a" * 64)
-    latest_suffix = _runtime_hook_state_suffix("b" * 64)
+    original_suffix = suffix_factory("a" * 64)
+    latest_suffix = suffix_factory("b" * 64)
     installed.write_bytes(installed.read_bytes() + original_suffix)
     latest_bytes = installed.read_bytes()[: -len(original_suffix)] + latest_suffix
 
@@ -860,9 +900,11 @@ def test_exclusive_copy_source_read_rejects_raced_symlink(
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_profile_removal_restores_concurrent_hook_trust_change_and_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """Deselection never backs up and removes bytes that changed after validation."""
 
@@ -878,8 +920,8 @@ def test_profile_removal_restores_concurrent_hook_trust_change_and_fails_closed(
     inventory = discover_catalog(config)
     apply_plan(config, inventory, build_plan(config, inventory))
     installed = config.targets[0].config_home / "team-lead.config.toml"
-    original_suffix = _runtime_hook_state_suffix("a" * 64)
-    latest_suffix = _runtime_hook_state_suffix("b" * 64)
+    original_suffix = suffix_factory("a" * 64)
+    latest_suffix = suffix_factory("b" * 64)
     installed.write_bytes(installed.read_bytes() + original_suffix)
     target = config.targets[0]
     deselected = replace(
@@ -913,9 +955,11 @@ def test_profile_removal_restores_concurrent_hook_trust_change_and_fails_closed(
     _assert_posix_private_mode(installed)
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_profile_removal_restores_from_backup_when_digest_read_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """EXDEV recovery exclusively copies a retained backup back to an absent path."""
 
@@ -932,7 +976,7 @@ def test_profile_removal_restores_from_backup_when_digest_read_fails(
     inventory = discover_catalog(config)
     apply_plan(config, inventory, build_plan(config, inventory))
     installed = target.config_home / "team-lead.config.toml"
-    suffix = _runtime_hook_state_suffix()
+    suffix = suffix_factory("a" * 64)
     installed.write_bytes(installed.read_bytes() + suffix)
     original_bytes = installed.read_bytes()
     original_digest = instruction_module._exact_file_digest
@@ -998,7 +1042,204 @@ def test_profile_removal_restores_from_backup_when_digest_read_fails(
 @pytest.mark.parametrize(
     "suffix",
     [
-        b'\nmodel = "unsafe"\n',
+        b'model = "synthetic-model"\n',
+        b'model_reasoning_effort = "synthetic-effort"\n',
+        b'plan_mode_reasoning_effort = "synthetic-plan"\n',
+        b'\n[projects."/synthetic/trusted"]\ntrust_level = "trusted"\n',
+        b'\n[projects."/synthetic/untrusted"]\ntrust_level = "untrusted"\n',
+        b'\n[tui.model_availability_nux]\n"synthetic-model" = 0\n',
+        _runtime_hook_state_suffix() + b"enabled = true\n",
+        _runtime_hook_state_suffix() + b"enabled = false\n",
+        _runtime_configuration_suffix(),
+    ],
+)
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_runtime_configuration_matches_only_recorded_normalized_prefix(
+    suffix: bytes,
+    newline: bytes,
+) -> None:
+    managed = b'developer_instructions = "synthetic prompt"\n'
+    inspection = instruction_module._inspect_instruction_copy_bytes(
+        managed.replace(b"\n", newline) + suffix,
+        installed_digest=hashlib.sha256(managed).hexdigest(),
+        allow_runtime_hook_state=True,
+    )
+    assert inspection.managed_matches is True
+    assert inspection.runtime_suffix == suffix
+
+
+def test_runtime_configuration_prefix_hashing_is_linear(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Separator counts must not repeatedly hash growing managed prefixes."""
+
+    managed = b'developer_instructions = "synthetic prompt"\n'
+    suffix = b"\n" * 2000 + _runtime_hook_state_suffix()
+    data = managed + suffix
+    digest = hashlib.sha256(managed).hexdigest()
+    original_sha256 = hashlib.sha256
+    hashed_bytes = 0
+
+    class CountingHash:
+        def __init__(self, value: bytes = b"") -> None:
+            nonlocal hashed_bytes
+            hashed_bytes += len(value)
+            self.inner = original_sha256(value)
+
+        def update(self, value: bytes) -> None:
+            nonlocal hashed_bytes
+            hashed_bytes += len(value)
+            self.inner.update(value)
+
+        def hexdigest(self) -> str:
+            return self.inner.hexdigest()
+
+    monkeypatch.setattr(instruction_module.hashlib, "sha256", CountingHash)
+    inspection = instruction_module._inspect_instruction_copy_bytes(
+        data, installed_digest=digest, allow_runtime_hook_state=True
+    )
+    assert inspection.managed_matches is True
+    assert inspection.runtime_suffix == suffix
+    assert hashed_bytes <= len(data) * 3
+
+
+def test_runtime_configuration_is_destination_only_and_never_adopts_an_unmanaged_copy(tmp_path: Path) -> None:
+    catalog = make_catalog(tmp_path / "catalog", skills=())
+    _bundle, _source, output = _profile_bundle(catalog)
+    generate_instruction_profiles(catalog)
+    config = make_config(tmp_path, catalog, mode=LinkMode.COPY, components=frozenset({Component.INSTRUCTIONS}))
+    destination = config.targets[0].config_home / "team-lead.config.toml"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(output.read_bytes() + _runtime_configuration_suffix())
+    before = destination.read_bytes()
+    plan = build_plan(config, discover_catalog(config))
+    action = next(item for item in plan.actions if item.name == "team-lead.config.toml")
+    assert action.disposition is Disposition.CONFLICT
+    assert "no matching target ownership state" in action.detail
+    assert destination.read_bytes() == before
+    output.write_bytes(before)
+    with pytest.raises(InstructionProfileError, match="only developer_instructions"):
+        check_instruction_profiles(catalog)
+
+
+@pytest.mark.parametrize(
+    "managed",
+    [
+        b'developer_instructions = "modified"\n',
+        b'developer_instructions = "original"\n[projects]\n',
+    ],
+)
+def test_runtime_configuration_does_not_hide_modified_managed_bytes(managed: bytes) -> None:
+    recorded = b'developer_instructions = "original"\n'
+    inspection = instruction_module._inspect_instruction_copy_bytes(
+        managed + _runtime_configuration_suffix(),
+        installed_digest=hashlib.sha256(recorded).hexdigest(),
+        allow_runtime_hook_state=True,
+    )
+    assert inspection.managed_matches is False
+
+
+def test_runtime_configuration_preserves_comments_after_the_recorded_prefix() -> None:
+    managed = b'developer_instructions = "original"\n'
+    suffix = b"# Appended runtime formatting, not a change within the recorded prefix.\n" + (
+        _runtime_configuration_suffix()
+    )
+    inspection = instruction_module._inspect_instruction_copy_bytes(
+        managed + suffix,
+        installed_digest=hashlib.sha256(managed).hexdigest(),
+        allow_runtime_hook_state=True,
+    )
+    assert inspection.managed_matches is True
+    assert inspection.runtime_suffix == suffix
+
+
+@pytest.mark.parametrize(
+    ("product", "relpath"),
+    [
+        (Product.CODEX, "config.toml"),
+        (Product.CODEX, "nested/team-lead.config.toml"),
+        (Product.CODEX, "AGENTS.md"),
+        (Product.CLAUDE_CODE, "team-lead.config.toml"),
+    ],
+)
+def test_runtime_configuration_exception_is_limited_to_codex_root_profiles(product: Product, relpath: str) -> None:
+    managed = b'developer_instructions = "original"\n'
+    permitted = instruction_module.codex_profile_allows_runtime_hook_state(product, relpath)
+    assert permitted is False
+    inspection = instruction_module._inspect_instruction_copy_bytes(
+        managed + _runtime_configuration_suffix(),
+        installed_digest=hashlib.sha256(managed).hexdigest(),
+        allow_runtime_hook_state=permitted,
+    )
+    assert inspection.managed_matches is False
+
+
+def test_runtime_configuration_never_accepts_a_symlink_in_place_of_a_managed_copy(tmp_path: Path) -> None:
+    catalog = make_catalog(tmp_path / "catalog", skills=())
+    _bundle, _source, _output = _profile_bundle(catalog)
+    generate_instruction_profiles(catalog)
+    config = make_config(tmp_path, catalog, mode=LinkMode.COPY, components=frozenset({Component.INSTRUCTIONS}))
+    inventory = discover_catalog(config)
+    apply_plan(config, inventory, build_plan(config, inventory))
+    destination = config.targets[0].config_home / "team-lead.config.toml"
+    destination.write_bytes(destination.read_bytes() + _runtime_configuration_suffix())
+    linked = destination.with_name("linked-profile")
+    destination.replace(linked)
+    try:
+        destination.symlink_to(linked)
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable: {exc}")
+    before = linked.read_bytes()
+    plan = build_plan(config, discover_catalog(config))
+    action = next(item for item in plan.actions if item.name == "team-lead.config.toml")
+    assert action.disposition is Disposition.CONFLICT
+    assert "unsupported type" in action.detail
+    assert destination.is_symlink()
+    assert linked.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "managed",
+    [b'model = "not-a-generated-profile"\n', b"[projects]\n", b'developer_instructions = "unterminated\n'],
+)
+def test_runtime_configuration_requires_a_complete_generated_toml_boundary(managed: bytes) -> None:
+    inspection = instruction_module._inspect_instruction_copy_bytes(
+        managed + _runtime_configuration_suffix(),
+        installed_digest=hashlib.sha256(managed).hexdigest(),
+        allow_runtime_hook_state=True,
+    )
+    assert inspection.managed_matches is False
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        b"\nmodel = 42\n",
+        b'model = ""\n',
+        b'model = "bad\\nmodel"\n',
+        b"model_reasoning_effort = false\n",
+        b'plan_mode_reasoning_effort = ["synthetic"]\n',
+        b'approval_policy = "never"\n',
+        b'sandbox_mode = "danger-full-access"\n',
+        b'[mcp_servers.synthetic]\ncommand = "untrusted"\n',
+        b'developer_instructions = "replacement"\n',
+        b'model = "a"\nmodel = "b"\n',
+        b'model = "unterminated\n',
+        b"\xff",
+        b'[projects."/synthetic"]\ntrust_level = "owner"\n',
+        b'[projects."/synthetic"]\ntrust_level = true\n',
+        b'[projects."/synthetic"]\ntrust_level = "trusted"\nextra = true\n',
+        b'[projects.""]\ntrust_level = "trusted"\n',
+        b'[projects."/synthetic\\npath"]\ntrust_level = "trusted"\n',
+        b"projects = []\n",
+        b'[tui.model_availability_nux]\n"synthetic" = true\n',
+        b'[tui.model_availability_nux]\n"synthetic" = -1\n',
+        b'[tui.model_availability_nux]\n"synthetic" = 1.0\n',
+        b'[tui.model_availability_nux]\n"" = 1\n',
+        b'[tui.model_availability_nux]\n"synthetic\\u0085model" = 1\n',
+        b"[tui]\nother = true\n",
+        _runtime_hook_state_suffix() + b'enabled = "false"\n',
+        _runtime_hook_state_suffix() + b"enabled = 0\n",
+        _runtime_hook_state_suffix() + b"enabled = false\nenabled = true\n",
+        _runtime_hook_state_suffix().replace(b"pre_tool_use", b"pre\\ntool_use"),
         b"\n[hooks]\nenabled = true\n",
         b'\n[hooks.state]\n[hooks.state."entry"]\ntrusted_hash = "sha256:ABC"\n',
         b'\n[hooks.state]\n[hooks.state."entry"]\ntrusted_hash = "sha256:' + b"a" * 64 + b'"\nextra = true\n',
@@ -1011,7 +1252,7 @@ def test_generated_profile_copy_conflicts_on_unsafe_runtime_suffix(
     tmp_path: Path,
     suffix: bytes,
 ) -> None:
-    """Only the closed provider Hook trust shape is excluded from drift."""
+    """Only the closed, typed runtime shape is excluded from managed drift."""
 
     catalog = make_catalog(tmp_path / "catalog", skills=())
     _bundle, _source, _output = _profile_bundle(catalog)
@@ -1034,8 +1275,10 @@ def test_generated_profile_copy_conflicts_on_unsafe_runtime_suffix(
     assert profile_action.detail == "managed instruction copy was modified after installation"
 
 
+@pytest.mark.parametrize("suffix_factory", [_runtime_hook_state_suffix, _runtime_configuration_suffix])
 def test_runtime_hook_state_exception_does_not_apply_to_other_instruction_files(
     tmp_path: Path,
+    suffix_factory: Callable[[str], bytes],
 ) -> None:
     """A product suffix never broadens drift tolerance for canonical Markdown."""
 
@@ -1051,7 +1294,7 @@ def test_runtime_hook_state_exception_does_not_apply_to_other_instruction_files(
     inventory = discover_catalog(config)
     apply_plan(config, inventory, build_plan(config, inventory))
     installed_markdown = config.targets[0].config_home / "model-instructions/team-lead.md"
-    installed_markdown.write_bytes(installed_markdown.read_bytes() + _runtime_hook_state_suffix())
+    installed_markdown.write_bytes(installed_markdown.read_bytes() + suffix_factory("a" * 64))
 
     plan = build_plan(config, discover_catalog(config))
 

@@ -200,14 +200,26 @@ not change the product launch command or select a profile automatically. It
 never projects `<config_home>/config.toml` through Instructions and does not
 claim support for analogous Claude Code profile TOML.
 
-A managed regular-file COPY of that generated root profile may contain a
-provider-owned `[hooks.state]` suffix after Codex records Hook approvals. The
-Bridge accepts only non-empty child identifiers with exactly one lowercase
-SHA-256 `trusted_hash` leaf, preserves the validated suffix byte-for-byte on
-update and backup, and never creates or edits trust. The `[hooks.state]` header
-must begin at column zero on its own line without a trailing comment. Any other
-extra data, alternate header formatting, other Instruction destination,
-symlink, or unmanaged file remains a conflict. On POSIX, apply creates or
+A managed regular-file COPY of that generated root profile may retain only
+these product/user-owned runtime fields after its recorded managed prefix:
+nonblank string `model`, `model_reasoning_effort`, and
+`plan_mode_reasoning_effort`; `projects` identifiers with exactly string
+`trust_level` (`trusted` or `untrusted`); `hooks.state` identifiers with required
+lowercase SHA-256 `trusted_hash` and optional boolean `enabled`; and
+`tui.model_availability_nux` identifiers with nonnegative integer values (not
+booleans). Identifiers and scalar strings must be nonblank and contain no
+C0/C1 controls. There is no model/reasoning enum or authority inference.
+
+The literal `[hooks.state]` header must still begin at column zero on its own
+line without a trailing comment; preferences may precede it. Incremental
+prefix matching and complete-document TOML validation reject changed managed
+content, duplicate keys, malformed data, unknown fields, and extra nested
+leaves. No-op leaves the profile untouched; update, backup, and deselection
+preserve suffix bytes exactly, including comments, CRLF, and disabled Hook
+state. Nothing is copied into Catalog, synchronized across targets, or treated
+as a new approval. Other Instruction destinations, base config, symlinks,
+unmanaged files, and alternate Hook-header formatting remain conflicts.
+On POSIX, apply creates or
 repairs managed profile copies and their retained backups to `0600`. On
 Windows, inherited ACLs are authoritative; POSIX-style mode assertions are not
 an ACL substitute.
