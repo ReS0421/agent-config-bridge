@@ -45,9 +45,10 @@ from agent_config_bridge.planner import CommandHint, SyncPlan, build_plan
 from agent_config_bridge.platforms import UnsupportedPlatformError, current_platform, scope_product_home_environment
 from agent_config_bridge.renderer import RenderError, render_marketplace
 from agent_config_bridge.retention import (
-    RetentionAction,
+    RetentionApplyStopped,
     RetentionError,
     RetentionPlan,
+    RetentionResult,
     apply_retention_plan,
     build_retention_plan,
 )
@@ -221,7 +222,10 @@ def _build_parser() -> argparse.ArgumentParser:
     state_subparsers = state_parser.add_subparsers(dest="state_command", required=True)
     prune_parser = state_subparsers.add_parser(
         "prune",
-        help=("plan bounded generated-state retention; --yes validates no-change plans and fails closed for actions"),
+        help=(
+            "plan bounded generated-state retention; --yes deletes only generation-verified Skill backup "
+            "captures and never deletes deferred entries"
+        ),
     )
     prune_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
     prune_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
@@ -229,7 +233,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="validate a reviewed no-change plan; action-bearing plans fail closed",
+        help=(
+            "capture, verify, and delete the reviewed Skill backup candidates; deferred entries are reported and "
+            "kept; exits 0 only when no candidates or blockers remain, otherwise exits 2 with applied false"
+        ),
     )
 
     instructions_parser = subparsers.add_parser(
@@ -559,18 +566,31 @@ def _command_state(config: BridgeConfig, args: argparse.Namespace) -> int:
         return 1
 
     if args.yes:
-        result = apply_retention_plan(config, plan)
+        try:
+            result = apply_retention_plan(config, plan)
+        except RetentionError as exc:
+            if args.json:
+                stopped = exc.result if isinstance(exc, RetentionApplyStopped) else None
+                _print_json(
+                    _retention_payload(
+                        stopped.final_plan if stopped is not None else plan,
+                        applied=False,
+                        reviewed_plan=plan,
+                        result=stopped,
+                        error=str(exc),
+                    )
+                )
+            raise
         payload = _retention_payload(
             result.final_plan,
             applied=True,
             reviewed_plan=plan,
-            deleted=result.deleted,
-            reclaimed_bytes=result.reclaimed_bytes,
+            result=result,
         )
         if args.json:
             _print_json(payload)
         else:
-            print("retention validation completed: the reviewed no-change plan remains current")
+            _print_retention_result(result)
         return 0
 
     payload = _retention_payload(plan, applied=False)
@@ -586,11 +606,22 @@ def _retention_payload(
     *,
     applied: bool,
     reviewed_plan: RetentionPlan | None = None,
-    deleted: Sequence[RetentionAction] = (),
-    reclaimed_bytes: int | None = None,
+    result: RetentionResult | None = None,
+    error: str | None = None,
 ) -> dict[str, Any]:
+    """Build the schema-1 prune payload; every field after ``converged`` is additive.
+
+    ``plan`` is the final plan and ``reviewed_plan`` the plan that ``--yes`` applied
+    (both are the same plan for a dry run). ``safe``, ``has_changes``,
+    ``has_blockers``, the counts, ``actions``, ``blockers``, and
+    ``excluded_instruction_roots`` describe the reviewed plan. ``converged``,
+    ``fully_converged``, ``deferred``, ``deferred_bytes``, ``recovery_pending``,
+    and ``capture`` describe the final plan. ``deleted`` and the other per-path
+    lists report what this run actually did, even when ``applied`` is false.
+    """
+
     source_plan = reviewed_plan or plan
-    return {
+    payload: dict[str, Any] = {
         "schema_version": 1,
         "applied": applied,
         "safe": not source_plan.has_blockers,
@@ -610,10 +641,27 @@ def _retention_payload(
         "actions": [asdict(action) for action in source_plan.actions],
         "blockers": [asdict(blocker) for blocker in source_plan.blockers],
         "excluded_instruction_roots": list(source_plan.excluded_instruction_roots),
-        "deleted": [asdict(item) for item in deleted],
-        "reclaimed_bytes": reclaimed_bytes if reclaimed_bytes is not None else 0,
-        "converged": not plan.has_changes and not plan.has_blockers,
+        "deleted": [asdict(item) for item in result.deleted] if result is not None else [],
+        "reclaimed_bytes": result.reclaimed_bytes if result is not None else 0,
+        "converged": error is None and not plan.has_changes and not plan.has_blockers,
+        "fully_converged": error is None and plan.fully_converged,
+        "deferred": [asdict(item) for item in plan.deferred],
+        "deferred_bytes": plan.deferred_bytes,
+        "recovery_pending": [asdict(item) for item in plan.recovery_pending],
+        "capture": {
+            "capable": plan.capability.capable,
+            "reason": plan.capability.reason,
+            "quiescence_seconds": plan.quiescence_seconds,
+        },
+        "restored": list(result.restored) if result is not None else [],
+        "quarantined": list(result.quarantined) if result is not None else [],
+        "busy": list(result.busy) if result is not None else [],
+        "pending_cleanup": list(result.pending_cleanup) if result is not None else [],
+        "recovered": [asdict(event) for event in result.recovered] if result is not None else [],
     }
+    if error is not None:
+        payload["error"] = error
+    return payload
 
 
 def _print_retention_plan(plan: RetentionPlan) -> None:
@@ -621,14 +669,40 @@ def _print_retention_plan(plan: RetentionPlan) -> None:
         "retention plan: "
         f"{plan.build_count} marketplace builds, "
         f"{plan.skill_backup_snapshot_count} Skill backups, "
-        f"{len(plan.actions)} deletion candidates, {len(plan.blockers)} blockers"
+        f"{len(plan.actions)} deletion candidates, {len(plan.deferred)} deferred, "
+        f"{len(plan.blockers)} blockers"
     )
     for blocker in plan.blockers:
         print(f"  BLOCKED {blocker.path}: {blocker.reason}")
     for action in plan.actions:
         print(f"  CANDIDATE  {action.category}: {action.path}")
+    for deferral in plan.deferred:
+        print(f"  DEFERRED   {deferral.category}: {deferral.path} ({deferral.reason})")
+    for pending in plan.recovery_pending:
+        print(f"  RECOVERY   {pending.path}: {pending.detail}")
     if plan.has_changes:
-        print("review only; automated deletion is disabled, and --yes fails closed when the plan contains actions")
+        print(
+            "review only; --yes captures each candidate into private Bridge state, verifies its "
+            "generation-bound identity after the move, and deletes only verified captures"
+        )
+    if plan.deferred:
+        print("deferred entries are reported and kept; they never block --yes")
+
+
+def _print_retention_result(result: RetentionResult) -> None:
+    if not (result.deleted or result.recovered or result.pending_cleanup):
+        print("retention validation completed: the reviewed no-change plan remains current")
+    else:
+        print(
+            f"retention apply completed: deleted {len(result.deleted)} verified Skill backup snapshots "
+            f"({result.reclaimed_bytes} bytes)"
+        )
+    for event in result.recovered:
+        print(f"  RECOVERED {event.outcome}: {event.path}")
+    for path in result.pending_cleanup:
+        print(f"  PENDING CLEANUP {path}")
+    if result.final_plan.deferred:
+        print(f"{len(result.final_plan.deferred)} deferred entries were kept")
 
 
 def _command_init(args: argparse.Namespace) -> int:

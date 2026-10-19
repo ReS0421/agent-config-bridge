@@ -203,14 +203,41 @@ agentbridge state prune -c agentbridge.toml --yes --json
 ```
 
 Planning is byte-preserving and reports retention candidates. A blocker-bearing
-plan exits with status 1 without entering apply. Otherwise, `--yes` returns
-status 0 only for locked validation of a no-action plan; a plan with any
-marketplace-build, Skill-directory, or terminal-symlink deletion candidate
-exits with status 2 before mutation and deletes nothing. Automatic destructive
-apply remains disabled until candidates have non-reusable generation identity
-and can be captured atomically before deletion. No backup/build marker
-migration is performed. The currently published marketplace build remains
-pinned, and Instruction backups remain outside this retention policy.
+plan exits with status 1 without entering apply. Otherwise `--yes` captures each
+POSIX Skill backup directory candidate into private Bridge state, verifies its
+device, inode, inode generation, and marker-inclusive digest after the move, and
+deletes only verified captures
+([ADR-0008](docs/adr/0008-generation-bound-retention-capture.md)).
+
+Deletion needs a passing capability probe: Linux on `x86_64` or `aarch64`,
+symlink-safe descriptor-relative `rmtree`, a working `FS_IOC_GETVERSION` and a
+readable mount ID for the backups root, an `ext2`/`ext3`/`ext4` state
+filesystem, and a private `retention/` tree on the same device. On any other
+host or filesystem (for example `tmpfs`, `xfs`, `btrfs`, or WSL `9p`/drvfs),
+every Skill backup candidate is deferred. Marketplace builds, terminal symlink
+snapshots, native Windows candidates, and snapshots changed in the last 15
+minutes are also reported as `deferred`, each with a `reason_code`, and kept.
+Deferrals never make `--yes` fail.
+
+`--yes` exits with status 0 and `applied: true` only when the final plan has no
+deletion candidates and no blockers, so `converged` is then `true`. Any other
+apply exits with status 2 and prints `applied: false` and `error`, together with
+what the run deleted, restored, or quarantined. That covers:
+
+- a capture that no longer matches, which is restored or quarantined;
+- a kept snapshot of the same group that changed or disappeared;
+- a backup ancestor that went missing or was redirected;
+- a busy capture rename;
+- a mount found in a verified capture, which is quarantined;
+- recovery that quarantined an interrupted capture;
+- recovery that restored an interrupted capture while other candidates or
+  blockers remain. A lone restored capture is usually deferred by the
+  quiescence window, so that run exits with status 0 and lists it in `restored`
+  and `recovered`.
+
+The next run then reviews a fresh plan. No backup/build marker migration is
+performed. The currently published marketplace build remains pinned, and
+Instruction backups remain outside this retention policy.
 
 Registration remains deliberately separate:
 
@@ -484,11 +511,16 @@ for the schema and lifecycle.
 - Copy mode updates only when the ownership marker matches and the installed digest has not drifted.
 - Updated or deselected, unchanged managed copies are retained under the
   configured state directory.
-- `state prune` is a byte-preserving dry run by default. A blocker-bearing plan
-  exits with status 1 without entering apply. Otherwise, `--yes` returns status
-  0 only after locked no-action validation; an action-bearing plan exits with
-  status 2 before mutation and deletes nothing. Destructive retention remains
-  disabled pending generation-bound atomic candidate capture.
+- `state prune` is a byte-preserving dry run by default and never creates
+  `retention/`. A blocker-bearing plan, including a mount inside a candidate,
+  exits with status 1 without entering apply. Otherwise, `--yes` recovers
+  interrupted capture runs and revalidates the plan under a lock. It deletes
+  only Skill backup directories that were renamed into a private capture run
+  and matched after the move on a non-reusable `(st_dev, st_ino,
+  i_generation)` identity. Deferred entries are kept. A mismatch, a changed
+  kept snapshot, a missing or redirected ancestor, a busy rename, or a
+  quarantine exits with status 2 and `applied: false`, and so does a recovery
+  that restores a capture while candidates or blockers remain.
 - Marketplace builds are immutable and addressed by source digest; the stable
   published snapshot is integrity-checked before reuse or replacement.
 - Settings update/remove only while each current value matches its target-scoped

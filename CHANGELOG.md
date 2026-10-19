@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `agentbridge state prune --yes` deletes Skill backup directory snapshots
+  again (ADR-0008). An action-bearing plan that it applies now exits with
+  status 0 and `applied: true`; before, every action-bearing `--yes` exited
+  with status 2 before mutation.
+- Exit status 0 with `applied: true` now always implies `converged: true`.
+  Any apply whose final plan still has deletion candidates or blockers exits
+  with status 2 and prints `applied: false`, `error`, and what it deleted,
+  restored, or quarantined. A recovery that restores an interrupted capture
+  deletes nothing new in that run, and it exits with status 2 only if
+  candidates or blockers remain.
+- Marketplace builds, terminal symlink snapshots, native Windows, snapshots
+  changed within the 15-minute quiescence window, and hosts or filesystems that
+  fail the capability probe (non-Linux, filesystems outside `ext2`/`ext3`/`ext4`
+  such as `tmpfs`, `xfs`, `btrfs`, or `9p`) are reported as `deferred` and never
+  deleted. Each deferral has a `reason_code`: `marketplace_build`,
+  `symlink_snapshot`, `capture_unavailable`, or `quiescence`. Deferrals are not
+  actions and never make `--yes` fail.
+- The prune JSON stays at `schema_version` 1. `converged` now means no
+  non-deferred actions and no blockers. Additive fields:
+  - `fully_converged`, `deferred`, `deferred_bytes`, `recovery_pending`,
+    `capture`, `restored`, `quarantined`, `busy`, `pending_cleanup`,
+    `recovered`;
+  - per-action `generation`, `capture_digest`, `entry_count`; per-deferral
+    `reason_code`.
+
+  `actions`, `blockers`, and `safe` describe the reviewed plan. `converged`,
+  `fully_converged`, `deferred`, `deferred_bytes`, `recovery_pending`, and
+  `capture` describe the final plan. A failed `--yes --json` also prints the
+  payload with `applied: false` and `error`.
+
 ### Fixed
 
 - Stop interpreter-written bytecode caches from making an installed managed
@@ -24,6 +56,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trade-off: anyone who can write to an installed Skill can make Python run a
   planted or forged cache instead of the verified source without Bridge
   reporting drift.
+
+### Security
+
+- Retention deletion uses generation-bound atomic capture.
+  - Each candidate is bound to `(st_dev, st_ino, i_generation)` and a
+    marker-inclusive, length-prefixed `capture_digest`.
+  - It is renamed by descriptor into a private `state_dir/retention/capture/`
+    run and verified after the move. The kept snapshots of its group are
+    checked again before it is recorded as `verified`.
+  - Only captures recorded as `verified` in the run's on-disk manifest are
+    removed. A byte-identical replacement, reused inode, or concurrent swap is
+    restored or quarantined instead.
+  - A mount at or inside a candidate is a planning blocker. A mount found in a
+    verified capture just before `rmtree` is quarantined, never deleted.
+  - Only a capture that is a real directory is renamed back; anything else is
+    quarantined. A refused delete is recorded as `captured` again before its
+    capture is renamed back.
+  - A read-only subdirectory inside a verified capture is set to `0700` through
+    its own no-follow descriptor, so the delete completes.
+  - Interrupted runs recover on the next apply and are reported as non-blocking
+    `recovery_pending`. Recovery quarantines only on definitive errors and
+    keeps the run for a retry otherwise. Planning never creates `retention/`.
 
 ## [0.3.6] - 2026-09-07
 

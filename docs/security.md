@@ -375,13 +375,40 @@ Current alpha limitations matter for threat modeling:
   managed-copy actions have localized snapshot/swap recovery;
 - a later action can fail after an earlier action succeeded;
 - symlink mode is live, so canonical Skill changes become visible immediately;
-- `state prune` retains byte-preserving planning, but an action-bearing
-  `--yes` invocation fails before mutation across marketplace builds, Skill
-  directories, and terminal symlinks; only locked no-change validation remains
-  available until generation-bound atomic candidate capture is implemented;
-- a future generation token is an object-identity aid, not authorization
-  against a same-account actor that can directly rewrite or delete Bridge
-  state; that actor remains outside the retention race-safety boundary;
+- `state prune` planning stays byte-preserving and never creates
+  `state_dir/retention/`. `--yes` deletes only POSIX Skill backup directories
+  ([ADR-0008](adr/0008-generation-bound-retention-capture.md)). Each candidate
+  is renamed into a private `0700` capture run and matched after the move on
+  `(st_dev, st_ino, i_generation)` and a marker-inclusive, length-prefixed
+  digest. Only a capture recorded as `verified` in its run's on-disk manifest
+  is removed. A mismatch is renamed back or quarantined, and an interrupted run
+  is recovered on the next apply. Exit status 0 with `applied: true` always
+  means the final plan converged; every other apply exits with status 2;
+- the capture digest rejects an entry on another device or a descriptor on
+  another mount (fdinfo `mnt_id`), so a mount at or inside a candidate is a
+  planning blocker. The verified slot is checked again immediately before
+  `rmtree`, and a mount found there is quarantined, never deleted. A mount
+  created after that check needs mount privilege in Bridge's mount namespace
+  and is outside this boundary;
+- marketplace builds, terminal symlink snapshots, native Windows, non-Linux
+  hosts, snapshots changed within the 15-minute quiescence window, and
+  filesystems outside the `ext2`/`ext3`/`ext4` generation allowlist are
+  reported as `deferred` and are never deleted;
+- the inode generation is an object-identity aid, not authorization against a
+  same-account actor that can directly rewrite or delete Bridge state,
+  including the private capture and quarantine directories; that actor remains
+  outside the retention race-safety boundary;
+- only a capture that is a real directory is renamed back; any other capture
+  is quarantined. The restore checks that the original name is free and then
+  renames without `RENAME_NOREPLACE`, so only a directory created empty at that
+  name in that instant could be replaced (a non-empty directory or a
+  non-directory fails the rename, and the capture is quarantined). Snapshot
+  names carry a random 8-hex suffix, and phase 1 does not call `renameat2`
+  through `ctypes`;
+- just before `rmtree`, each directory inside the verified private capture that
+  lacks owner `rwx` is set to `0700` through its own no-follow descriptor, never
+  by path, so a read-only subdirectory does not block deletion; a directory the
+  owner cannot read stays as pending cleanup;
 - transaction-wide Instruction recovery after process interruption remains out
   of scope; the update/remove paths provide only localized fail-closed recovery;
 - Instruction copy, backup, and install checks do not fsync their file contents
@@ -395,7 +422,10 @@ visible before the final old-inode and backup checks. A same-filesystem
 hard-linked backup continues to receive writes to that inode. A
 cross-filesystem byte-copy backup cannot receive a write made after the final
 old-inode check and local-name cleanup. Direct same-user replacement or deletion
-of Bridge private candidates is likewise outside this retention boundary.
+of Bridge private candidates is likewise outside this retention boundary. Retention
+capture also cannot revoke a descriptor that another same-user process opened on
+a Skill backup before the capture rename. Writes through that descriptor reach the
+captured object and are lost when it is deleted.
 
 After an interrupted operation, inspect a fresh `plan`. Restore a retained
 managed-copy backup manually only after reviewing both the destination and

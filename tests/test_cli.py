@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import functools
 import json
+import os
 import shutil
 import subprocess
+import time
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-from agent_config_bridge import cli, marketplace_registry
+from agent_config_bridge import cli, marketplace_registry, retention
 from agent_config_bridge import renderer as renderer_module
 from agent_config_bridge.catalog import Artifact, CatalogError, discover_catalog
 from agent_config_bridge.config import load_config
@@ -21,12 +24,19 @@ from agent_config_bridge.planner import CommandHint, build_plan
 from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.renderer import RenderError
 from agent_config_bridge.retention import (
+    CaptureCapability,
     RetentionAction,
+    RetentionApplyStopped,
     RetentionBlocker,
+    RetentionDeferral,
+    RetentionError,
     RetentionPlan,
+    RetentionRecoveryPending,
+    RetentionResult,
 )
+from agent_config_bridge.retention_capture import DEFAULT_CAPTURE_OPS
 from agent_config_bridge.state import read_registered_plugins, read_skill_state, write_registered_plugins
-from tests.conftest import make_catalog
+from tests.conftest import make_catalog, make_skill_backup
 
 
 @pytest.mark.parametrize(
@@ -56,7 +66,7 @@ def test_mutating_command_help_names_its_full_reconciliation_scope(
     assert expected in " ".join(capsys.readouterr().out.split())
 
 
-def test_state_prune_help_describes_no_change_validation_and_action_fail_closed(
+def test_state_prune_help_describes_verified_capture_and_deferrals(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as raised:
@@ -64,16 +74,25 @@ def test_state_prune_help_describes_no_change_validation_and_action_fail_closed(
 
     assert raised.value.code == 0
     output = " ".join(capsys.readouterr().out.split())
-    assert "validate a reviewed no-change plan" in output
-    assert "action-bearing plans fail closed" in output
-    assert "apply the reviewed retention plan" not in output
-    assert "delete the reviewed entries" not in output
+    assert "capture, verify, and delete the reviewed Skill backup candidates" in output
+    assert "deferred entries are reported and kept" in output
+    assert "exits 0 only when no candidates or blockers remain, otherwise exits 2 with applied false" in output
+    assert "fail closed" not in output
 
 
 _CODEX_FIXTURES = Path(__file__).parent / "fixtures" / "codex-marketplace-list"
-_DESTRUCTIVE_RETENTION_DISABLED = (
-    "destructive retention apply is disabled until generation-bound atomic "
-    "candidate capture exists; no entries were deleted"
+_WRAPPER_FIELDS = ("schema_version", "applied", "safe", "has_blockers", "converged")
+_ADDITIVE_FIELDS = (
+    "fully_converged",
+    "deferred",
+    "deferred_bytes",
+    "recovery_pending",
+    "capture",
+    "restored",
+    "quarantined",
+    "busy",
+    "pending_cleanup",
+    "recovered",
 )
 
 
@@ -1477,8 +1496,11 @@ def test_state_prune_is_a_read_only_json_plan_without_yes(
     assert payload["actions"] == [
         {
             "bytes": 10,
+            "capture_digest": None,
             "category": "marketplace_build",
             "device": 2,
+            "entry_count": None,
+            "generation": None,
             "inode": 3,
             "mtime_ns": 1,
             "node_kind": "directory",
@@ -1488,6 +1510,9 @@ def test_state_prune_is_a_read_only_json_plan_without_yes(
     assert payload["deleted"] == []
     assert payload["reclaimed_bytes"] == 0
     assert payload["converged"] is False
+    assert payload["fully_converged"] is False
+    assert all(field in payload for field in _ADDITIVE_FIELDS)
+    assert "error" not in payload
 
 
 def test_state_prune_human_dry_run_labels_candidates_and_disabled_deletion(
@@ -1514,13 +1539,13 @@ def test_state_prune_human_dry_run_labels_candidates_and_disabled_deletion(
 
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "1 deletion candidates" in captured.out
+    assert "1 deletion candidates, 0 deferred" in captured.out
     assert f"CANDIDATE  marketplace_build: {action_path}" in captured.out
-    assert "automated deletion is disabled" in captured.out
+    assert "deletes only verified captures" in captured.out
     assert captured.err == ""
 
 
-def test_state_prune_yes_rejects_action_plan_without_deletion(
+def test_state_prune_yes_stopped_capture_emits_json_error_and_exit_two(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1528,9 +1553,6 @@ def test_state_prune_yes_rejects_action_plan_without_deletion(
     make_catalog(tmp_path / "catalog")
     config_path = _write_config(tmp_path, components=())
     action_path = tmp_path / "state" / "backups" / "local" / "seo" / "20260723-120000-1234abcd"
-    action_path.mkdir(parents=True)
-    sentinel = action_path / "keep.txt"
-    sentinel.write_text("keep\n", encoding="utf-8")
     action = RetentionAction(
         category="skill_backup",
         path=action_path,
@@ -1539,18 +1561,54 @@ def test_state_prune_yes_rejects_action_plan_without_deletion(
         mtime_ns=1,
         device=2,
         inode=3,
+        generation=4,
+        capture_digest="0" * 64,
+        entry_count=2,
     )
     reviewed = _retention_plan(config_path, actions=(action,))
+    stopped = RetentionApplyStopped(
+        "captured entry did not match its reviewed identity",
+        RetentionResult(deleted=(), reclaimed_bytes=0, final_plan=reviewed, restored=(action_path,)),
+    )
     monkeypatch.setattr(cli, "build_retention_plan", lambda _config: reviewed)
+    monkeypatch.setattr(cli, "apply_retention_plan", lambda *_args: (_ for _ in ()).throw(stopped))
 
     exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
 
     assert exit_code == 2
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == f"error: {_DESTRUCTIVE_RETENTION_DISABLED}\n"
-    assert action_path.is_dir()
-    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    payload = json.loads(captured.out)
+    assert payload["schema_version"] == 1
+    assert payload["applied"] is False
+    assert payload["converged"] is False
+    assert payload["restored"] == [str(action_path)]
+    assert payload["deleted"] == []
+    assert payload["error"] == "captured entry did not match its reviewed identity"
+    assert captured.err == "error: captured entry did not match its reviewed identity\n"
+
+
+def test_state_prune_yes_plain_apply_error_still_emits_json_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    message = "generated state changed after retention planning; review a fresh plan"
+    monkeypatch.setattr(
+        cli,
+        "apply_retention_plan",
+        lambda *_args: (_ for _ in ()).throw(RetentionError(message)),
+    )
+
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["applied"] is False
+    assert payload["error"] == message
+    assert captured.err == f"error: {message}\n"
 
 
 def test_state_prune_yes_validates_no_action_plan(
@@ -1570,6 +1628,7 @@ def test_state_prune_yes_validates_no_action_plan(
     assert payload["deleted"] == []
     assert payload["reclaimed_bytes"] == 0
     assert payload["converged"] is True
+    assert payload["fully_converged"] is True
 
 
 def test_state_prune_yes_human_output_reports_validation_not_deletion(
@@ -1611,3 +1670,292 @@ def test_state_prune_blocker_fails_closed_without_apply(
     assert payload["safe"] is False
     assert payload["has_blockers"] is True
     assert payload["deleted"] == []
+
+
+def _capture_ops_in_cli(monkeypatch: pytest.MonkeyPatch, *, now_offset_ns: int, **overrides: object) -> None:
+    ops = replace(DEFAULT_CAPTURE_OPS, now_ns=lambda: time.time_ns() + now_offset_ns, **overrides)
+    monkeypatch.setattr(cli, "build_retention_plan", functools.partial(retention.build_retention_plan, ops=ops))
+    monkeypatch.setattr(cli, "apply_retention_plan", functools.partial(retention.apply_retention_plan, ops=ops))
+
+
+def _prune_json(config_path: Path, capsys: pytest.CaptureFixture[str], *extra: str) -> tuple[int, dict]:
+    exit_code = cli.main(["state", "prune", "-c", str(config_path), *extra, "--json"])
+    return exit_code, json.loads(capsys.readouterr().out)
+
+
+def test_state_prune_yes_deletes_verified_candidates_with_schema_one_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    state_dir = tmp_path / "state"
+    backups = [make_skill_backup(state_dir, index, target="local") for index in range(4)]
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=3600 * 1_000_000_000)
+
+    _, preview = _prune_json(config_path, capsys)
+    if not preview["capture"]["capable"]:
+        pytest.skip(f"generation-bound capture is unavailable: {preview['capture']['reason']}")
+    exit_code, payload = _prune_json(config_path, capsys, "--yes")
+
+    assert exit_code == 0
+    assert {field: payload[field] for field in _WRAPPER_FIELDS} == {
+        "schema_version": 1,
+        "applied": True,
+        "safe": True,
+        "has_blockers": False,
+        "converged": True,
+    }
+    assert all(field in payload for field in _ADDITIVE_FIELDS)
+    assert [item["path"] for item in payload["deleted"]] == [str(backups[0])]
+    assert payload["deleted"][0]["generation"] is not None
+    assert payload["reclaimed_bytes"] == payload["deleted"][0]["bytes"]
+    assert payload["fully_converged"] is True
+    assert not backups[0].exists()
+    assert all(path.is_dir() for path in backups[1:])
+
+
+def test_state_prune_yes_does_not_fail_because_of_deferrals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    backups = [make_skill_backup(tmp_path / "state", index, target="local") for index in range(4)]
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=0)  # every snapshot is inside the quiescence window
+
+    exit_code, payload = _prune_json(config_path, capsys, "--yes")
+
+    assert exit_code == 0
+    assert payload["applied"] is True
+    assert payload["has_changes"] is False
+    assert payload["converged"] is True
+    assert payload["fully_converged"] is False
+    assert [item["path"] for item in payload["deferred"]] == [str(backups[0])]
+    assert payload["deferred"][0]["reason_code"] == "quiescence"
+    assert payload["deferred_bytes"] == payload["deferred"][0]["bytes"]
+    assert payload["deleted"] == []
+    assert all(path.is_dir() for path in backups)
+
+
+def test_state_prune_dry_run_payload_is_stable_between_runs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    [make_skill_backup(tmp_path / "state", index, target="local") for index in range(5)]
+
+    first_code, first = _prune_json(config_path, capsys)
+    second_code, second = _prune_json(config_path, capsys)
+
+    assert first_code == second_code == 0
+    assert first == second
+    assert first["schema_version"] == 1
+    assert "quiescence_cutoff_ns" not in json.dumps(first)
+    assert not (tmp_path / "state" / "retention").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative capture is POSIX-only")
+def test_state_prune_reports_recovery_pending_without_blocking(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    state_dir = tmp_path / "state"
+    make_skill_backup(state_dir, 0, target="local")
+    run = state_dir / "retention" / "capture" / ("b" * 32)
+    run.mkdir(parents=True)
+    for path in (run.parent.parent, run.parent, run):
+        path.chmod(0o700)
+
+    plan_code, plan = _prune_json(config_path, capsys)
+    apply_code, applied = _prune_json(config_path, capsys, "--yes")
+
+    assert plan_code == 0
+    assert plan["has_blockers"] is False
+    assert plan["converged"] is True
+    assert plan["fully_converged"] is False
+    assert [item["path"] for item in plan["recovery_pending"]] == [str(run)]
+    assert apply_code == 0
+    assert applied["recovered"] == [{"outcome": "cleaned_up", "path": str(run)}]
+    assert applied["fully_converged"] is True
+    assert not run.exists()
+
+
+_HOUR_NS = 3600 * 1_000_000_000
+_LIMIT_ONE = "\n[bridge.retention]\nskill_backups = 1\n"
+
+
+class _CliCrash(BaseException):
+    """Simulated process death inside ``agentbridge state prune --yes``."""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative capture is POSIX-only")
+def test_state_prune_yes_exits_two_when_recovery_restores_then_converges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=(), target_extra=_LIMIT_ONE)
+    backups = [make_skill_backup(tmp_path / "state", index, target="local") for index in range(4)]
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=_HOUR_NS)
+    _, preview = _prune_json(config_path, capsys)
+    if not preview["capture"]["capable"]:
+        pytest.skip(f"generation-bound capture is unavailable: {preview['capture']['reason']}")
+    assert [item["path"] for item in preview["actions"]] == [str(path) for path in backups[:3]]
+
+    def crash_after_first_capture(source: str, destination: str, source_fd: int, destination_fd: int) -> None:
+        DEFAULT_CAPTURE_OPS.rename(source, destination, source_fd, destination_fd)
+        if destination.startswith("item-"):
+            raise _CliCrash
+
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=_HOUR_NS, rename=crash_after_first_capture)
+    with pytest.raises(_CliCrash):
+        cli.main(["state", "prune", "-c", str(config_path), "--yes", "--json"])
+    capsys.readouterr()
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=_HOUR_NS)
+
+    exit_code, stopped = _prune_json(config_path, capsys, "--yes")
+
+    assert exit_code == 2
+    assert {field: stopped[field] for field in _WRAPPER_FIELDS} == {
+        "schema_version": 1,
+        "applied": False,
+        "safe": True,
+        "has_blockers": False,
+        "converged": False,
+    }
+    assert "recovery changed the reviewed plan" in stopped["error"]
+    assert stopped["restored"] == [str(backups[0])]
+    assert stopped["deleted"] == []
+    # ``actions`` is the reviewed plan; ``recovery_pending`` is the final plan after recovery.
+    assert [item["path"] for item in stopped["actions"]] == [str(path) for path in backups[1:3]]
+    assert stopped["recovery_pending"] == []
+
+    exit_code, converged = _prune_json(config_path, capsys, "--yes")
+
+    assert exit_code == 0
+    assert {field: converged[field] for field in _WRAPPER_FIELDS} == {
+        "schema_version": 1,
+        "applied": True,
+        "safe": True,
+        "has_blockers": False,
+        "converged": True,
+    }
+    assert [item["path"] for item in converged["deleted"]] == [str(path) for path in backups[:3]]
+    assert converged["fully_converged"] is True
+    assert backups[3].is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor-relative capture is POSIX-only")
+def test_state_prune_dry_run_with_actions_and_recovery_is_stable_between_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    state_dir = tmp_path / "state"
+    [make_skill_backup(state_dir, index, target="local") for index in range(5)]
+    run = state_dir / "retention" / "capture" / ("b" * 32)
+    run.mkdir(parents=True)
+    for path in (run.parent.parent, run.parent, run):
+        path.chmod(0o700)
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=_HOUR_NS)
+
+    first_code, first = _prune_json(config_path, capsys)
+    if not first["capture"]["capable"]:
+        pytest.skip(f"generation-bound capture is unavailable: {first['capture']['reason']}")
+    second_code, second = _prune_json(config_path, capsys)
+
+    assert first_code == second_code == 0
+    assert first == second
+    assert [item["path"] for item in first["recovery_pending"]] == [str(run)]
+    assert len(first["actions"]) == 2
+    assert all(item["generation"] is not None for item in first["actions"])
+    assert "quiescence_cutoff_ns" not in json.dumps(first)
+
+
+@pytest.mark.parametrize("outcome", ("applied", "stopped"))
+def test_state_prune_yes_payload_takes_plan_state_fields_from_the_final_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: str,
+) -> None:
+    make_catalog(tmp_path / "catalog")
+    config_path = _write_config(tmp_path, components=())
+    state_dir = tmp_path / "state"
+    action = RetentionAction(
+        category="skill_backup",
+        path=state_dir / "backups" / "local" / "seo" / "20260723-000000-00000001",
+        node_kind="directory",
+        bytes=10,
+        mtime_ns=1,
+        device=2,
+        inode=3,
+        generation=4,
+        capture_digest="0" * 64,
+        entry_count=2,
+    )
+    reviewed = replace(
+        _retention_plan(config_path, actions=(action,)),
+        deferred=(
+            RetentionDeferral(
+                "skill_backup",
+                state_dir / "backups" / "local" / "seo" / "old",
+                "directory",
+                7,
+                "reviewed",
+                "quiescence",
+            ),
+        ),
+        recovery_pending=(RetentionRecoveryPending(state_dir / "retention" / "capture" / ("a" * 32), "reviewed"),),
+        capability=CaptureCapability(capable=True, reason=None),
+        quiescence_seconds=900,
+    )
+    final_deferral = RetentionDeferral(
+        "marketplace_build", state_dir / "builds" / ("b" * 20), "directory", 11, "final", "marketplace_build"
+    )
+    final = replace(
+        _retention_plan(config_path),
+        deferred=(final_deferral,),
+        capability=CaptureCapability(capable=False, reason="final probe"),
+        quiescence_seconds=60,
+    )
+    result = RetentionResult(deleted=(action,), reclaimed_bytes=10, final_plan=final)
+    monkeypatch.setattr(cli, "build_retention_plan", lambda _config: reviewed)
+    if outcome == "applied":
+        monkeypatch.setattr(cli, "apply_retention_plan", lambda *_args: result)
+    else:
+        stopped = RetentionApplyStopped("stopped after one deletion", result)
+        monkeypatch.setattr(cli, "apply_retention_plan", lambda *_args: (_ for _ in ()).throw(stopped))
+
+    exit_code, payload = _prune_json(config_path, capsys, "--yes")
+
+    assert exit_code == (0 if outcome == "applied" else 2)
+    # The reviewed plan: what --yes was asked to apply.
+    assert [item["path"] for item in payload["actions"]] == [str(action.path)]
+    assert payload["has_changes"] is True
+    assert payload["safe"] is True
+    # The final plan: what remains after the run.
+    assert payload["deferred"] == [
+        {
+            "bytes": 11,
+            "category": "marketplace_build",
+            "node_kind": "directory",
+            "path": str(final_deferral.path),
+            "reason": "final",
+            "reason_code": "marketplace_build",
+        }
+    ]
+    assert payload["deferred_bytes"] == 11
+    assert payload["recovery_pending"] == []
+    assert payload["capture"] == {"capable": False, "reason": "final probe", "quiescence_seconds": 60}
+    # What the run actually did, even when it stopped.
+    assert [item["path"] for item in payload["deleted"]] == [str(action.path)]
