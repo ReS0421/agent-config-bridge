@@ -291,6 +291,24 @@ digest mismatches:
   planned source digest;
 - managed copies update/remove only when their marker and installed digest still
   match;
+- when comparing a live installed managed Skill copy, or digesting a Skill
+  source, the interpreter's own bytecode caches are ignored: regular (non-link)
+  `.pyc`/`.pyo` files (suffix compared case-insensitively) whose immediate parent
+  directory is named exactly `__pycache__`, and a real `__pycache__` directory
+  that holds nothing else. Importing a bundled script otherwise looks like drift.
+  Everything else is still digested, including other files or nested
+  directories inside `__pycache__`, symlinks, a file named `__pycache__`, and
+  sourceless `.pyc` files outside `__pycache__` (which Python imports). Source
+  caches are not copied, and new backups omit caches (a legacy copy recorded
+  with caches is backed up unfiltered, exactly as recorded). Backup, restore
+  and retention verification stay strict, as does the check of Bridge's own
+  staged copy. A copy recorded with caches before this change still verifies
+  against its recorded digest and is re-recorded without them on the next
+  update. Trade-off: `__pycache__` content is not verified. Anyone who can write
+  to an installed Skill can make Python execute code other than the verified
+  source without Bridge reporting drift, for example a timestamp-mode `.pyc`
+  whose header copies the script's mtime and size, or a checked-hash `.pyc`
+  built from the (non-secret) source hash;
 - Instruction files use the same link/copy ownership checks at file grain.
   Managed Instruction directories carry `AGENTBRIDGE-MANAGED.json`; root-level
   `AGENTS.md`, `CLAUDE.md`, and generated Codex profiles remain attributable

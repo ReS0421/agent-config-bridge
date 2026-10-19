@@ -25,6 +25,8 @@ __all__ = [
     "apply_copy",
     "apply_link",
     "apply_remove",
+    "is_bytecode_cache_file",
+    "managed_copy_digest_matches",
     "read_managed_marker",
     "tree_digest",
 ]
@@ -36,11 +38,80 @@ class FilesystemError(RuntimeError):
     """Raised when a filesystem operation cannot be completed safely."""
 
 
-def tree_digest(root: Path) -> str:
+_BYTECODE_SUFFIXES = frozenset({".pyc", ".pyo"})
+_BYTECODE_DIRECTORY = "__pycache__"
+
+
+def _is_real_regular_file(path: Path) -> bool:
+    try:
+        status = path.lstat()
+    except OSError:
+        return False
+    attributes = getattr(status, "st_file_attributes", 0)
+    return stat.S_ISREG(status.st_mode) and not attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def is_bytecode_cache_file(path: Path) -> bool:
+    """Return whether ``path`` is a regular bytecode file CPython writes itself.
+
+    Only a real (non-symlink) ``.pyc``/``.pyo`` file whose immediate parent is a
+    directory named exactly ``__pycache__`` qualifies. Sourceless ``.pyc`` files
+    elsewhere are importable code and are never excluded.
+    """
+
+    return (
+        path.parent.name == _BYTECODE_DIRECTORY
+        and path.suffix.casefold() in _BYTECODE_SUFFIXES
+        and _is_real_regular_file(path)
+    )
+
+
+def is_pure_bytecode_cache_directory(path: Path) -> bool:
+    """Return whether ``path`` is a real ``__pycache__`` directory holding only cache files."""
+
+    if path.name != _BYTECODE_DIRECTORY:
+        return False
+    try:
+        if path.is_symlink() or not path.is_dir() or is_directory_reparse_point(path):
+            return False
+        with os.scandir(path) as entries:
+            return all(is_bytecode_cache_file(path / entry.name) for entry in entries)
+    except OSError:
+        return False
+
+
+def _ignore_bytecode_caches(directory: str, names: list[str]) -> set[str]:
+    """``shutil.copytree`` ignore callback that skips only CPython-written caches."""
+
+    parent = Path(directory)
+    return {
+        name
+        for name in names
+        if is_bytecode_cache_file(parent / name) or is_pure_bytecode_cache_directory(parent / name)
+    }
+
+
+def managed_copy_digest_matches(destination: Path, installed_digest: str) -> bool:
+    """Compare a live installed Skill copy with its recorded digest.
+
+    Bytecode caches are ignored, but a recorded digest that covers them (copies
+    made before caches were excluded) still verifies against the strict digest.
+    """
+
+    return (
+        tree_digest(destination, ignore_bytecode_caches=True) == installed_digest
+        or tree_digest(destination) == installed_digest
+    )
+
+
+def tree_digest(root: Path, *, ignore_bytecode_caches: bool = False) -> str:
     """Compute a deterministic digest of a file or directory tree.
 
     The bridge ownership marker is excluded so copied trees can be compared with
-    their canonical sources.
+    their canonical sources. With ``ignore_bytecode_caches`` (live installed
+    Skill copies and Skill sources only), regular ``.pyc``/``.pyo`` files
+    directly inside a ``__pycache__`` directory, and a ``__pycache__`` directory
+    holding nothing else, are also excluded. Everything else is digested.
     """
 
     try:
@@ -68,6 +139,8 @@ def tree_digest(root: Path) -> str:
         except OSError as exc:
             raise FilesystemError(f"cannot inspect path before digesting it: {path}: {exc}") from exc
         relative = path.relative_to(root)
+        if ignore_bytecode_caches and (is_bytecode_cache_file(path) or is_pure_bytecode_cache_directory(path)):
+            continue
         if relative.as_posix() == MANAGED_MARKER:
             try:
                 marker_status = path.lstat()
@@ -154,13 +227,13 @@ def apply_copy(
         The backup path for an update, otherwise ``None``.
     """
 
-    if tree_digest(source) != source_digest:
+    if tree_digest(source, ignore_bytecode_caches=True) != source_digest:
         raise FilesystemError(f"canonical source changed after planning: {source}")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.agentbridge.{uuid.uuid4().hex}.tmp")
     try:
-        shutil.copytree(source, temporary, symlinks=True)
+        shutil.copytree(source, temporary, symlinks=True, ignore=_ignore_bytecode_caches)
         if tree_digest(temporary) != source_digest:
             raise FilesystemError(f"staged copy does not match its planned source: {source}")
         _write_marker(temporary, source_id=source_id, digest=source_digest)
@@ -207,7 +280,7 @@ def apply_copy(
             shutil.rmtree(temporary, ignore_errors=True)
             raise FilesystemError(f"managed copy ownership changed after planning: {destination}")
         installed_digest = marker.get("installed_digest")
-        if not isinstance(installed_digest, str) or tree_digest(destination) != installed_digest:
+        if not isinstance(installed_digest, str) or not managed_copy_digest_matches(destination, installed_digest):
             shutil.rmtree(temporary, ignore_errors=True)
             raise FilesystemError(f"managed copy changed after planning: {destination}")
         backup_digest = installed_digest
@@ -330,7 +403,7 @@ def apply_remove(
     if (
         not isinstance(marker_digest, str)
         or installed_digest != marker_digest
-        or tree_digest(destination) != marker_digest
+        or not managed_copy_digest_matches(destination, marker_digest)
     ):
         raise FilesystemError(f"managed Skill copy changed after planning: {destination}")
 
@@ -418,6 +491,7 @@ def _validate_managed_destination(
     installed_digest: str,
     expected_link_target: Path | None,
     windows_path_semantics: bool,
+    live: bool = True,
 ) -> None:
     """Revalidate reviewed ownership immediately before destructive mutation."""
 
@@ -451,7 +525,11 @@ def _validate_managed_destination(
         marker is None
         or marker.get("source_id") != source_id
         or marker.get("installed_digest") != installed_digest
-        or tree_digest(destination) != installed_digest
+        or not (
+            managed_copy_digest_matches(destination, installed_digest)
+            if live
+            else tree_digest(destination) == installed_digest
+        )
     ):
         raise FilesystemError(f"managed Skill copy content changed after backup snapshot: {destination}")
 
@@ -472,6 +550,7 @@ def _restore_copy_backup_to_destination(
         installed_digest=installed_digest,
         expected_link_target=None,
         windows_path_semantics=False,
+        live=False,
     )
     if os.path.lexists(destination):
         raise FilesystemError(f"cannot restore managed Skill over an existing destination: {destination}")
@@ -485,6 +564,7 @@ def _restore_copy_backup_to_destination(
             installed_digest=installed_digest,
             expected_link_target=None,
             windows_path_semantics=False,
+            live=False,
         )
         os.replace(restore, destination)
     except (FilesystemError, OSError, shutil.Error):
@@ -520,7 +600,12 @@ def _snapshot_managed_destination(
 
     if mode is not LinkMode.COPY:
         raise FilesystemError(f"unsupported managed Skill backup mode: {mode.value}")
-    shutil.copytree(destination, backup, symlinks=True)
+    # Backups of a copy whose recorded digest ignores caches omit them; a legacy
+    # copy whose recorded digest covers them is preserved exactly as recorded.
+    ignore = (
+        _ignore_bytecode_caches if tree_digest(destination, ignore_bytecode_caches=True) == installed_digest else None
+    )
+    shutil.copytree(destination, backup, symlinks=True, ignore=ignore)
     marker = read_managed_marker(backup)
     if (
         marker is None
