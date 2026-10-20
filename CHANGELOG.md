@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-10-20
+
 ### Changed
 
 - `agentbridge state prune --yes` deletes Skill backup directory snapshots
