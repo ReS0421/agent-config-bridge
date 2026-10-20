@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -10,7 +11,7 @@ import pytest
 
 from agent_config_bridge.catalog import discover_catalog
 from agent_config_bridge.filesystem import apply_copy, tree_digest
-from agent_config_bridge.models import Component, LinkMode, Platform, Product
+from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product
 from agent_config_bridge.planner import Disposition, Operation, build_plan
 from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.state import BridgeStateError, write_registered_plugins, write_skill_state
@@ -516,3 +517,115 @@ def test_plan_warns_when_cross_host_cleanup_commands_are_omitted(
 
     assert plan.commands == ()
     assert any("registration commands are omitted" in warning for warning in plan.warnings)
+
+
+def _install_managed_skill_copy(tmp_path: Path) -> tuple[BridgeConfig, Path, Path]:
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog, platform=Platform.WINDOWS, mode=LinkMode.COPY)
+    source = catalog / "skills/hello"
+    (source / "scripts").mkdir()
+    (source / "scripts/run.py").write_text("print('hi')\n", encoding="utf-8")
+    destination = tmp_path / "home/.agents/skills/hello"
+    apply_copy(
+        source,
+        destination,
+        source_id="skills/hello",
+        source_digest=tree_digest(source),
+        state_dir=config.state_dir,
+        target_name=config.targets[0].name,
+        update=False,
+    )
+    write_skill_state(config, config.targets[0], discover_catalog(config).skills)
+    return config, source, destination
+
+
+@pytest.mark.parametrize(
+    "cache",
+    ["__pycache__/x.cpython-312.pyc", "scripts/__pycache__/x.PYC", "scripts/__pycache__/y.cpython-312.opt-1.pyo"],
+)
+def test_plan_ignores_bytecode_cache_in_managed_skill_copy(tmp_path: Path, cache: str) -> None:
+    """Importing a bundled script must not make the installed copy look modified."""
+
+    config, _source, destination = _install_managed_skill_copy(tmp_path)
+    (destination / cache).parent.mkdir(parents=True, exist_ok=True)
+    (destination / cache).write_bytes(b"bytecode")
+
+    plan = build_plan(config, discover_catalog(config))
+
+    assert plan.actions[0].disposition is Disposition.NOOP
+    assert all(action.disposition is not Disposition.CONFLICT for action in plan.actions)
+
+
+def test_plan_still_detects_real_file_drift_beside_bytecode_cache(tmp_path: Path) -> None:
+    """Only caches are excluded; other edits remain drift."""
+
+    config, _source, destination = _install_managed_skill_copy(tmp_path)
+    (destination / "__pycache__").mkdir()
+    (destination / "__pycache__/x.pyc").write_bytes(b"bytecode")
+    (destination / "SKILL.md").write_text("tampered\n", encoding="utf-8")
+
+    plan = build_plan(config, discover_catalog(config))
+
+    assert plan.actions[0].disposition is Disposition.CONFLICT
+    assert "modified after installation" in plan.actions[0].detail
+
+
+def test_plan_ignores_bytecode_cache_in_previously_managed_skill_copy(tmp_path: Path) -> None:
+    """A deselected managed copy with a cache is still removable, not a conflict."""
+
+    config, _source, destination = _install_managed_skill_copy(tmp_path)
+    (destination / "__pycache__").mkdir()
+    (destination / "__pycache__/x.cpython-312.pyc").write_bytes(b"bytecode")
+    deselected = replace(config.targets[0], components=frozenset())
+
+    plan = build_plan(replace(config, targets=(deselected,)), discover_catalog(config))
+
+    assert plan.actions[0].operation is Operation.REMOVE
+    assert plan.actions[0].disposition is not Disposition.CONFLICT
+
+    (destination / "SKILL.md").write_text("tampered\n", encoding="utf-8")
+    plan = build_plan(replace(config, targets=(deselected,)), discover_catalog(config))
+    assert plan.actions[0].disposition is Disposition.CONFLICT
+
+
+def test_skill_source_bytecode_cache_is_not_copied_or_digested(tmp_path: Path) -> None:
+    """A stray cache in the catalog checkout causes neither churn nor a copied cache."""
+
+    config, source, destination = _install_managed_skill_copy(tmp_path)
+    clean_digest = tree_digest(source, ignore_bytecode_caches=True)
+    (source / "__pycache__").mkdir()
+    (source / "__pycache__/x.cpython-312.pyc").write_bytes(b"bytecode")
+    (source / "__pycache__/mod.pyo").write_bytes(b"bytecode")
+    assert tree_digest(source, ignore_bytecode_caches=True) == clean_digest
+    assert build_plan(config, discover_catalog(config)).actions[0].disposition is Disposition.NOOP
+
+    other = tmp_path / "other"
+    apply_copy(
+        source,
+        other,
+        source_id="skills/hello",
+        source_digest=clean_digest,
+        state_dir=config.state_dir,
+        target_name="other",
+        update=False,
+    )
+    assert not (other / "__pycache__").exists()
+    assert not (other / "__pycache__").exists()
+    assert destination.exists()
+
+
+def test_plan_migrates_legacy_copy_recorded_with_caches(tmp_path: Path) -> None:
+    """A copy whose marker covers caches is re-recorded, not left as a silent noop."""
+
+    config, source, destination = _install_managed_skill_copy(tmp_path)
+    (destination / "__pycache__").mkdir()
+    (destination / "__pycache__/x.cpython-312.pyc").write_bytes(b"bytecode")
+    marker = destination / ".agent-config-bridge.json"
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["installed_digest"] = tree_digest(destination)
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    plan = build_plan(config, discover_catalog(config))
+
+    assert plan.actions[0].disposition is Disposition.UPDATE
+    assert source.exists()

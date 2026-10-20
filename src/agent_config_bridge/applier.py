@@ -154,7 +154,10 @@ def apply_skill_plan(config: BridgeConfig, inventory: CatalogInventory, plan: Sy
             skill_ownership[action.target] = next_entries
         try:
             if action.operation is Operation.LINK:
-                if action.source_digest is None or tree_digest(action.source) != action.source_digest:
+                if (
+                    action.source_digest is None
+                    or tree_digest(action.source, ignore_bytecode_caches=True) != action.source_digest
+                ):
                     raise ApplyError(f"link source changed after planning: {action.target}:{action.name}")
                 apply_link(action.source, action.destination)
             elif action.operation is Operation.COPY:
@@ -353,7 +356,10 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     raise ApplyError(f"link source changed after planning: {action.target}:{action.name}")
                 apply_instruction_link(action.source, action.destination)
             else:
-                if action.source_digest is None or tree_digest(action.source) != action.source_digest:
+                if (
+                    action.source_digest is None
+                    or tree_digest(action.source, ignore_bytecode_caches=True) != action.source_digest
+                ):
                     raise ApplyError(f"link source changed after planning: {action.target}:{action.name}")
                 apply_link(action.source, action.destination)
         elif action.operation is Operation.COPY:

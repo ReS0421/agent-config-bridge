@@ -401,3 +401,40 @@ def test_dry_run_is_byte_and_metadata_invariant_and_excludes_instructions(
     assert plan.excluded_instruction_roots == (instructions,)
     assert _state_snapshot(config.state_dir) == before
     assert not (config.state_dir / ".agentbridge-retention.lock").exists()
+
+
+def _backup_with_marker(config, build, *, ignore: bool) -> Path:
+    snapshot = _make_backup(config, 0)
+    build(snapshot)
+    digest = tree_digest(snapshot, ignore_bytecode_caches=ignore)
+    marker = snapshot / MANAGED_MARKER
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload["installed_digest"] = digest
+    marker.write_text(json.dumps(payload), encoding="utf-8")
+    return snapshot
+
+
+def _plant_plain_cache(snapshot: Path) -> None:
+    (snapshot / "__pycache__").mkdir()
+    (snapshot / "__pycache__/x.cpython-312.pyc").write_bytes(b"cache")
+
+
+@pytest.mark.parametrize("build", [_plant_plain_cache])
+def test_backup_whose_marker_ignores_planted_or_cache_files_is_a_blocker(tmp_path: Path, build) -> None:
+    """Retention verifies backups strictly; a cache-ignoring marker digest is not accepted."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog)
+    _backup_with_marker(config, build, ignore=True)
+
+    assert build_retention_plan(config).has_blockers
+
+
+def test_backup_recorded_with_caches_strictly_remains_valid(tmp_path: Path) -> None:
+    """Backups recorded before caches were excluded keep verifying."""
+
+    catalog = make_catalog(tmp_path / "catalog")
+    config = make_config(tmp_path, catalog)
+    _backup_with_marker(config, _plant_plain_cache, ignore=False)
+
+    assert not build_retention_plan(config).has_blockers

@@ -10,7 +10,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from agent_config_bridge.catalog import Artifact, CatalogInventory
-from agent_config_bridge.filesystem import read_managed_marker, tree_digest
+from agent_config_bridge.filesystem import managed_copy_digest_matches, read_managed_marker, tree_digest
 from agent_config_bridge.governance import ResolvedInventory, resolve_inventory
 from agent_config_bridge.instructions import (
     InstructionFile,
@@ -630,7 +630,7 @@ def _plan_link(
                 destination=destination,
                 detail="symlink already points to canonical skill",
                 source_id=_skill_source_id(skill),
-                source_digest=tree_digest(skill.path),
+                source_digest=tree_digest(skill.path, ignore_bytecode_caches=True),
             )
         detail = (
             "managed symlink no longer matches its recorded target"
@@ -662,7 +662,7 @@ def _plan_link(
         destination=destination,
         detail="create canonical skill symlink",
         source_id=_skill_source_id(skill),
-        source_digest=tree_digest(skill.path),
+        source_digest=tree_digest(skill.path, ignore_bytecode_caches=True),
     )
 
 
@@ -674,7 +674,7 @@ def _plan_copy(
     *,
     windows_path_semantics: bool,
 ) -> Action:
-    source_digest = tree_digest(skill.path)
+    source_digest = tree_digest(skill.path, ignore_bytecode_caches=True)
     if not os.path.lexists(destination):
         return Action(
             operation=Operation.COPY,
@@ -801,8 +801,7 @@ def _plan_copy(
         )
 
     installed_digest = marker.get("installed_digest")
-    current_digest = tree_digest(destination)
-    if installed_digest != current_digest:
+    if not isinstance(installed_digest, str) or not managed_copy_digest_matches(destination, installed_digest):
         return _conflict_action(
             operation=Operation.COPY,
             skill=skill,
@@ -812,6 +811,7 @@ def _plan_copy(
             source_id=_skill_source_id(skill),
             source_digest=source_digest,
         )
+    current_digest = tree_digest(destination, ignore_bytecode_caches=True)
     if previous.mode is LinkMode.SYMLINK:
         if source_digest != current_digest:
             return _conflict_action(
@@ -836,7 +836,7 @@ def _plan_copy(
             source_digest=source_digest,
             link_mode=LinkMode.COPY,
         )
-    if source_digest == current_digest:
+    if source_digest == current_digest and installed_digest == current_digest:
         return Action(
             operation=Operation.COPY,
             disposition=Disposition.NOOP,
@@ -857,7 +857,11 @@ def _plan_copy(
         name=skill.name,
         source=skill.path,
         destination=destination,
-        detail="update unchanged managed copy and retain backup",
+        detail=(
+            "re-record managed copy digest without bytecode caches and retain backup"
+            if source_digest == current_digest
+            else "update unchanged managed copy and retain backup"
+        ),
         source_id=_skill_source_id(skill),
         source_digest=source_digest,
     )
@@ -1387,7 +1391,7 @@ def _plan_skill_removal(
             detail="previously managed Skill copy has no matching ownership marker",
         )
     installed_digest = marker.get("installed_digest")
-    if not isinstance(installed_digest, str) or tree_digest(destination) != installed_digest:
+    if not isinstance(installed_digest, str) or not managed_copy_digest_matches(destination, installed_digest):
         return replace(
             base,
             disposition=Disposition.CONFLICT,

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop interpreter-written bytecode caches from making an installed managed
+  Skill copy look modified ("managed copy was modified after installation",
+  current and previously managed). Only regular `.pyc`/`.pyo` files directly
+  inside a `__pycache__` directory, and a `__pycache__` directory holding
+  nothing else, are ignored, and only when comparing a live installed Skill copy
+  and when digesting a Skill source (so source caches are also not copied).
+  Digests are otherwise strict: other files in `__pycache__`, nested
+  directories, symlinks, sourceless `.pyc` files elsewhere, and everything else
+  still count as drift. New backups omit caches (a legacy copy recorded with
+  caches is backed up as recorded); backup, restore, retention and Bridge's own
+  staged-copy checks verify strictly. Copies recorded with caches before this
+  change still verify and are re-recorded without them on the next update.
+  Trade-off: anyone who can write to an installed Skill can make Python run a
+  planted or forged cache instead of the verified source without Bridge
+  reporting drift.
+
 ## [0.3.6] - 2026-09-07
 
 ### Fixed
