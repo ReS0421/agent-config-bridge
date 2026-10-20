@@ -843,6 +843,7 @@ def test_exdev_capture_rename_reports_busy_and_moves_nothing(tmp_path: Path) -> 
     assert _capture_runs(config) == []
 
 
+@_POSIX_ONLY
 def test_symlink_inside_deleted_capture_is_not_followed(tmp_path: Path) -> None:
     require_directory_symlink_support(tmp_path)
     config = _backup_config(tmp_path, limit=1)
