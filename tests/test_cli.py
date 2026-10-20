@@ -1724,7 +1724,9 @@ def test_state_prune_yes_does_not_fail_because_of_deferrals(
     make_catalog(tmp_path / "catalog")
     config_path = _write_config(tmp_path, components=())
     backups = [make_skill_backup(tmp_path / "state", index, target="local") for index in range(4)]
-    _capture_ops_in_cli(monkeypatch, now_offset_ns=0)  # every snapshot is inside the quiescence window
+    # Every snapshot is inside the quiescence window; where capture is unavailable (native Windows),
+    # the candidate is deferred for that reason instead. Either way it is reported, kept, and not a failure.
+    _capture_ops_in_cli(monkeypatch, now_offset_ns=0)
 
     exit_code, payload = _prune_json(config_path, capsys, "--yes")
 
@@ -1734,7 +1736,8 @@ def test_state_prune_yes_does_not_fail_because_of_deferrals(
     assert payload["converged"] is True
     assert payload["fully_converged"] is False
     assert [item["path"] for item in payload["deferred"]] == [str(backups[0])]
-    assert payload["deferred"][0]["reason_code"] == "quiescence"
+    expected_reason = "quiescence" if payload["capture"]["capable"] else "capture_unavailable"
+    assert payload["deferred"][0]["reason_code"] == expected_reason
     assert payload["deferred_bytes"] == payload["deferred"][0]["bytes"]
     assert payload["deleted"] == []
     assert all(path.is_dir() for path in backups)

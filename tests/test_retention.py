@@ -1208,6 +1208,8 @@ def test_restored_capture_is_deferred_when_the_cutoff_precedes_the_restore(tmp_p
     assert _tree_bytes(backups[0]) == original
 
 
+# ``st_ctime`` is a status-change time only on POSIX; on Windows it is the creation time.
+@_POSIX_ONLY
 def test_recent_change_deep_inside_a_snapshot_defers_it(tmp_path: Path) -> None:
     config = _backup_config(tmp_path, limit=1)
     backups = [_make_backup(config, index) for index in range(3)]
