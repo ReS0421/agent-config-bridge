@@ -304,11 +304,14 @@ def _fdinfo_mount_id(descriptor: int) -> int:
 
 
 def _mount_filesystem_type(device: int) -> str | None:
+    major, minor = getattr(os, "major", None), getattr(os, "minor", None)
+    if major is None or minor is None:
+        return None
     try:
         text = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    wanted = f"{os.major(device)}:{os.minor(device)}"
+    wanted = f"{major(device)}:{minor(device)}"
     types: set[str] = set()
     for line in text.splitlines():
         left, separator, right = line.partition(" - ")
@@ -466,7 +469,23 @@ def _private_tree_stats(
 
 
 def _is_private(path_stat: os.stat_result) -> bool:
-    return stat.S_IMODE(path_stat.st_mode) == _PRIVATE_MODE and path_stat.st_uid == os.geteuid()
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return stat.S_IMODE(path_stat.st_mode) == _PRIVATE_MODE and path_stat.st_uid == geteuid()
+
+
+def _fchmod(descriptor: int, mode: int) -> None:
+    """Call the POSIX-only ``os.fchmod``.
+
+    It, ``os.geteuid``, ``os.major``, and ``os.minor`` are looked up at run time so the module
+    also type-checks for Windows, where capture is never capable and never reaches them.
+    """
+
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is None:
+        raise CaptureError("descriptor-bound permission change is unavailable on this platform")
+    fchmod(descriptor, mode)
 
 
 def descriptor_identity(descriptor: int, ops: CaptureOps) -> CaptureIdentity:
@@ -1024,7 +1043,7 @@ def _prepare_tree(dir_fd: int, prefix: bytes, depth: int, boundary: _Boundary) -
     if depth > _MAX_DEPTH:
         raise CaptureError("capture slot is too deep to check for mounts")
     if stat.S_IMODE(os.fstat(dir_fd).st_mode) & _PRIVATE_MODE != _PRIVATE_MODE:
-        os.fchmod(dir_fd, _PRIVATE_MODE)
+        _fchmod(dir_fd, _PRIVATE_MODE)
     with os.scandir(dir_fd) as iterator:
         entries = list(iterator)
     for entry in entries:
@@ -1560,7 +1579,7 @@ def _ensure_private_directory(parent_fd: int, name: str, opened: list[int], *, e
     except OSError as exc:
         raise CaptureError(f"retention capture directory {name} must be a real directory") from exc
     if created:
-        os.fchmod(descriptor, _PRIVATE_MODE)
+        _fchmod(descriptor, _PRIVATE_MODE)
         _sync_directories(parent_fd)
     if not _is_private(os.fstat(descriptor)):
         raise CaptureError(f"retention capture directory {name} must be owned by the current user with mode 0700")
