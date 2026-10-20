@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_config_bridge.filesystem import MANAGED_MARKER, tree_digest
 from agent_config_bridge.models import (
     BridgeConfig,
     Component,
@@ -135,6 +136,34 @@ def make_config(
         components=components,
         targets=(target,),
     )
+
+
+def make_skill_backup(
+    state_dir: Path,
+    index: int,
+    *,
+    target: str = "target",
+    skill: str = "hello",
+) -> Path:
+    """Create one valid managed Skill backup snapshot; a higher index is newer."""
+
+    group = state_dir / "backups" / target / skill
+    group.mkdir(parents=True, exist_ok=True)
+    snapshot = group / f"20260723-0000{index:02d}-{index + 1:08x}"
+    snapshot.mkdir()
+    (snapshot / "SKILL.md").write_text(f"snapshot {index}\n", encoding="utf-8")
+    digest = tree_digest(snapshot)
+    (snapshot / MANAGED_MARKER).write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source_id": f"skills/{skill}",
+                "installed_digest": digest,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return snapshot
 
 
 def require_directory_symlink_support(root: Path) -> None:

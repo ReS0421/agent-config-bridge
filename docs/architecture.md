@@ -608,6 +608,7 @@ state_dir/
 ├── schedules/<target>.json          # stable Schedule pointer
 ├── schedule-runtime/                # claim/run locks + minute marker
 ├── backups/<target>/...             # verified Skill/Instruction backups
+├── retention/                       # 0700 capture runs and quarantine (apply only)
 └── targets/<target>/
     ├── skills.json                  # standalone Skill ownership
     ├── instructions.json            # file-granular Instruction ownership
@@ -620,23 +621,63 @@ state_dir/
 subtrees.
 `bridge.retention.marketplace_builds` defaults to 20, and
 `bridge.retention.skill_backups` defaults to 3 per target/Skill; both must be
-integers of at least one. Planning remains read-only and reports candidates
-under those limits. In 0.3.3, `--yes` performs locked validation only when the
-reviewed plan has no actions. If the plan contains any marketplace-build,
-Skill-directory, or terminal-symlink deletion candidate, it fails before
-mutation and deletes nothing. Destructive automatic apply is disabled until
-each candidate has non-reusable generation identity and the selected object can
-be captured atomically before deletion. No backup/build marker schema change or
-migration is implemented in this release. The published marketplace build is
-pinned even when it is older than the normal cutoff; a missing corresponding
-immutable build is a blocker.
+integers of at least one. Planning remains read-only, never creates
+`retention/`, and reports candidates under those limits.
+
+[ADR-0008](adr/0008-generation-bound-retention-capture.md) defines
+generation-bound capture. Phase 1 makes only POSIX Skill backup directory
+snapshots actions. Each action records `generation`, `capture_digest`, and
+`entry_count`, and the plan records the identities of the kept snapshots in
+each affected group.
+
+Everything else selected past a limit is a `deferred` entry with a reason:
+
+- marketplace builds;
+- terminal symlink snapshots;
+- native Windows candidates;
+- snapshots changed within the 15-minute quiescence window (newest `ctime` in
+  the tree);
+- every candidate when the capability probe fails.
+
+Deferred entries are kept, are not actions, and never make `--yes` fail.
+
+Under `.agentbridge-retention.lock`, `--yes` first recovers interrupted runs
+and then requires an equal fresh plan. Each action is then:
+
+1. renamed by descriptor into `retention/capture/<run>/`;
+2. recorded as `captured` in an atomically replaced `manifest.json`;
+3. verified after the move, and its group's kept snapshots re-checked;
+4. recorded as `verified`;
+5. checked again for its identity and for mounts, then deleted with
+   descriptor-based `rmtree`;
+6. recorded as `deleted`.
+
+A mismatched real directory is renamed back when its name is free; anything
+else is moved to `retention/quarantine/<run>/`, which stays a blocker until an
+operator acts. A mount found in a verified slot is quarantined. An interrupted
+run is reported as non-blocking `recovery_pending`.
+
+The prune JSON stays at `schema_version` 1. `converged` means no non-deferred
+actions and no blockers. Additive fields are `fully_converged`, `deferred`
+(each with a `reason_code`), `deferred_bytes`, `recovery_pending`, `capture`,
+`restored`, `quarantined`, `busy`, `pending_cleanup`, and `recovered`.
+`actions`, `blockers`, and `safe` describe the reviewed plan; `converged`,
+`fully_converged`, `deferred`, `deferred_bytes`, `recovery_pending`, and
+`capture` describe the final plan. Exit status 0 with `applied: true` implies
+`converged: true`. Any other apply exits with status 2, and `--json` prints the
+payload with `applied: false`, `error`, and what was already deleted.
+
+Backup naming and the marker schema are unchanged. The published marketplace
+build is pinned even when it is older than the normal cutoff; a missing
+corresponding immutable build is a blocker.
 
 Instruction backups below `backups/<target>/instructions/` are deliberately
 excluded because their file-granular layout has a different lifecycle. A
-terminal symlink snapshot remains a valid historical Skill backup and may
-appear as a candidate, but it is not unlinked automatically. Any unexpected
-name, special node, redirected ancestor, invalid build marker, or mismatched
-Skill marker/digest remains a global blocker.
+terminal symlink snapshot remains a valid historical Skill backup and is
+deferred, never unlinked automatically. Any unexpected name, special node,
+redirected ancestor, invalid build marker, mismatched Skill marker/digest,
+malformed capture manifest, unknown capture entry, or quarantined capture
+remains a global blocker.
 
 This state is designed to be non-secret: the bridge never writes product auth,
 session, trust, cache, or conversation state there. The ownership files contain
