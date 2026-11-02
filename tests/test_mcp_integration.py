@@ -905,7 +905,7 @@ command = "npx"
 args = ["-y", "@playwright/mcp@0.0.78", "--headless", "--isolated"]
 
 [mcp_servers.github]
-command = "{home}/.local/bin/orca-github-mcp"
+command = '{home}/.local/bin/orca-github-mcp'
 env_vars = ["GITHUB_TOKEN"]
 
 [mcp_servers.shared-agent-memory]
@@ -916,12 +916,18 @@ approval_mode = "approve"
 """
 
 
+def _native_home(tmp_path: Path) -> str:
+    """Return the test home the way ``{user_home}`` expands for a target on this host."""
+    home = tmp_path / "home"
+    return str(home) if current_platform() is Platform.WINDOWS else home.as_posix()
+
+
 def _codex_adopt_setup(tmp_path: Path, live: str = LIVE_CODEX) -> tuple[Path, Path]:
     _catalog(tmp_path, browser=BROWSER, github=GITHUB, **{"shared-agent-memory": MEMORY})
     config_path = _write_target_config(tmp_path, product="codex")
     destination = tmp_path / "home" / ".codex" / "config.toml"
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(live.replace("{home}", (tmp_path / "home").as_posix()), encoding="utf-8")
+    destination.write_text(live.replace("{home}", _native_home(tmp_path)), encoding="utf-8")
     return config_path, destination
 
 
@@ -1059,7 +1065,7 @@ def test_claude_adoption_records_normalized_exact_matches(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     config_path, fake = _claude_setup(tmp_path, monkeypatch, browser=BROWSER, github=GITHUB)
-    home = (tmp_path / "home").as_posix()
+    home = _native_home(tmp_path)
     user_config = tmp_path / "home" / ".claude.json"
     user_config.write_text(
         json.dumps(
