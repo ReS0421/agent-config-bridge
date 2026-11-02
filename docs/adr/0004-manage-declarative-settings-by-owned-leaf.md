@@ -4,6 +4,11 @@
 
 Accepted — 2026-07-14
 
+Amended by [ADR-0009](0009-register-mcp-servers-by-owned-entry.md): MCP server
+entries may be adopted and released explicitly when their values match, and a
+removed Codex MCP server table is deleted together with its unowned `tools`
+approvals.
+
 ## Context
 
 The first bridge release deliberately supported only Skills, Plugins, and Hooks.
@@ -109,6 +114,7 @@ future project-target model and are not inferred from a user target.
 - [ADR-0001: Render target-specific artifacts](0001-render-target-specific-artifacts.md)
 - [ADR-0002: Never share runtime state](0002-never-share-runtime-state.md)
 - [ADR-0005: Use host scheduler adapters](0005-use-host-scheduler-adapters.md)
+- [ADR-0009: Register MCP servers by owned entry](0009-register-mcp-servers-by-owned-entry.md)
 
 ## References
 

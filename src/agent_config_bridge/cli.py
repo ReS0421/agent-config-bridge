@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
@@ -23,6 +23,7 @@ from agent_config_bridge.governance import (
     GovernanceError,
     GovernanceFinding,
     GovernanceSeverity,
+    ResolvedInventory,
     build_registry_payload,
     registry_path,
     resolve_inventory,
@@ -40,8 +41,35 @@ from agent_config_bridge.marketplace_registry import (
     probe_marketplace_source,
     run_utf8_json_command,
 )
+from agent_config_bridge.mcp import (
+    ClaudeMcpPlan,
+    McpAdoptionEntry,
+    McpAdoptionStatus,
+    McpError,
+    claude_spec_digest,
+    claude_user_config_path,
+    discover_mcp_servers,
+    read_claude_mcp_servers,
+)
+from agent_config_bridge.mcp_ownership import (
+    McpReleaseEntry,
+    McpReleaseStatus,
+    adoption_entries,
+    record_adoption,
+    record_release,
+    release_entries,
+    require_no_orphaned_state,
+    select_mcp_targets,
+)
 from agent_config_bridge.models import BridgeConfig, Component, Product, TargetConfig
-from agent_config_bridge.planner import CommandHint, SyncPlan, build_plan
+from agent_config_bridge.planner import (
+    CommandHint,
+    Operation,
+    SyncPlan,
+    build_plan,
+    desired_mcp_servers,
+    plan_claude_mcp,
+)
 from agent_config_bridge.platforms import UnsupportedPlatformError, current_platform, scope_product_home_environment
 from agent_config_bridge.renderer import RenderError, render_marketplace
 from agent_config_bridge.retention import (
@@ -64,7 +92,7 @@ from agent_config_bridge.scheduler_registration import (
     validate_vendor_executable,
 )
 from agent_config_bridge.schedules import ScheduleError, ScheduleExecutionError
-from agent_config_bridge.settings import SettingsError
+from agent_config_bridge.settings import SettingsError, safe_key
 from agent_config_bridge.skill_migration import (
     MigrationError,
     MigrationSource,
@@ -80,6 +108,7 @@ from agent_config_bridge.state import (
     read_registration_state,
     read_scheduler_state,
     registration_marketplace_source,
+    write_claude_mcp_ownership,
     write_registered_plugins,
 )
 
@@ -110,16 +139,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         config, inventory = _load_context(Path(args.config))
         if args.command == "registry":
             return _command_registry(inventory, args.registry_command, args.json)
+        if args.command == "mcp":
+            return _command_mcp(config, inventory, args)
         if args.command == "validate":
             return _command_validate(inventory, args.json)
         if args.command == "render":
             return _command_render(config, inventory, args.json)
         if args.command == "doctor":
-            # Doctor must stay usable when required-mode governance errors
-            # block planning; the governance.mode check reports the cause.
+            # Doctor must stay usable when required-mode governance errors or
+            # invalid MCP manifests block planning; the governance.mode and
+            # mcp.manifests checks report the cause.
             try:
                 plan = build_plan(config, inventory)
-            except GovernanceError:
+            except (GovernanceError, McpError):
                 plan = SyncPlan(actions=(), commands=(), reviews=(), warnings=())
             return _command_doctor(config, inventory, plan, args.json)
         plan = build_plan(config, inventory)
@@ -148,6 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ScheduleError,
         ScheduleExecutionError,
         SettingsError,
+        McpError,
         MigrationError,
         RetentionError,
         UnsupportedPlatformError,
@@ -286,6 +319,65 @@ def _build_parser() -> argparse.ArgumentParser:
                 default=[],
                 help="register one configured target; repeat to select multiple",
             )
+
+    mcp_parser = subparsers.add_parser("mcp", help="manage catalog-declared MCP server registrations")
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", required=True)
+    adopt_parser = mcp_subparsers.add_parser(
+        "adopt",
+        help="record Bridge ownership of existing MCP entries that exactly equal their catalog declaration",
+        description=(
+            "Record Bridge ownership of unowned Codex mcp_servers leaves and Claude Code user-scope MCP servers "
+            "whose current values exactly equal the rendered catalog declaration. Product configuration is "
+            "never changed; mismatches are listed and never adopted."
+        ),
+    )
+    adopt_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+    adopt_parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help="adopt for one configured target on this platform; repeat to select multiple",
+    )
+    adopt_parser.add_argument(
+        "--name",
+        action="append",
+        default=[],
+        help="adopt only this catalog MCP server; repeat to select multiple",
+    )
+    adopt_parser.add_argument("-y", "--yes", action="store_true", help="record ownership without prompting")
+    adopt_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON; without --yes this is a read-only preview",
+    )
+    release_parser = mcp_subparsers.add_parser(
+        "release",
+        help="forget Bridge ownership of MCP servers without changing product configuration",
+        description=(
+            "Forget Bridge ownership of MCP servers, the inverse of adopt. Owned Codex mcp_servers leaves and "
+            "Claude Code user-scope registrations are dropped from Bridge state only; product configuration is "
+            "never changed. Use it to recover from a missing or drifted owned entry, or to hand a server back."
+        ),
+    )
+    release_parser.add_argument("-c", "--config", default=_DEFAULT_CONFIG)
+    release_parser.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        help="release for one configured target on this platform; repeat to select multiple",
+    )
+    release_parser.add_argument(
+        "--name",
+        action="append",
+        default=[],
+        help="release only this owned MCP server; repeat to select multiple",
+    )
+    release_parser.add_argument("-y", "--yes", action="store_true", help="forget ownership without prompting")
+    release_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON; without --yes this is a read-only preview",
+    )
 
     registry_parser = subparsers.add_parser(
         "registry",
@@ -711,7 +803,7 @@ def _command_init(args: argparse.Namespace) -> int:
         raise ConfigError(f"config already exists (use --force to replace it): {config_path}")
 
     catalog = config_path.parent / "catalog"
-    for group in ("skills", "plugins", "hooks", "settings", "schedules", "instructions"):
+    for group in ("skills", "plugins", "hooks", "settings", "schedules", "instructions", "mcp"):
         (catalog / group).mkdir(parents=True, exist_ok=True)
     template = """schema_version = 1
 
@@ -719,7 +811,7 @@ def _command_init(args: argparse.Namespace) -> int:
 catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions", "mcp"]
 
 [bridge.retention]
 marketplace_builds = 20
@@ -748,6 +840,7 @@ enabled = true
 
 
 def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
+    mcp_servers = discover_mcp_servers(inventory.root)
     payload = {
         "catalog": str(inventory.root),
         "skills": len(inventory.skills),
@@ -756,6 +849,7 @@ def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
         "settings": len(inventory.settings),
         "schedules": len(inventory.schedules),
         "instructions": len(inventory.instructions),
+        "mcp": len(mcp_servers),
         "valid": True,
     }
     if as_json:
@@ -764,8 +858,8 @@ def _command_validate(inventory: CatalogInventory, as_json: bool) -> int:
         print(
             f"valid: {payload['skills']} skills, {payload['plugins']} plugins, "
             f"{payload['hooks']} hook bundles, {payload['settings']} settings bundles, "
-            f"{payload['schedules']} schedules, and {payload['instructions']} instruction bundles "
-            f"in {payload['catalog']}"
+            f"{payload['schedules']} schedules, {payload['instructions']} instruction bundles, "
+            f"and {payload['mcp']} MCP servers in {payload['catalog']}"
         )
     return 0
 
@@ -849,7 +943,7 @@ def _command_apply(
         for warning in result.warnings:
             print(f"warning: {warning}", file=sys.stderr)
         if plan.commands:
-            print("plugin and schedule registration remains explicit; review and run:")
+            print("plugin, MCP, and schedule registration remains explicit; review and run:")
             for command in plan.commands:
                 print(f"  [{command.target}] {_format_command(command)}")
     return 0
@@ -943,11 +1037,9 @@ def _command_register(
         target = known_targets[name]
         target_commands = tuple(command for command in commands if command.target == name)
         _validate_registration_executable(target, target_commands)
-    scheduler_registrations = _build_scheduler_registrations(
-        config,
-        inventory,
-        tuple(known_targets[name] for name in sorted(target_names)),
-    )
+    selected = tuple(known_targets[name] for name in sorted(target_names))
+    mcp_plans = _claude_mcp_plans(config, inventory, resolve_inventory(inventory), selected)
+    scheduler_registrations = _build_scheduler_registrations(config, inventory, selected)
     if commands:
         print("product commands to execute:")
         for command in commands:
@@ -962,6 +1054,18 @@ def _command_register(
             print(f"    agentbridge: {registration.spec.agentbridge_executable}")
             print(f"    product CLI: {registration.spec.vendor_executable}")
             print(f"    config: {registration.spec.config_path}")
+    mcp_conflicts = sorted(name for name, mcp_plan in mcp_plans.items() if mcp_plan.has_conflicts)
+    if mcp_conflicts:
+        details = "; ".join(
+            f"{action.target}: {action.detail}"
+            for action in plan.actions
+            if action.component is Component.MCP
+            and action.operation is Operation.REGISTER
+            and action.target in mcp_conflicts
+        )
+        raise ConfigError(
+            f"resolve MCP registration conflicts before registering: {details or ', '.join(mcp_conflicts)}"
+        )
     conflicts = tuple(registration for registration in scheduler_registrations if registration.has_conflict)
     if conflicts:
         raise ConfigError(
@@ -969,8 +1073,9 @@ def _command_register(
             + ", ".join(registration.target.name for registration in conflicts)
         )
     has_scheduler_changes = any(registration.has_changes for registration in scheduler_registrations)
-    if not commands and not has_scheduler_changes:
-        print("no plugin or host scheduler registration changes are required")
+    has_mcp_state_changes = any(mcp_plan.needs_state_write for mcp_plan in mcp_plans.values())
+    if not commands and not has_scheduler_changes and not has_mcp_state_changes:
+        print("no plugin, MCP, or host scheduler registration changes are required")
         return 0
     if not _confirm("Execute these product and host scheduler changes?", confirmed):
         print("cancelled", file=sys.stderr)
@@ -985,15 +1090,19 @@ def _command_register(
     fresh_plan = build_plan(config, fresh_inventory, resolved=fresh_resolved)
     if fresh_plan != plan:
         raise ConfigError("catalog, generated state, or destinations changed; review a fresh plan")
+    fresh_mcp_plans = _claude_mcp_plans(config, fresh_inventory, fresh_resolved, selected)
+    if fresh_mcp_plans != mcp_plans:
+        raise ConfigError("Claude MCP registration state changed; review a fresh plan")
     fresh_scheduler_registrations = _build_scheduler_registrations(
         config,
         fresh_inventory,
-        tuple(known_targets[name] for name in sorted(target_names)),
+        selected,
         reviewed=scheduler_registrations,
     )
     if _scheduler_review_keys(fresh_scheduler_registrations) != _scheduler_review_keys(scheduler_registrations):
         raise ConfigError("host scheduler state changed; review a fresh registration plan")
-    if commands:
+    plugin_commands = tuple(command for command in commands if command.component is not Component.MCP)
+    if plugin_commands:
         marketplace_action = next(
             (action for action in fresh_plan.actions if action.target == "marketplace"),
             None,
@@ -1011,7 +1120,7 @@ def _command_register(
     commands_by_target: dict[str, tuple[CommandHint, ...]] = {}
     for name in sorted(target_names):
         target = known_targets[name]
-        target_commands = tuple(command for command in commands if command.target == name)
+        target_commands = tuple(command for command in plugin_commands if command.target == name)
         commands_by_target[name] = target_commands
         environment = os.environ.copy()
         scope_product_home_environment(environment, target)
@@ -1030,8 +1139,237 @@ def _command_register(
         write_registered_plugins(
             config, target, desired_plugin_names(target, fresh_inventory, fresh_resolved.hooks_for_target(target))
         )
+        mcp_plan = fresh_mcp_plans.get(name)
+        if mcp_plan is not None:
+            _register_claude_mcp(
+                config,
+                target,
+                mcp_plan,
+                tuple(command for command in commands if command.component is Component.MCP and command.target == name),
+            )
     apply_scheduler_registrations(config, fresh_inventory, fresh_scheduler_registrations)
     return 0
+
+
+def _claude_mcp_plans(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    resolved: ResolvedInventory,
+    targets: tuple[TargetConfig, ...],
+) -> dict[str, ClaudeMcpPlan]:
+    """Return the read-only Claude MCP reconciliation for each relevant selected target."""
+
+    servers = discover_mcp_servers(inventory.root)
+    plans: dict[str, ClaudeMcpPlan] = {}
+    for target in targets:
+        if target.product is not Product.CLAUDE_CODE:
+            continue
+        mcp_plan = plan_claude_mcp(config, target, desired_mcp_servers(target, resolved, servers))
+        if mcp_plan is not None:
+            plans[target.name] = mcp_plan
+    return plans
+
+
+def _register_claude_mcp(
+    config: BridgeConfig,
+    target: TargetConfig,
+    mcp_plan: ClaudeMcpPlan,
+    commands: tuple[CommandHint, ...],
+) -> None:
+    """Run reviewed Claude MCP commands, checkpointing ownership after each success.
+
+    Each command first re-reads the Claude user config: a removal requires the
+    recorded digest and an addition requires an absent name, so an entry that
+    changed after review is never removed or shadowed. Ownership changes are
+    written only after the command that justifies them has succeeded.
+    """
+
+    if mcp_plan.has_conflicts:
+        raise ConfigError(f"target {target.name!r}: resolve MCP registration conflicts before registering")
+    ownership = dict(mcp_plan.previous_ownership)
+    for command in commands:
+        verb, name = _mcp_command_identity(command)
+        environment = os.environ.copy()
+        scope_product_home_environment(environment, target)
+        _scope_command_environment(environment, command)
+        live = read_claude_mcp_servers(target)
+        if verb == "remove":
+            current = live.get(name)
+            if current is not None:
+                if ownership.get(name) != claude_spec_digest(current):
+                    raise ConfigError(
+                        f"target {target.name!r}: MCP server {name!r} changed after review; review a fresh plan"
+                    )
+                _run_mcp_command(command, environment, target, name)
+            ownership.pop(name, None)
+        else:
+            if name in live:
+                raise ConfigError(
+                    f"target {target.name!r}: MCP server {name!r} appeared after review; review a fresh plan"
+                )
+            subprocess.run(command.argv, check=True, env=environment)
+            ownership[name] = claude_spec_digest(json.loads(command.argv[-1]))
+        _write_claude_mcp_ownership(config, target, ownership)
+        if verb == "add-json":
+            registered = read_claude_mcp_servers(target).get(name)
+            if registered is None or claude_spec_digest(registered) != ownership[name]:
+                raise ConfigError(
+                    f"target {target.name!r}: registered MCP server {name!r}, but "
+                    f"{claude_user_config_path(target)} does not show the requested entry; inspect it before "
+                    "running register again"
+                )
+    resulting = dict(mcp_plan.resulting_ownership)
+    if resulting != ownership:
+        _write_claude_mcp_ownership(config, target, resulting)
+
+
+def _mcp_command_identity(command: CommandHint) -> tuple[str, str]:
+    arguments = command.argv[1:]
+    if arguments[:1] != ("mcp",) or arguments[2:4] != ("--scope", "user"):
+        raise ConfigError(f"unexpected MCP registration command for target {command.target!r}")
+    if arguments[1] == "remove" and len(arguments) == 5:
+        return "remove", arguments[4]
+    if arguments[1] == "add-json" and len(arguments) == 6:
+        return "add-json", arguments[4]
+    raise ConfigError(f"unexpected MCP registration command for target {command.target!r}")
+
+
+def _run_mcp_command(command: CommandHint, environment: dict[str, str], target: TargetConfig, name: str) -> None:
+    try:
+        subprocess.run(command.argv, check=True, env=environment)
+    except subprocess.CalledProcessError:
+        if name not in read_claude_mcp_servers(target):
+            return
+        raise
+
+
+def _write_claude_mcp_ownership(config: BridgeConfig, target: TargetConfig, ownership: dict[str, str]) -> None:
+    write_claude_mcp_ownership(config, target, tuple(sorted(ownership.items())))
+
+
+def _command_mcp(config: BridgeConfig, inventory: CatalogInventory, args: argparse.Namespace) -> int:
+    if args.mcp_command == "adopt":
+        return _command_mcp_adopt(config, inventory, args)
+    if args.mcp_command == "release":
+        return _command_mcp_release(config, args)
+    raise ConfigError(f"unknown mcp command: {args.mcp_command}")  # pragma: no cover - argparse restricts it
+
+
+def _command_mcp_adopt(config: BridgeConfig, inventory: CatalogInventory, args: argparse.Namespace) -> int:
+    """Record ownership of unowned live MCP entries that exactly equal their declaration (ADR-0009)."""
+
+    require_no_orphaned_state(config)
+    targets = select_mcp_targets(config, args.target, command="adopt", include_owned=False)
+    names = frozenset(args.name)
+    entries = adoption_entries(config, inventory, targets, names)
+    adoptable = tuple(entry for entry in entries if entry.status is McpAdoptionStatus.ADOPTABLE)
+    exit_code = 1 if any(entry.status is McpAdoptionStatus.MISMATCH for entry in entries) else 0
+    if not args.json:
+        _print_mcp_adoption(entries)
+    if not adoptable or (args.json and not args.yes):
+        if args.json:
+            _print_json(_mcp_adoption_payload(entries, applied=False))
+        elif not adoptable:
+            print("no MCP entries can be adopted")
+        return exit_code
+    if not _confirm("Record Bridge ownership for the adoptable MCP entries?", args.yes):
+        print("cancelled", file=sys.stderr)
+        return 2
+
+    fresh_entries = adoption_entries(config, discover_catalog(config), targets, names)
+    if fresh_entries != entries:
+        raise ConfigError("MCP entries, ownership, or catalog changed during adoption; review it again")
+    record_adoption(config, targets, adoptable)
+    adopted = tuple(
+        replace(entry, status=McpAdoptionStatus.ADOPTED) if entry.status is McpAdoptionStatus.ADOPTABLE else entry
+        for entry in entries
+    )
+    if args.json:
+        _print_json(_mcp_adoption_payload(adopted, applied=True))
+    else:
+        print(f"adopted {len(adoptable)} MCP entries; product configuration was not changed")
+    return exit_code
+
+
+def _command_mcp_release(config: BridgeConfig, args: argparse.Namespace) -> int:
+    """Forget Bridge ownership of MCP servers without touching product configuration (ADR-0009)."""
+
+    require_no_orphaned_state(config)
+    targets = select_mcp_targets(config, args.target, command="release", include_owned=True)
+    names = frozenset(args.name)
+    entries = release_entries(config, targets, names)
+    if not args.json:
+        for entry in entries:
+            print(f"{entry.status.value.upper():10} [{entry.target}] {entry.name}: {entry.detail}")
+    if not entries or (args.json and not args.yes):
+        if args.json:
+            _print_json(_mcp_release_payload(entries, applied=False))
+        else:
+            print("no MCP ownership to release")
+        return 0
+    if not _confirm("Forget Bridge ownership for these MCP servers?", args.yes):
+        print("cancelled", file=sys.stderr)
+        return 2
+
+    if release_entries(config, targets, names) != entries:
+        raise ConfigError("MCP ownership changed during release; review it again")
+    record_release(config, targets, entries)
+    released = tuple(replace(entry, status=McpReleaseStatus.RELEASED) for entry in entries)
+    if args.json:
+        _print_json(_mcp_release_payload(released, applied=True))
+    else:
+        print(
+            f"released {len(entries)} MCP entries; product configuration was not changed. The next plan re-creates "
+            "absent declared servers and reports existing entries as unowned until they are adopted or removed"
+        )
+    return 0
+
+
+def _mcp_release_payload(entries: tuple[McpReleaseEntry, ...], *, applied: bool) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "applied": applied,
+        "entries": [
+            {
+                "target": entry.target,
+                "product": entry.product.value,
+                "name": entry.name,
+                "status": entry.status.value,
+                "detail": entry.detail,
+            }
+            for entry in entries
+        ],
+    }
+
+
+def _print_mcp_adoption(entries: tuple[McpAdoptionEntry, ...]) -> None:
+    for entry in entries:
+        kept = (
+            f" (unowned keys kept: {', '.join(safe_key(key) for key in entry.unowned_keys)})"
+            if entry.unowned_keys
+            else ""
+        )
+        print(f"{entry.status.value.upper():9} [{entry.target}] {entry.name}: {entry.detail}{kept}")
+
+
+def _mcp_adoption_payload(entries: tuple[McpAdoptionEntry, ...], *, applied: bool) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "applied": applied,
+        "adoptable": sum(entry.status in {McpAdoptionStatus.ADOPTABLE, McpAdoptionStatus.ADOPTED} for entry in entries),
+        "mismatches": sum(entry.status is McpAdoptionStatus.MISMATCH for entry in entries),
+        "entries": [
+            {
+                "target": entry.target,
+                "product": entry.product.value,
+                "name": entry.name,
+                "status": entry.status.value,
+                "detail": entry.detail,
+                "unowned_keys": list(entry.unowned_keys),
+            }
+            for entry in entries
+        ],
+    }
 
 
 def _build_scheduler_registrations(
@@ -1225,7 +1563,7 @@ def _print_plan(plan: SyncPlan) -> None:
         for review in plan.reviews:
             print(f"  REVIEW  {review}")
     if plan.commands:
-        print("after apply, plugin registration commands are available:")
+        print("after apply, plugin and MCP registration commands are available:")
         for command in plan.commands:
             print(f"  [{command.target}] {_format_command(command)}")
 
@@ -1275,6 +1613,7 @@ def _plan_payload(plan: SyncPlan) -> dict[str, Any]:
 def _command_payload(command: CommandHint) -> dict[str, Any]:
     return {
         "target": command.target,
+        "component": command.component.value,
         "environment": dict(command.environment),
         "environment_unsets": list(command.environment_unsets),
         "argv": list(command.argv),

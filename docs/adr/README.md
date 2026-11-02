@@ -17,6 +17,7 @@ decision.
 | [0006](0006-generate-codex-instruction-profiles.md)          | Generate Codex instruction profiles       | Accepted | 2026-07-29 |
 | [0007](0007-preserve-codex-profile-hook-trust-state.md)      | Preserve Codex profile Hook trust state   | Accepted | 2026-07-30 |
 | [0008](0008-generation-bound-retention-capture.md)           | Generation-bound retention capture        | Accepted | 2026-10-19 |
+| [0009](0009-register-mcp-servers-by-owned-entry.md)          | Register MCP servers by owned entry       | Accepted | 2026-11-02 |
 
 ## Statuses
 

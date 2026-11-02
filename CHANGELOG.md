@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An `mcp` component (ADR-0009) for user-scope MCP servers. Each server is
+  declared once in `catalog/mcp/<name>/server.toml` (schema version 1) with a
+  transport, command and arguments or URL, forwarded environment-variable
+  names, a required package pin, and a required access declaration. Unknown
+  keys are rejected, so the schema has no field for environment values,
+  headers, or tokens. Unpinned `npm`/`pypi` packages, URLs with userinfo, a
+  query, a fragment, or `;` path parameters, a bearer token on a URL that is
+  neither `https` nor loopback `http`, and placeholders other than
+  `{user_home}` are rejected. `command`, `args`, and `url` stay free text:
+  common token shapes (also checked in `package.name`, `package.version`, and
+  `access.paths`), credential-named flags with a value (including camelCase
+  names such as `--accessToken`), `-e`/`--env` with a credential-named
+  `NAME=value`, `-H`/`--header` with an `Authorization` or other credential
+  header, and a `NAME=value` assignment in `command` are rejected as likely
+  accidents, naming only the field and argument index, but catalog review
+  remains the control. Governance
+  gates each server with `capability_kind = "tool"` and
+  `delivery = "mcp-registration"`; the new GOV038 finding rejects a `tool`
+  capability that delivers a non-MCP artifact and vice versa.
+- Codex MCP servers are merged by `apply` as owned `mcp_servers.<name>` leaves
+  in `<config_home>/config.toml`. A desired server never merges into an
+  existing unowned server table, whatever it holds (credentials, approvals, or
+  the other transport); that is a conflict until `mcp adopt` takes it over.
+  Comments and the unowned `tools` approvals of a declared server are
+  preserved, and deselection removes only unchanged owned leaves. Removing a
+  server deletes its whole table, including `tools` approvals and empty
+  `args`/`env_vars` arrays, so Codex is never left with a server table it
+  cannot load; the plan warns how many approvals that deletes, any other
+  leftover unowned key is a conflict that names the keys, and the comment lines
+  that end the removed table (often the note for the next table) are kept.
+- Claude Code MCP servers are registered by `register` through
+  `claude mcp add-json/remove --scope user`. The Bridge never writes
+  `~/.claude.json`; it reads the user config to report unowned, drifted,
+  missing, and unreadable entries, re-checks it before each command, records
+  ownership after each successful command, and verifies the stored entry. The
+  read requires a regular file of at most 64 MiB, does not block on special
+  files, rejects non-finite numbers and excessive nesting, and never prints
+  server names that only that file contains.
+- MCP ownership for both products lives in `state_dir/targets/<target>/mcp.json`:
+  owned Codex leaves and created containers, and Claude server names with spec
+  digests.
+- `agentbridge mcp adopt` records ownership of existing unowned MCP entries
+  that exactly equal their declaration, without changing product
+  configuration. On Codex the only extra key allowed in the table is `tools`,
+  and an empty `args` or `env_vars` array counts as absent. `--json` without
+  `--yes` is a read-only preview; mismatches exit with status 1 and are never
+  adopted.
+- `agentbridge mcp release` forgets Bridge ownership of selected MCP servers,
+  including missing or drifted owned entries and targets that deselected `mcp`,
+  without changing product configuration. It follows the same preview,
+  confirmation, platform, and orphaned-state rules as `mcp adopt`; conflict and
+  doctor messages for those entries point to it with `--target` and `--name`.
+  `register`, `mcp adopt`, and `mcp release` take no state lock and must not
+  run concurrently for one target.
+- `doctor` reports `mcp.manifests`, `mcp.drift`, `mcp.missing`,
+  `mcp.unowned-conflict`, `mcp.removal-blocked`, `mcp.claude-config`,
+  `mcp.state`, and `mcp.entries`, plus the warnings `mcp.pending-registration`
+  and `mcp.unowned-keys` and the `mcp.platform-skipped` information check.
+  `validate` counts MCP servers; `plan` reviews each server's command or URL,
+  access, package pin (marked "pin recorded, not verified" for `binary` and
+  `local`), and environment-variable names, and warns about unowned keys in
+  owned Codex server tables. Key names read from product files are printed
+  with control and other non-printable characters escaped.
+
+### Changed
+
+- Plan JSON gains additive values within schema version 1: action
+  `component = "mcp"`, action `operation = "register"`, and a `component` field
+  (`plugins` or `mcp`) on command hints.
+- `doctor` runs the marketplace preflight and `claude plugin` probe only for
+  Plugin command hints.
+- A Codex Settings fragment that declares `mcp_servers` is now a validation
+  error; declare MCP servers under `catalog/mcp` instead.
+- Settings parse errors now give the file and the line and column only, never
+  parser text; value errors in product settings files no longer name keys, and
+  catalog fragment errors print key paths with non-printable characters
+  escaped. Duplicate JSON keys are reported without the key name.
+
 ## [0.3.7] - 2026-10-20
 
 ### Changed

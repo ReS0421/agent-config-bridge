@@ -3,7 +3,9 @@
 Agent customizations are executable supply-chain inputs. A Skill can direct an
 agent to run commands, a Plugin can start an MCP server, and a Hook can execute
 at lifecycle boundaries. A Settings fragment can change permissions or tool
-behavior, and a Schedule can trigger a prompt without a human present. The
+behavior, an MCP server declaration launches a process or reaches a URL with
+the product's privileges, and a Schedule can trigger a prompt without a human
+present. The
 bridge therefore treats its canonical catalog and every rendered change as
 code, not as harmless preferences.
 
@@ -26,13 +28,16 @@ avoid importing unrelated product state.
 
 ## Allowlist, never home-directory sync
 
-Only six component classes are eligible for projection:
+Only seven component classes are eligible for projection:
 
 - standalone `skills`;
 - `plugins` and their declarative package payload;
 - `hooks` and the handler files explicitly placed in Hook bundles;
 - explicit product-native `settings` leaves in reviewed fragments;
-- strict `schedules` containing a definition and prompt.
+- strict `schedules` containing a definition and prompt;
+- strict `mcp` server manifests, delivered only as owned Codex
+  `mcp_servers.<name>` leaves and Claude Code user-scope `claude mcp`
+  registrations;
 - reviewed `instructions` overlays restricted to explicit product destinations:
   Claude Code `CLAUDE.md`, `rules/**`, `agents/**`, `commands/**`, and direct
   `model-instructions/*.md`; Codex `AGENTS.md`, `agents/**`, and direct
@@ -57,6 +62,36 @@ Settings eligibility is deliberately narrow: Codex `config.toml` and Claude
 Code `settings.json` at the configured user home. It does not include
 credentials, `~/.claude.json`, project-local configuration, managed policy, or
 any other file merely because it is beneath a product home.
+
+MCP delivery does not widen that boundary
+([ADR-0009](adr/0009-register-mcp-servers-by-owned-entry.md)). The Bridge never
+writes `~/.claude.json`; Claude Code entries change only through
+`claude mcp add-json/remove --scope user`. The Bridge reads the user config
+only to compare `mcpServers` entries: it requires a regular file of at most
+64 MiB, opens it without blocking on special files, decodes it as strict JSON
+(non-finite numbers and excessive nesting are errors), and reports parse errors
+by line and column without echoing content. Server names found only in that
+file are never printed. All MCP ownership, for both products, is recorded in
+`state_dir/targets/<target>/mcp.json`, separate from Settings and Plugin state.
+
+On Codex, a desired server never merges into an existing server table that
+the Bridge does not own. A same-name table holding anything at all, such as
+`env`, `http_headers`, `bearer_token`, `tools` approvals, or the other
+transport's key, is an unowned conflict until `mcp adopt` proves it equal, so
+pre-staged credentials or approvals cannot end up attached to the catalog
+endpoint and a table cannot mix transports.
+
+Unowned children of an owned server table, such as
+`tools.<tool>.approval_mode`, are never owned or compared while the server stays
+declared. The one exception is removal: when every owned leaf of a server is
+removed unchanged, the whole table goes with it if its only other children are
+`tools` approvals or empty `args`/`env_vars` arrays, because Codex refuses to
+load a server table without a transport. The plan warns how many approvals that
+deletes. Any other leftover key makes the removal a conflict that names the
+keys. Comment lines that end the removed table, which tomlkit stores there even
+when they introduce the next table, are kept in place. Key names read from
+product files are printed with control and other non-printable characters
+escaped.
 
 Codex profile projection does not expand that Settings boundary. The generated
 `<name>.config.toml` is a standalone Instruction file; the base
@@ -248,6 +283,9 @@ desired or previously recorded bridge-owned source. `plan` reports:
 - marketplace create/update state;
 - Hook events, matchers, handler types, and command/URL/prompt values;
 - Plugin `.mcp.json` or manifest MCP command/URL values;
+- each catalog MCP server's transport, command and arguments or URL, access
+  mode and declared paths, package pin, and forwarded environment-variable
+  names;
 - product CLI argv, environment assignments, and environment removals needed
   for later registration;
 - relevant warnings, including the Claude Code Desktop session boundary.
@@ -266,10 +304,11 @@ are not a substitute for code review.
 Before `apply` or `register` mutates state, it rediscovers the catalog and
 rebuilds the plan. A difference from the reviewed plan aborts the operation.
 Unmanaged Skill destinations, unmanaged allowlisted Instruction destinations,
-unmanaged Settings leaves, and drifted bridge-managed content are hard
-conflicts. A corrupted generated artifact that does not change plan identity
-can still fail a later integrity check rather than being classified as a stale
-plan.
+unmanaged Settings leaves, unowned same-name MCP entries, missing or drifted
+owned MCP entries, blocked MCP server table removals, an unreadable Claude user
+config, and drifted bridge-managed content are hard conflicts. A corrupted
+generated artifact that does not change plan identity can still fail a later
+integrity check rather than being classified as a stale plan.
 
 External mutation and ownership persistence cannot be one filesystem-atomic
 operation. A process can crash after replacing a Settings file, changing a
@@ -476,6 +515,33 @@ record, only an absent entry or the desired source is accepted. A duplicate
 entry, an unknown vendor JSON shape, or a third-party source fails closed before
 marketplace add/update, Plugin installation, or removal starts.
 
+Claude MCP registration adds per-command checks because the user config is a
+product-owned file with concurrent writers. Before each command the Bridge
+re-reads it: `remove` runs only while the entry still matches its recorded
+digest, and `add-json` only while the name is absent. Ownership is recorded
+after each successful command, and the stored entry must equal the requested
+spec afterwards. A window remains between the check and the product command,
+and Claude Code removes and adds entries by name: an entry edited in that
+window can be removed by `remove`, and one added under the same name can be
+replaced by `add-json` or make it fail. Such a lost edit is not reported or
+recovered, so close other sessions that change MCP servers while `register`
+runs.
+
+Bridge MCP ownership has no state lock either. `register`, `mcp adopt`, and
+`mcp release` each re-check before writing `mcp.json`, but they must not run
+concurrently for the same target: a write from one can overwrite the other's.
+The recovery is the next plan, where an entry whose ownership was lost reads as
+an unowned conflict that `mcp adopt` can take over again.
+
+`mcp adopt` is the only path that records ownership of an existing entry. It
+accepts only exact value matches (on Codex the only extra key allowed in the
+table is `tools`, and an empty `args` or `env_vars` array counts as absent),
+previews before writing, re-checks before recording, and never changes product
+configuration. A near match is listed and remains a conflict. `mcp release` is
+its inverse: it forgets Bridge ownership of selected servers, including owned
+entries that are missing or drifted, under the same preview, re-check, and
+platform rules, and it also never changes product configuration.
+
 Installation does not confer trust. Codex and Claude Code remain responsible for
 Hook review, workspace trust, organization policy, permission prompts, Plugin
 caches, connector authentication, and disabled-feature settings. The bridge does
@@ -533,6 +599,28 @@ or allowlist policies suitable for unattended execution. Do not assume a
 Desktop prompt or approval dialog will be available to a host-scheduled process.
 
 ## Hook and MCP hardening
+
+MCP manifests are strict so that the schema has no field for secret values.
+`env`, `headers`, `bearer_token`, and every other undeclared key are rejected.
+Environment variables are declared by name (`^[A-Z_][A-Z0-9_]*$`) and rendered
+as Codex `env_vars` or Claude `${NAME}` references; a bearer token is declared
+only as a variable name, and only for an `https` URL or an `http` URL whose host
+is `localhost`, `127.0.0.1`, or `::1`. Ownership state and diagnostics hold
+names, key names, and digests, not values.
+
+`command`, `args`, and `url` remain free text, and they appear in plan review
+and in rendered product commands. Parsing rejects common accidents: token
+shapes (`ghp_`, `gho_`, `ghu_`, `ghs_`, `github_pat_`, `sk-` with 16 or more
+characters, `xox[abprs]-`, `AKIA` access-key IDs, and JWT-like strings), a
+credential-named flag such as `--api-key` or `--token` given a value either as
+`--flag=value` or as the next argument, a `NAME=value` assignment in `command`,
+and URLs with userinfo, a query string, a fragment, or `;` path parameters.
+Errors name only the field and argument index. These checks are heuristics, not
+a secret scanner; catalog review is the control. `npm` and `pypi` servers must
+pin an exact version that appears in their arguments; `binary` and `local` pins
+are recorded for review but not verified. The `[access]` declaration is a
+review aid, not a sandbox: the server runs with the launching product's
+privileges.
 
 Catalog authors should:
 

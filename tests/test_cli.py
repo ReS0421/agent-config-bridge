@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import time
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
@@ -390,7 +391,8 @@ def test_init_creates_starter_config_and_refuses_unconfirmed_overwrite(
 
     assert cli.main(["init", "--config", str(config_path)]) == 0
     assert config_path.is_file()
-    assert all((tmp_path / "catalog" / group).is_dir() for group in ("skills", "plugins", "hooks"))
+    assert all((tmp_path / "catalog" / group).is_dir() for group in ("skills", "plugins", "hooks", "mcp"))
+    assert "mcp" in tomllib.loads(config_path.read_text(encoding="utf-8"))["bridge"]["components"]
 
     assert cli.main(["init", "--config", str(config_path)]) == 2
     assert "config already exists" in capsys.readouterr().err
@@ -412,6 +414,7 @@ def test_validate_json_reports_catalog_inventory(
         "catalog": str((tmp_path / "catalog").resolve()),
         "hooks": 1,
         "instructions": 0,
+        "mcp": 0,
         "plugins": 0,
         "schedules": 0,
         "settings": 0,

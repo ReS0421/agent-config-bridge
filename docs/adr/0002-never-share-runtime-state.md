@@ -4,6 +4,12 @@
 
 Accepted — 2026-07-14
 
+Amended by [ADR-0009](0009-register-mcp-servers-by-owned-entry.md): `mcp`
+server declarations join the allowlisted components. Codex tool approvals stay
+unowned and are never compared or shared; they are removed only together with
+a removed MCP server table, because Codex cannot load a server table that holds
+nothing else.
+
 ## Context
 
 Codex and Claude product homes contain both declarative customization and mutable
@@ -93,6 +99,7 @@ workspace trust, hook review, connector authentication, and permission decisions
 ## Related decisions
 
 - [ADR-0001: Render target-specific artifacts](0001-render-target-specific-artifacts.md)
+- [ADR-0009: Register MCP servers by owned entry](0009-register-mcp-servers-by-owned-entry.md)
 
 ## References
 

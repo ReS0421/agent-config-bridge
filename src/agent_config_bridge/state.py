@@ -6,13 +6,16 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_config_bridge.catalog import Artifact, CatalogInventory, is_windows_portable_path_component
+from agent_config_bridge.mcp import CODEX_SERVER_KEYS
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key
+from agent_config_bridge.platforms import product_home_environment_unsets
 
 __all__ = [
     "BridgeStateError",
@@ -26,7 +29,12 @@ __all__ = [
     "effective_link_mode",
     "find_orphaned_target_states",
     "instruction_state_path",
+    "McpState",
+    "mcp_state_path",
+    "read_claude_mcp_ownership",
     "read_instruction_state",
+    "read_mcp_leaf_state",
+    "read_mcp_state",
     "read_registration_state",
     "read_scheduler_state",
     "read_settings_state",
@@ -38,7 +46,10 @@ __all__ = [
     "settings_state_path",
     "skill_root_for_target",
     "skill_state_path",
+    "write_claude_mcp_ownership",
     "write_instruction_state",
+    "write_mcp_leaf_state",
+    "write_mcp_state",
     "write_registered_plugins",
     "write_scheduler_state",
     "write_settings_state",
@@ -86,6 +97,27 @@ class RegistrationState:
 
     plugins: tuple[str, ...]
     marketplace_source: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class McpState:
+    """MCP server ownership for one target (ADR-0009), kept in ``mcp.json``.
+
+    ``leaves`` records owned Codex ``mcp_servers`` leaves and the containers
+    the Bridge created or adopted. ``claude_servers`` records ``(name,
+    spec_digest)`` pairs for Claude Code user-scope servers registered or
+    adopted by the Bridge. Plugin registration state never holds MCP
+    ownership, so a Bridge release without MCP support cannot drop it.
+    """
+
+    leaves: SettingsState
+    claude_servers: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        """Return whether the target owns no MCP leaves or registrations."""
+
+        return not self.leaves.entries and not self.claude_servers
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +189,12 @@ def settings_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
     """Return the validated per-target setting ownership record path."""
 
     return _state_path(config, target, "settings.json")
+
+
+def mcp_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
+    """Return the validated per-target MCP server ownership record path."""
+
+    return _state_path(config, target, "mcp.json")
 
 
 def instruction_state_path(config: BridgeConfig, target: TargetConfig) -> Path:
@@ -351,45 +389,150 @@ def read_registered_plugins(config: BridgeConfig, target: TargetConfig) -> tuple
 def read_settings_state(config: BridgeConfig, target: TargetConfig) -> SettingsState:
     """Read product-setting leaves previously reconciled through apply."""
 
-    path = settings_state_path(config, target)
+    return _read_leaf_state(
+        settings_state_path(config, target),
+        "settings ownership state",
+        target,
+        _settings_identity(target),
+        entries_key="settings",
+        valid_entry=lambda source_id, _path: source_id.startswith("settings/") and "\x00" not in source_id,
+        valid_container=lambda _path: True,
+    )
+
+
+def read_mcp_state(config: BridgeConfig, target: TargetConfig) -> McpState:
+    """Read MCP server ownership recorded by apply, register, or adoption.
+
+    MCP ownership is recorded separately from Settings bundles and Plugin
+    registrations so each component can be selected or deselected, and each
+    record rolled back, without touching the others.
+    """
+
+    path = mcp_state_path(config, target)
     if not path.exists():
         if path.is_symlink():
-            raise BridgeStateError(f"settings ownership state is a broken symlink: {path}")
+            raise BridgeStateError(f"MCP ownership state is a broken symlink: {path}")
+        return McpState(leaves=SettingsState(file_created=False, created_containers=(), entries=()))
+    payload = _read_state_payload(path, "MCP ownership state")
+    leaves = _parse_leaf_state(
+        payload,
+        path,
+        "MCP ownership state",
+        target,
+        _mcp_identity(target),
+        entries_key="mcp_leaves",
+        valid_entry=_is_valid_mcp_leaf,
+        valid_container=lambda container: container[0] == "mcp_servers" and len(container) <= 2,
+    )
+    raw_claude = payload.get("claude_servers")
+    if not isinstance(raw_claude, dict) or not all(
+        isinstance(name, str)
+        and _ARTIFACT_NAME.fullmatch(name) is not None
+        and isinstance(digest, str)
+        and _SHA256.fullmatch(digest) is not None
+        for name, digest in raw_claude.items()
+    ):
+        raise BridgeStateError(f"invalid Claude MCP server ownership in MCP ownership state: {path}")
+    if raw_claude and target.product is not Product.CLAUDE_CODE:
+        raise BridgeStateError(f"Claude MCP server ownership recorded for a non-Claude target: {path}")
+    if leaves.entries and target.product is not Product.CODEX:
+        raise BridgeStateError(f"Codex MCP leaf ownership recorded for a non-Codex target: {path}")
+    return McpState(leaves=leaves, claude_servers=tuple(sorted(raw_claude.items())))
+
+
+def read_mcp_leaf_state(config: BridgeConfig, target: TargetConfig) -> SettingsState:
+    """Read owned Codex ``mcp_servers`` leaves and Bridge-held containers."""
+
+    return read_mcp_state(config, target).leaves
+
+
+def read_claude_mcp_ownership(config: BridgeConfig, target: TargetConfig) -> tuple[tuple[str, str], ...]:
+    """Read ``(name, spec_digest)`` pairs for Bridge-owned Claude Code MCP servers."""
+
+    return read_mcp_state(config, target).claude_servers
+
+
+def _is_valid_mcp_leaf(source_id: str, path: tuple[str, ...]) -> bool:
+    name = source_id.removeprefix("mcp/")
+    return (
+        source_id.startswith("mcp/")
+        and _ARTIFACT_NAME.fullmatch(name) is not None
+        and len(path) == 3
+        and path[:2] == ("mcp_servers", name)
+        and path[2] in CODEX_SERVER_KEYS
+    )
+
+
+def _read_leaf_state(
+    path: Path,
+    description: str,
+    target: TargetConfig,
+    identity: dict[str, str],
+    *,
+    entries_key: str,
+    valid_entry: Callable[[str, tuple[str, ...]], bool],
+    valid_container: Callable[[tuple[str, ...]], bool],
+) -> SettingsState:
+    if not path.exists():
+        if path.is_symlink():
+            raise BridgeStateError(f"{description} is a broken symlink: {path}")
         return SettingsState(file_created=False, created_containers=(), entries=())
-    payload = _read_state_payload(path, "settings ownership state")
+    payload = _read_state_payload(path, description)
+    return _parse_leaf_state(
+        payload,
+        path,
+        description,
+        target,
+        identity,
+        entries_key=entries_key,
+        valid_entry=valid_entry,
+        valid_container=valid_container,
+    )
+
+
+def _parse_leaf_state(
+    payload: dict[str, Any],
+    path: Path,
+    description: str,
+    target: TargetConfig,
+    identity: dict[str, str],
+    *,
+    entries_key: str,
+    valid_entry: Callable[[str, tuple[str, ...]], bool],
+    valid_container: Callable[[tuple[str, ...]], bool],
+) -> SettingsState:
     try:
         if payload["schema_version"] != 1 or payload["target"] != target.name:
             raise ValueError("schema version or target does not match")
-        _require_identity(payload, _settings_identity(target), path)
+        _require_identity(payload, identity, path)
         file_created = payload["file_created"]
         raw_containers = payload["created_containers"]
-        raw_entries = payload["settings"]
+        raw_entries = payload[entries_key]
     except (KeyError, TypeError, ValueError) as exc:
-        raise BridgeStateError(f"invalid settings ownership state: {path}") from exc
+        raise BridgeStateError(f"invalid {description}: {path}") from exc
     if type(file_created) is not bool or not isinstance(raw_containers, list) or not isinstance(raw_entries, list):
-        raise BridgeStateError(f"invalid settings ownership state: {path}")
+        raise BridgeStateError(f"invalid {description}: {path}")
 
     containers = tuple(_parse_setting_path(item, path) for item in raw_containers)
-    if len(containers) != len(set(containers)):
-        raise BridgeStateError(f"duplicate created containers in settings ownership state: {path}")
+    if len(containers) != len(set(containers)) or not all(valid_container(item) for item in containers):
+        raise BridgeStateError(f"invalid created containers in {description}: {path}")
 
     entries: list[SettingStateEntry] = []
     seen_paths: set[tuple[str, ...]] = set()
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict):
-            raise BridgeStateError(f"invalid setting entry in ownership state: {path}")
+            raise BridgeStateError(f"invalid entry in {description}: {path}")
         source_id = raw_entry.get("source_id")
         value_digest = raw_entry.get("value_digest")
         setting_path = _parse_setting_path(raw_entry.get("path"), path)
         if (
             not isinstance(source_id, str)
-            or not source_id.startswith("settings/")
-            or "\x00" in source_id
+            or not valid_entry(source_id, setting_path)
             or not isinstance(value_digest, str)
             or _SHA256.fullmatch(value_digest) is None
             or setting_path in seen_paths
         ):
-            raise BridgeStateError(f"invalid setting entry in ownership state: {path}")
+            raise BridgeStateError(f"invalid entry in {description}: {path}")
         seen_paths.add(setting_path)
         entries.append(SettingStateEntry(source_id=source_id, path=setting_path, value_digest=value_digest))
     return SettingsState(file_created=file_created, created_containers=containers, entries=tuple(entries))
@@ -504,6 +647,51 @@ def write_settings_state(
         ],
     }
     _write_state_document(path, payload, "settings ownership state")
+
+
+def write_mcp_state(config: BridgeConfig, target: TargetConfig, state: McpState) -> None:
+    """Atomically record MCP server ownership; an empty record removes ``mcp.json``."""
+
+    path = mcp_state_path(config, target)
+    if state.is_empty:
+        _remove_state_document(path, "MCP ownership state")
+        return
+    leaves = state.leaves if state.leaves.entries else SettingsState(False, (), ())
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "target": target.name,
+        "identity": _mcp_identity(target),
+        "file_created": leaves.file_created,
+        "created_containers": [list(item) for item in leaves.created_containers],
+        "mcp_leaves": [
+            {
+                "source_id": entry.source_id,
+                "path": list(entry.path),
+                "value_digest": entry.value_digest,
+            }
+            for entry in leaves.entries
+        ],
+        "claude_servers": dict(sorted(state.claude_servers)),
+    }
+    _write_state_document(path, payload, "MCP ownership state")
+
+
+def write_mcp_leaf_state(config: BridgeConfig, target: TargetConfig, leaves: SettingsState) -> None:
+    """Record owned Codex MCP leaves, keeping any Claude registration ownership."""
+
+    current = read_mcp_state(config, target)
+    write_mcp_state(config, target, McpState(leaves=leaves, claude_servers=current.claude_servers))
+
+
+def write_claude_mcp_ownership(
+    config: BridgeConfig,
+    target: TargetConfig,
+    servers: tuple[tuple[str, str], ...],
+) -> None:
+    """Record Bridge-owned Claude MCP servers, keeping any Codex leaf ownership."""
+
+    current = read_mcp_state(config, target)
+    write_mcp_state(config, target, McpState(leaves=current.leaves, claude_servers=tuple(sorted(servers))))
 
 
 def write_scheduler_state(
@@ -629,7 +817,14 @@ def find_orphaned_target_states(config: BridgeConfig) -> tuple[str, ...]:
             raise BridgeStateError(f"invalid target ownership state directory: {candidate}")
         has_state = any(
             (candidate / filename).exists()
-            for filename in ("skills.json", "plugins.json", "settings.json", "scheduler.json", "instructions.json")
+            for filename in (
+                "skills.json",
+                "plugins.json",
+                "settings.json",
+                "scheduler.json",
+                "instructions.json",
+                "mcp.json",
+            )
         )
         if has_state and candidate.name not in enabled_names:
             orphaned.append(candidate.name)
@@ -658,6 +853,22 @@ def _instruction_identity(target: TargetConfig) -> dict[str, str]:
         "product": target.product.value,
         "platform": target.platform.value,
         "config_home": _path_identity(target.config_home, target.platform),
+    }
+
+
+def _mcp_identity(target: TargetConfig) -> dict[str, str]:
+    """Bind MCP ownership to the product file that holds the entries."""
+
+    if target.product is Product.CODEX:
+        mcp_file = target.config_home / "config.toml"
+    elif product_home_environment_unsets(target):
+        mcp_file = target.user_home / ".claude.json"
+    else:
+        mcp_file = target.config_home / ".claude.json"
+    return {
+        "product": target.product.value,
+        "platform": target.platform.value,
+        "mcp_file": _path_identity(mcp_file, target.platform),
     }
 
 

@@ -27,11 +27,21 @@ Version 1 contains these required top-level fields:
   `source`, `destination`, `detail`, and the nullable provenance fields
   `source_id`, `source_digest`, and `link_mode`.
 - `commands`: an array of structured product command hints. Each command
-  contains `target`, an `environment` object, an `environment_unsets` array, an
-  `argv` array, and a human-readable `reason`. Consumers must preserve both
-  environment additions and removals when evaluating a command.
+  contains `target`, `component`, an `environment` object, an
+  `environment_unsets` array, an `argv` array, and a human-readable `reason`.
+  Consumers must preserve both environment additions and removals when
+  evaluating a command. `component` is an additive field: `plugins` for
+  marketplace and Plugin/Hook package commands, `mcp` for Claude Code MCP
+  registration commands.
 - `reviews` and `warnings`: arrays of human-readable strings.
 - `has_changes` and `has_conflicts`: booleans summarizing the action set.
+
+The MCP component adds values within version 1 without changing its shape:
+action `component = "mcp"`, action `operation = "register"` for the per-target
+Claude Code MCP registration summary (its `disposition` is `noop` or
+`conflict`; pending work is described by the `mcp` command hints), and the
+command `component` field above. Consumers that switch on these enumerations
+must treat unknown values as unsupported rather than guessing.
 
 Exit status `0` means the plan has no conflicts; status `1` means the emitted
 plan contains a conflict. Any other status, invalid JSON, a non-object payload,
@@ -170,6 +180,54 @@ Only the user-level public Settings files above are eligible. The bridge does
 not treat project-local settings, `~/.claude.json`, organization-managed policy,
 authentication, trust, or other product-home files as Settings fragments.
 Plugin marketplace registration remains a separate explicit workflow.
+
+## MCP servers
+
+MCP servers share one declaration, not one writer
+([ADR-0009](adr/0009-register-mcp-servers-by-owned-entry.md)):
+
+| Concern | Codex | Claude Code |
+| --- | --- | --- |
+| Canonical manifest | `mcp/<name>/server.toml` | `mcp/<name>/server.toml` |
+| Live destination | `mcp_servers.<name>` in `<config_home>/config.toml` | user-scope `mcpServers.<name>` in `<user_home>/.claude.json` (default profile) or `<config_home>/.claude.json` |
+| Writer | `apply`, owned leaves | `register`, `claude mcp add-json/remove --scope user` |
+| stdio shape | `command`, plus `args` and `env_vars` when non-empty | `{"type":"stdio","command","args","env":{"NAME":"${NAME}"}}` |
+| http shape | `url`, plus `bearer_token_env_var` when set | `{"type":"http","url"}`, plus `headers.Authorization = "Bearer ${NAME}"` |
+| Unowned children | `tools.*` approvals preserved while the server is declared; removed with the table | Not applicable; the whole entry is compared |
+| Ownership | `mcp_leaves` and `created_containers` in `targets/<target>/mcp.json` | `claude_servers` name-to-digest map in `targets/<target>/mcp.json` |
+
+`{user_home}` expands to `C:\Users\...` form for Windows targets and POSIX form
+for Linux targets. Command lines are used exactly as declared; the Bridge adds
+no shell wrapper, so a Windows target's `command` must be one the product can
+launch on that host. Claude registration runs
+only from the target's platform; another platform gets a warning. When
+comparing Claude entries, a missing `type` is `stdio`, missing stdio `args` and
+`env` are empty, and empty http `headers` are dropped. Schema version 1 cannot
+declare tool allowlists, startup timeouts, inline environment values, or
+headers other than the bearer token.
+
+A desired Codex server never merges into an existing unowned
+`mcp_servers.<name>` table, whatever it holds; such a table is a conflict until
+`agentbridge mcp adopt` takes it over.
+
+Removing a Codex server deletes the whole `mcp_servers.<name>` table when every
+owned leaf is unchanged and the table holds nothing else but `tools` approvals
+or empty `args`/`env_vars` arrays; any other unowned key makes the removal a
+conflict. The plan warns how many `tools` approvals a removal deletes, and the
+comment lines that end the removed table stay in place. While a server stays
+declared, extra unowned keys produce a plan warning and the `mcp.unowned-keys`
+doctor warning.
+
+`agentbridge mcp adopt` records ownership of existing entries that exactly match
+their declaration (on Codex only `tools` may be present besides the declared
+leaves). `agentbridge mcp release` forgets ownership of selected servers. Both
+change only `mcp.json`, never product configuration.
+
+`plugins.json` holds no MCP data, so Plugin registration state is byte-for-byte
+what it was before MCP support. Bridge 0.3.7 and earlier cannot load a
+configuration that selects `mcp` or a catalog with `mcp/` governance refs, and
+they never read or write `mcp.json`; a downgrade therefore cannot erase MCP
+ownership, and an upgrade needs no migration.
 
 ## Instructions
 
@@ -375,8 +433,8 @@ product homes and `state_dir`.
 
 ## Ownership and reconciliation
 
-`apply` records standalone Skills, Instruction files, and Settings leaves, and
-publishes Schedule snapshots. On a later plan it can:
+`apply` records standalone Skills, Instruction files, Settings leaves, and Codex
+MCP leaves, and publishes Schedule snapshots. On a later plan it can:
 
 - remove a recorded symlink only if it still targets the recorded source;
 - update or remove a managed copy only if its marker matches and it has not
@@ -389,11 +447,12 @@ publishes Schedule snapshots. On a later plan it can:
 - remove a deselected published Schedule pointer without touching a host
   scheduler entry.
 
-`register` separately records the Plugin names and host heartbeat it
-successfully reconciles for a target. Later deselection removes only those
-recorded items. Claude registration includes marketplace update and Plugin
-update commands so a bumped local release is refreshed. Unrelated Plugins and
-scheduler entries remain untouched.
+`register` separately records the Plugin names (in `plugins.json`), Claude MCP
+server digests (in `mcp.json`), and host heartbeat it successfully reconciles
+for a target. Later deselection removes only those recorded items. Claude
+registration includes marketplace update and Plugin update commands so a bumped
+local release is refreshed. Unrelated Plugins and scheduler entries remain
+untouched.
 
 If a user copies a preview command and runs it manually, the product may change
 but bridge ownership state does not. Use `agentbridge register` when automatic
@@ -402,7 +461,7 @@ future reconciliation is desired.
 Target names identify ownership records. To rename/delete a target or change its
 product/home identity safely, first keep the old target identity, set
 `components = []`, run `apply` and `register`, and confirm the empty
-reconciliation of all six component classes. Only then change or remove it.
+reconciliation of all seven component classes. Only then change or remove it.
 Skipping this sequence leaves an orphan `state_dir/targets/<old-name>` record;
 diagnostics fail and `apply` plus `register` stop because the bridge cannot infer
 which new target, if any, owns the old state. Restore the old identity and
@@ -414,7 +473,8 @@ reconcile it to empty.
   rollback, or recovery log. Schedule ticks use a separate runtime lock.
 - A crash between a successful external mutation and the matching ownership
   write can leave a fail-closed conflict; the bridge has no automatic rollback
-  or adoption path for that window.
+  or adoption path for that window. For MCP servers, `mcp adopt` and
+  `mcp release` are the explicit recovery paths.
 - A sequential apply/register can stop after earlier actions succeeded; inspect
   a fresh plan before retrying.
 - Symlink mode is live and bypasses copy-mode update checkpoints.
@@ -426,6 +486,10 @@ reconcile it to empty.
 - Manual product commands bypass bridge ownership recording.
 - Settings remain product-specific, project-local and policy-managed Settings
   are out of scope, and arrays are atomic merge leaves.
+- MCP servers are user-scope only. Project-scoped `.mcp.json` files, Claude
+  local-scope entries, and product tuning keys are not managed, and Claude
+  registration trusts the product CLI's stored representation, checked after
+  each `add-json`.
 - Host Schedules do not appear in native product scheduler UIs, do not inherit
   conversation context, and do not replay missed minutes.
 - Host scheduler availability, product CLI authentication, and unattended
