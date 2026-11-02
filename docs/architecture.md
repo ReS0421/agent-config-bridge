@@ -3,9 +3,9 @@
 Agent Config Bridge projects one canonical catalog of reusable agent
 customizations into the native layouts expected by Codex and Claude Code. It
 shares declarative content—Skills, Plugin source, Hook source, selected public
-Settings, recurring CLI workflows, and allowlisted always-loaded Instructions—
-but keeps credentials, sessions, caches, trust decisions, and other runtime
-state local to each product installation.
+Settings, recurring CLI workflows, allowlisted always-loaded Instructions, and
+user-scope MCP server declarations—but keeps credentials, sessions, caches,
+trust decisions, and other runtime state local to each product installation.
 
 The core rule is:
 
@@ -19,12 +19,14 @@ The bridge is designed to:
 
 - maintain one reviewable catalog for Windows and Linux;
 - target Codex CLI, Claude Code CLI, Codex Desktop, and Claude Code Desktop;
-- enable `skills`, `plugins`, `hooks`, `settings`, `schedules`, and
-  `instructions`
+- enable `skills`, `plugins`, `hooks`, `settings`, `schedules`,
+  `instructions`, and `mcp`
   independently, globally or per target;
 - produce separate Codex and Claude Code Plugin packages from shared source;
 - patch explicit product Settings leaves without replacing unrelated local
   configuration;
+- declare user-scope MCP servers once and deliver them through each product's
+  native writer, with ownership, drift checks, and value-proven adoption;
 - run portable recurring prompts through the native host scheduler and public
   product CLI;
 - reconcile only paths and installations that the bridge has recorded as owned;
@@ -45,7 +47,7 @@ product CLI returns. `doctor` reports the selected launcher's informational
                     | canonical catalog    |
                     | skills/plugins/hooks |
                     | settings/schedules/  |
-                    | instructions         |
+                    | instructions/mcp     |
                     +----------+-----------+
                                |
                       discover + validate
@@ -59,8 +61,9 @@ product CLI returns. `doctor` reports the selected launcher's informational
                          |             |
             +------------+--+       product CLIs
             |               |       + host scheduler
-      Skills + Instructions |
-      + Settings + ownership|
+      Skills + Instructions |       + claude mcp
+      + Settings + Codex MCP|
+      leaves + ownership    |
                             v
                   immutable build
              marketplaces + target schedules
@@ -70,7 +73,8 @@ product CLI returns. `doctor` reports the selected launcher's informational
 
 The catalog is the source of truth. Immutable builds, the published marketplace,
 Schedule snapshots, Skill links/copies, Instruction links/copies, Settings
-patches, scheduler heartbeats, and product install caches are derived artifacts.
+patches, Codex MCP leaves, Claude MCP registrations, scheduler heartbeats, and
+product install caches are derived artifacts.
 The stable marketplace and per-target Schedule pointers let registered
 consumers use content without depending on a changing build digest.
 
@@ -85,7 +89,7 @@ schema_version = 1
 catalog = "/path/to/agent-catalog"
 state_dir = "/path/to/bridge-state"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions", "mcp"]
 
 [[targets]]
 name = "local-codex"
@@ -182,6 +186,9 @@ catalog/
 ├── schedules/<name>/
 │   ├── schedule.toml
 │   └── PROMPT.md
+├── mcp/<name>/
+│   ├── server.toml               # product-neutral server manifest
+│   └── README.md                 # optional
 └── instructions/<bundle>/
     ├── projections.toml          # optional Codex profile projection metadata
     ├── codex/                    # AGENTS.md, agents/**, model-instructions/*.md,
@@ -208,7 +215,8 @@ lowercase kebab-case identity. A Settings bundle must contain at least one
 non-empty product fragment. A Schedule contains exactly its two declared files.
 An Instruction bundle contains one or both product overlays. Each source is
 non-empty UTF-8 without BOM, every destination is on the product allowlist, and
-only one bundle may own a destination for a product.
+only one bundle may own a destination for a product. An MCP bundle contains
+`server.toml` and an optional `README.md`, both real regular files.
 
 ### Codex instruction profile projection
 
@@ -370,6 +378,86 @@ formatting. Claude JSON preserves unrelated values but may normalize formatting.
 Ownership state does not retain the original or displaced values, so unrelated
 product configuration is not copied into bridge state.
 
+## MCP server projection
+
+An MCP server is declared once in `catalog/mcp/<name>/server.toml`
+([ADR-0009](adr/0009-register-mcp-servers-by-owned-entry.md)). Schema version 1
+accepts only `schema_version`, `transport` (`stdio` or `http`), `command`,
+`args`, `url`, `env_vars`, `bearer_token_env_var`, a required `[package]`
+(`ecosystem`, `name`, `version`), and a required `[access]` (`mode`, `paths`).
+Unknown keys, wrong-transport values, an `npm`/`pypi` pin that does not appear
+in `args`, a URL with userinfo, a query, a fragment, or `;` path parameters, a
+bearer token on a non-`https` URL other than loopback `http`, control
+characters, and any placeholder other than `{user_home}` are validation errors.
+`command`, `args`, and `url` are also checked for common token shapes,
+credential-named flags with a value, and a `NAME=value` assignment in `command`;
+the error names only the field and argument index. That check is a heuristic,
+and catalog review stays the control. `validate`, `plan`,
+and `doctor` parse every manifest. Governance gates each server per target with
+`capability_kind = "tool"` and `delivery = "mcp-registration"`; a `tool`
+capability must deliver only `mcp/` artifacts and vice versa (GOV038).
+
+The two products keep their native writers:
+
+| Product | Delivered by | Desired shape | Ownership |
+| --- | --- | --- | --- |
+| Codex | `apply` | owned leaves `mcp_servers.<name>.{command,args,env_vars}` or `{url,bearer_token_env_var}` in `<config_home>/config.toml`; empty lists are omitted | `mcp_leaves` and `created_containers` in `targets/<target>/mcp.json`, separate from Settings |
+| Claude Code | `register` | `claude mcp add-json --scope user <name> <json>`; an update is `remove` then `add-json`; a deselection is `remove` | `claude_servers` (name → spec digest) in `targets/<target>/mcp.json`; `plugins.json` holds no MCP data |
+
+Codex leaves use the Settings owned-leaf engine with source IDs `mcp/<name>`, so
+comments survive and unowned children such as `tools.<tool>.approval_mode` are
+never owned or compared while the server stays declared. Each desired server
+table is claimed: a desired server may create it, but when no owned leaf lies
+below it and the table already exists with any child (credentials, approvals,
+or the other transport), the table is one unowned conflict and none of its
+leaves are planned, so only `mcp adopt` can take it over. The engine accepts
+owned-table rules for MCP servers: when a plan removes every owned leaf of a
+server and their digests still match, the whole `mcp_servers.<name>` table is
+removed if its remaining children are only `tools` or empty `args`/`env_vars`
+arrays, because Codex rejects a server table without a transport. Any other
+leftover key turns the removal into a conflict that names the keys. A declared
+server whose table carries such extra keys gets a plan warning instead, and a
+removal that deletes `tools` approvals gets a warning with their count. Because
+tomlkit stores the comment block above the next table header inside the
+preceding table, apply puts the comment lines that end a removed table back in
+place: above the following sibling, or after anything added to the same
+container, so a note for the next table survives byte-for-byte. Key names read
+from the file are escaped before they reach plan, doctor, or adoption output. A
+Settings fragment that declares
+`mcp_servers` is rejected, so the two ownership records never claim the same
+path. `apply` re-plans the MCP patch against the fresh file and requires the
+reviewed desired digest before the atomic replacement.
+
+For Claude Code, planning reads `mcpServers` from the user config
+(`<user_home>/.claude.json` for the default profile, otherwise
+`<config_home>/.claude.json`) and compares normalized specs: a missing `type`
+is `stdio`, missing stdio `args` and `env` are empty, and empty http `headers`
+are dropped. Rendered specs contain only `${NAME}` references for environment
+variables and bearer tokens. The plan carries one `register` action per Claude
+target that is a no-op or a conflict; pending work appears as command hints.
+An unowned same-name entry, a changed owned entry, a missing owned entry, a
+blocked Codex table removal, and an unreadable or invalid user config are
+conflicts. Like every other conflict they make `plan.has_conflicts` true, which
+blocks `apply`, `register`, and `sync-skills`. Pending Claude registration is
+not a conflict and blocks none of them; `doctor` reports it as a warning.
+Targets on another platform get a warning instead of commands.
+
+`agentbridge mcp adopt` previews, then records ownership of unowned entries
+whose values exactly equal the rendered declaration, without touching product
+configuration. Codex requires every declared leaf to be equal, treats an empty
+`args` or `env_vars` array as absent, and allows no key in the table besides
+the declared leaves and `tools`; Claude requires equal normalized JSON.
+`agentbridge mcp release` is the inverse: it forgets ownership of selected
+servers (Codex leaves and created containers, or Claude name and digest),
+including owned entries that are missing or drifted and targets that no longer
+select `mcp` but still hold ownership. Conflict details and doctor messages for
+those entries name `mcp release --name <name>`. Both commands are limited to
+targets on the current platform, preview before writing, re-check before
+writing, fail closed on orphaned state, and change only `mcp.json`. There is no
+state lock, so `register`, `mcp adopt`, and `mcp release` must not run
+concurrently for one target; a lost ownership update shows up on the next plan
+as an unowned conflict.
+
 ## Host-managed Schedules
 
 A Schedule is a product-neutral recurring CLI intent:
@@ -438,6 +526,9 @@ marketplace integrity metadata, and bridge ownership records. It reports:
 - Skill link/copy creates, updates, removals, no-ops, and conflicts;
 - Instruction file link/copy creates, updates, removals, no-ops, and conflicts;
 - aggregate Settings leaf create/update/remove/no-op/conflict counts;
+- aggregate Codex MCP leaf counts and one Claude MCP registration action per
+  target, plus a review item per server with its transport, command or URL,
+  access mode and paths, package pin, and environment-variable names;
 - whether the stable marketplace must be created or refreshed;
 - whether each per-target Schedule snapshot must be published or removed;
 - explicit product CLI commands for registration and reconciliation;
@@ -469,7 +560,17 @@ probe as `register` and reports absent/owned, foreign, malformed, or skipped
 marketplace state. Both probes capture bytes and decode vendor text as strict
 UTF-8 rather than using the host locale. These checks validate executable
 identity and registration readiness; they do not certify Plugin, Hook,
-Settings, or Schedule feature semantics.
+Settings, or Schedule feature semantics. Doctor also reports MCP manifest
+validity (`mcp.manifests`) and, per target, owned-entry drift (`mcp.drift`),
+missing owned entries (`mcp.missing`), unowned same-name entries
+(`mcp.unowned-conflict`), blocked Codex table removals (`mcp.removal-blocked`),
+an unreadable Claude user config (`mcp.claude-config`), and unreadable MCP
+ownership state (`mcp.state`) as errors; pending Claude registration
+(`mcp.pending-registration`) and extra unowned keys in owned Codex tables
+(`mcp.unowned-keys`) as warnings; and a target on another platform
+(`mcp.platform-skipped`) as information. Messages name servers, key names, and
+files, never values. The marketplace preflight and `claude plugin` probe run
+only for Plugin command hints, never for MCP hints.
 
 ## Apply and filesystem reconciliation
 
@@ -537,7 +638,7 @@ retained managed-copy backups remain available for manual recovery. The
 Instruction copy/backup/install path does not fsync file contents or parent
 directories and therefore makes no power-loss durability claim.
 
-## Plugin, Hook, and Schedule registration
+## Plugin, Hook, MCP, and Schedule registration
 
 `register` is deliberately separate from `apply`. It requires confirmation,
 refuses targets whose platform differs from the current host, rechecks the plan
@@ -547,6 +648,14 @@ receives `CODEX_HOME`; Claude removes an inherited `CLAUDE_CONFIG_DIR` for the
 default profile and sets it only for a custom `config_home`, because default
 profile metadata lives beside `<user_home>/.claude`. It then reconciles any selected or previously owned
 scheduler heartbeat.
+
+Claude MCP registration refuses to start while the target has MCP conflicts and
+requires the fresh MCP plan to equal the reviewed one. Before each command it
+re-reads the user config: `remove` runs only while the entry still matches its
+recorded digest, and `add-json` only while the name is absent. Ownership is
+written after each successful command, and after `add-json` the stored entry
+must equal the requested spec. A failed command stops the run with the
+completed steps recorded, so the next plan reconciles from the real state.
 
 The desired installation set is the selected canonical Plugins plus the
 generated Hook Plugin when Hooks are selected. Registration:
@@ -568,8 +677,8 @@ name; an unrecorded or digest-mismatched heartbeat is a conflict.
 Target `name` is also the key below `state_dir/targets`. Before changing a
 target's name, product, or home—or deleting it—retain the old identity, set its
 `components = []`, then run `apply` and `register` to reconcile Skills,
-Instruction files, Settings, Schedule snapshots, registered Plugins/Hooks, and
-the host heartbeat.
+Instruction files, Settings, Codex MCP leaves, Schedule snapshots, registered
+Plugins/Hooks, Claude MCP registrations, and the host heartbeat.
 After the empty ownership records are cleared, the target can be changed or
 removed. Otherwise its state directory is orphaned; diagnostics fail and
 state-changing commands stop rather than guessing a
@@ -612,8 +721,9 @@ state_dir/
 └── targets/<target>/
     ├── skills.json                  # standalone Skill ownership
     ├── instructions.json            # file-granular Instruction ownership
-    ├── plugins.json                 # registration ownership
+    ├── plugins.json                 # Plugin registration ownership
     ├── settings.json                # owned paths/value digests
+    ├── mcp.json                     # MCP ownership: Codex leaves/containers, Claude name → digest
     └── scheduler.json               # heartbeat ownership
 ```
 

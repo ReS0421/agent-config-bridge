@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -19,6 +20,22 @@ from agent_config_bridge.instructions import (
     instruction_digest,
     instruction_files,
     instruction_source_id,
+)
+from agent_config_bridge.mcp import (
+    ClaudeMcpPlan,
+    McpError,
+    McpServer,
+    claude_user_config_path,
+    codex_owned_table_rules,
+    codex_unowned_server_keys,
+    discover_mcp_servers,
+    mcp_leaves_digest,
+    read_claude_mcp_servers,
+    reconcile_claude_mcp,
+    release_hint,
+    render_claude_spec,
+    render_codex_leaves,
+    server_review,
 )
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import path_comparison_key, paths_overlap, read_symlink_target
@@ -43,10 +60,13 @@ from agent_config_bridge.schedules import discover_schedules
 from agent_config_bridge.settings import (
     OwnedSettingLeaf,
     SettingDisposition,
+    SettingIssue,
     SettingsPatchPlan,
     build_settings_patch,
     discover_settings_fragments,
     plan_settings_patch,
+    read_settings_document,
+    safe_key,
     settings_patch_digest,
 )
 from agent_config_bridge.state import (
@@ -57,7 +77,9 @@ from agent_config_bridge.state import (
     desired_plugin_names,
     effective_link_mode,
     find_orphaned_target_states,
+    read_claude_mcp_ownership,
     read_instruction_state,
+    read_mcp_leaf_state,
     read_registration_state,
     read_settings_state,
     read_skill_state,
@@ -72,6 +94,11 @@ __all__ = [
     "Operation",
     "SyncPlan",
     "build_plan",
+    "codex_mcp_removed_approvals",
+    "codex_mcp_unowned_keys",
+    "desired_mcp_servers",
+    "plan_claude_mcp",
+    "plan_codex_mcp",
 ]
 
 
@@ -83,6 +110,7 @@ class Operation(StrEnum):
     RENDER = "render"
     PATCH = "patch"
     REMOVE = "remove"
+    REGISTER = "register"
 
 
 class Disposition(StrEnum):
@@ -114,7 +142,11 @@ class Action:
 
 @dataclass(frozen=True, slots=True)
 class CommandHint:
-    """A product command required to register or install rendered plugins."""
+    """A product command required to register plugins or Claude MCP servers.
+
+    ``component`` is ``plugins`` for Plugin/Hook marketplace registration and
+    ``mcp`` for Claude Code user-scope MCP server registration.
+    """
 
     target: str
     platform: Platform
@@ -122,6 +154,7 @@ class CommandHint:
     argv: tuple[str, ...]
     reason: str
     environment_unsets: tuple[str, ...] = ()
+    component: Component = Component.PLUGINS
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +205,7 @@ def build_plan(
     _validate_skill_root_reservations(enabled_targets, previous_skills_by_target)
     schedule_catalog = discover_schedules(config)
     settings_fragments = discover_settings_fragments(inventory.root)
+    mcp_catalog = discover_mcp_servers(inventory.root)
     marketplace_snapshot: MarketplaceSourceSnapshot | None = None
 
     for target_name in find_orphaned_target_states(config):
@@ -214,6 +248,7 @@ def build_plan(
             )
         )
 
+    mcp_commands: list[CommandHint] = []
     for target in enabled_targets:
         windows_path_semantics = host_platform is Platform.WINDOWS or target.platform is Platform.WINDOWS
         selected_skill_names: set[str] = set()
@@ -297,6 +332,32 @@ def build_plan(
                         f"{target.name}: settings fragment {fragment.path} manages "
                         f"{len(fragment.leaves)} explicit leaf values in {settings_destination}"
                     )
+
+        target_mcp_servers = desired_mcp_servers(target, resolved, mcp_catalog)
+        if target.product is Product.CODEX:
+            codex_mcp_plan = plan_codex_mcp(config, target, target_mcp_servers)
+            if codex_mcp_plan.changes:
+                actions.append(_codex_mcp_action(target, inventory, codex_mcp_plan))
+            warnings.extend(
+                f"{target.name}: owned Codex MCP server {name} also carries keys the Bridge does not manage: "
+                f"{', '.join(safe_key(key) for key in keys)}"
+                for name, keys in codex_mcp_unowned_keys(codex_mcp_plan).items()
+            )
+            warnings.extend(
+                f"{target.name}: removing mcp_servers.{name} also deletes its tools approvals ({count})"
+                for name, count in codex_mcp_removed_approvals(codex_mcp_plan).items()
+            )
+        elif target.platform is host_platform:
+            claude_mcp_plan = plan_claude_mcp(config, target, target_mcp_servers)
+            if claude_mcp_plan is not None:
+                actions.append(_claude_mcp_action(target, inventory, claude_mcp_plan))
+                mcp_commands.extend(_claude_mcp_hints(target, claude_mcp_plan))
+        elif target_mcp_servers or read_claude_mcp_ownership(config, target):
+            warnings.append(
+                f"{target.name}: Claude Code MCP registration is omitted on this {host_platform.value} host; "
+                f"run plan/register from the configured {target.platform.value} platform"
+            )
+        reviews.extend(server_review(server, target) for server in target_mcp_servers)
 
         published_schedules = schedule_publish_path(config, target)
         schedules_selected = Component.SCHEDULES in target.components and bool(schedule_catalog.schedules)
@@ -385,7 +446,7 @@ def build_plan(
                 f"run plan/register from the configured {target.platform.value} platform with native paths"
             )
 
-    commands = _registration_hints(config, inventory, resolved, host_platform)
+    commands = (*_registration_hints(config, inventory, resolved, host_platform), *mcp_commands)
     return SyncPlan(
         actions=tuple(actions),
         commands=commands,
@@ -419,10 +480,252 @@ def _owned_settings(state: SettingsState) -> tuple[OwnedSettingLeaf, ...]:
     )
 
 
+def desired_mcp_servers(
+    target: TargetConfig,
+    resolved: ResolvedInventory,
+    servers: Sequence[McpServer],
+) -> tuple[McpServer, ...]:
+    """Return the governance-gated MCP servers one target should receive."""
+
+    if Component.MCP not in target.components:
+        return ()
+    by_name = {server.name: server for server in servers}
+    selected: list[McpServer] = []
+    for artifact in resolved.mcp_for_target(target):
+        server = by_name.get(artifact.name)
+        if server is None:
+            raise McpError(f"MCP catalog changed during planning: {artifact.name!r} is no longer declared")
+        selected.append(server)
+    return tuple(selected)
+
+
+def plan_codex_mcp(
+    config: BridgeConfig,
+    target: TargetConfig,
+    servers: Sequence[McpServer],
+) -> SettingsPatchPlan:
+    """Plan owned Codex ``mcp_servers`` leaves against the target ``config.toml``.
+
+    MCP leaves use their own ownership record, separate from Settings bundles,
+    with the same comment-preserving, digest-owned engine.
+    """
+
+    if target.product is not Product.CODEX:
+        raise McpError(f"target {target.name!r} is not a Codex target")
+    desired = tuple(leaf for server in servers for leaf in render_codex_leaves(server, target))
+    previous = _owned_settings(read_mcp_leaf_state(config, target))
+    return plan_settings_patch(
+        target.product,
+        _settings_destination(target),
+        desired,
+        previous,
+        owned_tables=codex_owned_table_rules(leaf.path for leaf in previous),
+        # A desired server may create its table but never merge into an
+        # existing unowned one; that table must go through `mcp adopt`.
+        claimed_tables=tuple(("mcp_servers", server.name) for server in servers),
+    )
+
+
+def codex_mcp_unowned_keys(plan: SettingsPatchPlan) -> dict[str, tuple[str, ...]]:
+    """Return unexpected unowned keys in owned Codex server tables, by server name.
+
+    These keys are not conflicts; the Bridge reports them so the owner can
+    review settings the catalog does not declare.
+    """
+
+    if not plan.previous:
+        return {}
+    document = read_settings_document(plan.product, plan.destination)
+    return codex_unowned_server_keys(document, (leaf.path for leaf in plan.previous))
+
+
+def codex_mcp_removed_approvals(plan: SettingsPatchPlan) -> dict[str, int]:
+    """Count the ``tools`` approvals deleted with each removed Codex server table.
+
+    Only server names and counts are returned, never approval values.
+    """
+
+    if not plan.removed_tables:
+        return {}
+    document = read_settings_document(plan.product, plan.destination)
+    servers = document.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for path in plan.removed_tables:
+        table = servers.get(path[-1]) if len(path) == 2 and path[0] == "mcp_servers" else None
+        tools = table.get("tools") if isinstance(table, dict) else None
+        if isinstance(tools, dict) and tools:
+            counts[path[-1]] = len(tools)
+    return counts
+
+
+def plan_claude_mcp(
+    config: BridgeConfig,
+    target: TargetConfig,
+    servers: Sequence[McpServer],
+) -> ClaudeMcpPlan | None:
+    """Plan Claude Code user-scope MCP registrations without writing anything.
+
+    The Claude user config is read only when servers are desired or owned; an
+    unreadable or invalid file becomes a whole-target conflict. Returns
+    ``None`` when the target has neither desired nor owned MCP servers.
+    """
+
+    if target.product is not Product.CLAUDE_CODE:
+        raise McpError(f"target {target.name!r} is not a Claude Code target")
+    owned = dict(read_claude_mcp_ownership(config, target))
+    if not servers and not owned:
+        return None
+    desired = {server.name: render_claude_spec(server, target) for server in servers}
+    config_path = claude_user_config_path(target)
+    try:
+        live = read_claude_mcp_servers(target)
+    except McpError as exc:
+        return reconcile_claude_mcp(config_path, desired, owned, None, target=target.name, error=str(exc))
+    return reconcile_claude_mcp(config_path, desired, owned, live, target=target.name)
+
+
+def _claude_mcp_action(
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    plan: ClaudeMcpPlan,
+) -> Action:
+    """Summarize Claude MCP registration; ``register`` executes its commands.
+
+    The action is ``conflict`` or ``noop``: pending product-CLI changes appear
+    as command hints, like Plugin registrations, so they never make ``apply``
+    or ``sync-skills`` report filesystem changes.
+    """
+
+    if plan.error is not None:
+        detail = f"cannot read the Claude user config: {plan.error}"
+    else:
+        counts = {
+            disposition: sum(change.disposition is disposition for change in plan.changes)
+            for disposition in SettingDisposition
+        }
+        details = ", ".join(f"{kind.value}={counts[kind]}" for kind in SettingDisposition if counts[kind])
+        conflicts = "; ".join(
+            f"{change.name}: {change.detail}"
+            for change in plan.changes
+            if change.disposition is SettingDisposition.CONFLICT
+        )
+        detail = f"register user-scope MCP servers through the product CLI ({details or 'no servers'})"
+        if conflicts:
+            detail = f"{detail}; {conflicts}"
+        elif plan.has_commands or plan.needs_state_write:
+            detail = f"{detail}; run register"
+    return Action(
+        operation=Operation.REGISTER,
+        disposition=Disposition.CONFLICT if plan.has_conflicts else Disposition.NOOP,
+        component=Component.MCP,
+        target=target.name,
+        name="mcp-servers",
+        source=inventory.root / "mcp",
+        destination=plan.config_path,
+        detail=detail,
+        source_id=f"mcp/{target.name}",
+        source_digest=plan.desired_digest,
+    )
+
+
+def _claude_mcp_hints(target: TargetConfig, plan: ClaudeMcpPlan) -> list[CommandHint]:
+    executable = str(target.executable) if target.executable is not None else "claude"
+    environment = product_home_environment(target)
+    environment_unsets = product_home_environment_unsets(target)
+    hints: list[CommandHint] = []
+
+    def hint(argv: tuple[str, ...], reason: str) -> CommandHint:
+        return CommandHint(
+            target=target.name,
+            platform=target.platform,
+            environment=environment,
+            argv=(executable, *argv),
+            reason=reason,
+            environment_unsets=environment_unsets,
+            component=Component.MCP,
+        )
+
+    for change in plan.changes:
+        if change.disposition in {SettingDisposition.UPDATE, SettingDisposition.REMOVE}:
+            reason = (
+                f"remove owned Claude Code MCP server {change.name} before re-registering it"
+                if change.disposition is SettingDisposition.UPDATE
+                else f"remove deselected bridge-owned Claude Code MCP server {change.name}"
+            )
+            hints.append(hint(("mcp", "remove", "--scope", "user", change.name), reason))
+        if change.disposition in {SettingDisposition.CREATE, SettingDisposition.UPDATE}:
+            if change.spec_json is None:
+                raise McpError(f"Claude MCP change has no rendered spec: {change.name}")
+            hints.append(
+                hint(
+                    ("mcp", "add-json", "--scope", "user", change.name, change.spec_json),
+                    f"register Claude Code user-scope MCP server {change.name}",
+                )
+            )
+    return hints
+
+
 def _settings_action(
     target: TargetConfig,
     inventory: CatalogInventory,
     plan: SettingsPatchPlan,
+) -> Action:
+    return _leaf_patch_action(
+        target,
+        plan,
+        component=Component.SETTINGS,
+        name="product-settings",
+        source=inventory.root / "settings",
+        detail="merge owned setting leaves",
+        source_id=f"settings/{target.name}",
+        source_digest=settings_patch_digest(plan.desired),
+    )
+
+
+def _codex_mcp_action(
+    target: TargetConfig,
+    inventory: CatalogInventory,
+    plan: SettingsPatchPlan,
+) -> Action:
+    issues: dict[str, set[str]] = {}
+    for change in plan.changes:
+        if change.disposition is SettingDisposition.CONFLICT and len(change.path) >= 2:
+            issues.setdefault(change.path[1], set()).add((change.issue or SettingIssue.DRIFT).value)
+    note = "; ".join(
+        f"{name}: {', '.join(sorted(kinds))}"
+        + (
+            f"; {release_hint(target.name, name)}"
+            if kinds & {SettingIssue.DRIFT.value, SettingIssue.MISSING.value}
+            else ""
+        )
+        for name, kinds in sorted(issues.items())
+    )
+    return _leaf_patch_action(
+        target,
+        plan,
+        component=Component.MCP,
+        name="mcp-servers",
+        source=inventory.root / "mcp",
+        detail="merge owned MCP server leaves",
+        source_id=f"mcp/{target.name}",
+        source_digest=mcp_leaves_digest(plan.desired),
+        note=note,
+    )
+
+
+def _leaf_patch_action(
+    target: TargetConfig,
+    plan: SettingsPatchPlan,
+    *,
+    component: Component,
+    name: str,
+    source: Path,
+    detail: str,
+    source_id: str,
+    source_digest: str,
+    note: str = "",
 ) -> Action:
     counts = {
         disposition: sum(change.disposition is disposition for change in plan.changes)
@@ -443,14 +746,14 @@ def _settings_action(
     return Action(
         operation=Operation.PATCH,
         disposition=disposition,
-        component=Component.SETTINGS,
+        component=component,
         target=target.name,
-        name="product-settings",
-        source=inventory.root / "settings",
+        name=name,
+        source=source,
         destination=plan.destination,
-        detail=f"merge owned setting leaves ({details})",
-        source_id=f"settings/{target.name}",
-        source_digest=settings_patch_digest(plan.desired),
+        detail=f"{detail} ({details}){f'; {note}' if note else ''}",
+        source_id=source_id,
+        source_digest=source_digest,
     )
 
 

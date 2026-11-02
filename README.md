@@ -1,7 +1,7 @@
 # Agent Config Bridge
 
-One canonical catalog for Skills, Plugins, Hooks, Settings, Schedules, and
-Instructions across:
+One canonical catalog for Skills, Plugins, Hooks, Settings, Schedules,
+Instructions, and MCP servers across:
 
 - Codex CLI and Codex Desktop
 - Claude Code CLI and Claude Code Desktop
@@ -14,8 +14,10 @@ owned leaf, Schedules are executed through host schedulers and product CLIs,
 and Instructions are per-product policy files linked or copied file-by-file
 into the product configuration home. A reviewed Codex Markdown instruction can
 also be projected deterministically into a developer-instructions-only profile
-without replacing Codex's base system instructions. All six component classes
-still come from one version-controlled catalog.
+without replacing Codex's base system instructions. User-scope MCP servers are
+declared once and delivered as owned Codex `config.toml` leaves or as explicit
+`claude mcp` registrations. All seven component classes still come from one
+version-controlled catalog.
 
 > **Status: alpha.** The safety model and core workflow are implemented, but product schemas continue to evolve. Always review `agentbridge plan` before applying or registering anything.
 
@@ -78,6 +80,14 @@ It never shares auth tokens, session databases, caches, logs, trust stores, or a
 - Shared hook bundles packaged as a synthetic plugin instead of overwriting user settings
 - Product-specific Codex `config.toml` and Claude Code `settings.json`
   fragments merged by explicit owned leaf, preserving unrelated local values
+- An `mcp` component ([ADR-0009](docs/adr/0009-register-mcp-servers-by-owned-entry.md))
+  with one product-neutral `catalog/mcp/<name>/server.toml` per user-scope
+  server: Codex receives owned `mcp_servers.<name>` leaves during `apply`,
+  Claude Code receives `claude mcp add-json/remove --scope user` commands during
+  `register`, `mcp adopt` hands over existing entries that exactly equal
+  their declaration, and `mcp release` hands ownership back; the schema has no
+  field for secret values, and common token shapes in free-text fields are
+  rejected
 - Portable five-field cron definitions with IANA time zones, per-target
   immutable snapshots, overlap protection, and manual-run support
 - One target-scoped, once-per-minute heartbeat in the Linux user crontab or
@@ -160,9 +170,10 @@ marketplace, and render per-target Schedule snapshots:
 agentbridge apply --yes
 ```
 
-`apply` records the standalone Skills, Instruction files, and Settings leaves
-it manages and prints the product and host commands needed to activate rendered
-Plugins, Hooks, and Schedules.
+`apply` records the standalone Skills, Instruction files, Settings leaves, and
+Codex MCP server leaves it manages and prints the product and host commands
+needed to activate rendered Plugins, Hooks, Schedules, and Claude Code MCP
+servers.
 
 For automation that must update only standalone Skills, use the fail-closed
 skill-only command:
@@ -172,9 +183,9 @@ agentbridge sync-skills -c agentbridge.toml --yes
 ```
 
 `sync-skills` still builds and rechecks the complete plan. It refuses to write
-when any component conflicts or when Plugins, Hooks, Settings, Schedules, or
-Instructions have a pending create, update, or removal. It never renders those
-components and never runs registration commands. A converged run does not ask
+when any component conflicts or when Plugins, Hooks, Settings, Schedules,
+Instructions, or Codex MCP servers have a pending create, update, or removal.
+It never renders those components and never runs registration commands. A converged run does not ask
 for confirmation. When `link_mode` changes from `symlink` to `copy`, a
 still-matching Bridge-owned Skill link is atomically replaced by a marked copy
 and the prior link is retained in the backup tree; changed or unowned links
@@ -248,6 +259,36 @@ agentbridge register --target local-claude-code --yes
 
 Omit `--target` to reconcile every enabled target for the current operating
 system; targets for another OS are left for registration on that OS. For a
+Claude Code target with `mcp` selected, `register` runs the reviewed
+`claude mcp add-json/remove --scope user` commands, re-reading the user config
+before each one, and records ownership after each successful command.
+
+Existing MCP entries that were configured by hand are unowned conflicts. Hand
+them over without recreating them:
+
+```bash
+agentbridge mcp adopt -c agentbridge.toml --json   # read-only preview
+agentbridge mcp adopt -c agentbridge.toml --yes
+```
+
+Adoption records ownership only for unowned entries whose values exactly equal
+the rendered declaration and never changes product configuration; mismatches
+are listed, exit with status 1, and stay conflicts until fixed by hand. On Codex
+the only key allowed besides the declared leaves is the `tools` approval table.
+
+To hand an owned server back, or to unblock an owned entry that is missing or
+was changed by hand, forget its ownership without touching product
+configuration:
+
+```bash
+agentbridge mcp release -c agentbridge.toml --name github --json   # preview
+agentbridge mcp release -c agentbridge.toml --name github --yes
+```
+
+`doctor` reports pending Claude MCP registration as the warning
+`mcp.pending-registration` and extra unowned keys in an owned Codex server table
+as `mcp.unowned-keys`; ownership is recorded in
+`state_dir/targets/<target>/mcp.json`. For a
 target with `schedules` selected, `register` installs or updates one heartbeat
 in that host's current-user scheduler. Run one published Schedule immediately
 without changing its cadence with:
@@ -278,7 +319,7 @@ schema_version = 1
 catalog = "./catalog"
 state_dir = "./.agentbridge"
 link_mode = "auto" # auto | symlink | copy
-components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions", "mcp"]
 
 [bridge.retention]
 marketplace_builds = 20
@@ -367,6 +408,10 @@ catalog/
 │   └── daily-review/
 │       ├── schedule.toml        # cron, timezone, worktree, timeout
 │       └── PROMPT.md            # prompt passed on standard input
+├── mcp/
+│   └── browser/
+│       ├── server.toml          # transport, command/url, pin, access
+│       └── README.md            # optional
 └── instructions/
     └── global-policy/
         ├── projections.toml       # generated Codex profile declarations
@@ -488,6 +533,48 @@ Unrelated local settings remain in place, and Codex TOML comments are
 preserved. The bridge never manages credentials, `~/.claude.json`, managed
 policy, or whole product homes.
 
+An MCP server bundle contains `server.toml` and an optional `README.md`. The
+manifest is product-neutral and strict; unknown keys are errors, so the schema
+has no field for environment values, headers, tokens, or product tuning keys:
+
+```toml
+schema_version = 1
+transport = "stdio"                 # stdio | http
+command = "npx"                     # stdio only
+args = ["-y", "@playwright/mcp@0.0.78", "--headless", "--isolated"]
+env_vars = []                       # stdio only; forwarded variable names
+# url = "http://127.0.0.1:7337/mcp" # http only; no userinfo, query, fragment
+# bearer_token_env_var = "TOKEN"    # http only; a variable name; https or loopback
+
+[package]                           # supply-chain pin
+ecosystem = "npm"                   # npm | pypi | binary | local | none
+name = "@playwright/mcp"
+version = "0.0.78"
+
+[access]                            # reviewed scope, shown in plan reviews
+mode = "read-write"                 # read-only | read-write
+paths = []                          # may use {user_home}
+```
+
+An `npm` pin must appear in `args` as `<name>@<version>` and a `pypi` pin as
+`<name>==<version>`; `none` is only for `http`. `{user_home}` is the only
+placeholder and expands to the target's native home path. Each server needs a
+governance manifest with `capability_kind = "tool"` and
+`delivery = "mcp-registration"`. Codex receives `command`, `args`, and
+`env_vars` (or `url` and `bearer_token_env_var`) as owned leaves; children such
+as `mcp_servers.<name>.tools.*` approvals stay user-owned while the server is
+declared and are removed together with the server table when it is deselected.
+Claude Code receives
+`{"type":"stdio","command":…,"args":…,"env":{"NAME":"${NAME}"}}` or
+`{"type":"http","url":…}` with an `Authorization: Bearer ${NAME}` header. A
+Settings fragment may not declare `mcp_servers`.
+
+`command`, `args`, and `url` are free text that appears in plan reviews and
+rendered commands. Parsing rejects common token shapes (for example `ghp_…`,
+`sk-…`, `AKIA…`, JWTs), credential-named flags with a value such as
+`--api-key=…` or `--token …`, and `NAME=value` in `command`, but this is a
+heuristic: review every manifest before approving it.
+
 A Schedule directory contains exactly `schedule.toml` and `PROMPT.md`. The
 definition uses a strict five-field numeric cron expression, an IANA timezone,
 a portable working directory relative to the target `user_home`, and an
@@ -525,7 +612,12 @@ for the schema and lifecycle.
   published snapshot is integrity-checked before reuse or replacement.
 - Settings update/remove only while each current value matches its target-scoped
   ownership digest; unrelated values are never backed up or copied into state.
-- Plugin/Hook and host scheduler registration require separate confirmation.
+- Plugin/Hook, Claude Code MCP, and host scheduler registration require
+  separate confirmation.
+- The Bridge never writes `~/.claude.json`. It reads the Claude user config only
+  to check MCP entries; `register` refuses to remove an entry that changed after
+  review or to add one that appeared after review, `mcp adopt` records
+  ownership only for exact matches, and `mcp release` only forgets ownership.
 - `register` removes only Plugins/Hooks recorded by an earlier bridge
   registration. Before any product registration commands it verifies that the product's
   bridge-named marketplace is absent, still at the recorded source, or already
@@ -541,8 +633,8 @@ for the schema and lifecycle.
 Target `name` is the ownership-state identity. Before renaming or deleting a
 target—or changing its product/home identity—keep the old identity, set
 `components = []`, run both `apply` and `register` to reconcile its managed
-Skills/Plugins/Hooks/Settings/Schedules/Instructions, and only then change or remove the
-target. Otherwise the old `state_dir/targets/<name>` record becomes orphaned and
+Skills/Plugins/Hooks/Settings/Schedules/Instructions/MCP servers, and only then
+change or remove the target. Otherwise the old `state_dir/targets/<name>` record becomes orphaned and
 diagnostics report
 that it cannot be reconciled automatically. `apply` and `register` then stop until
 the old target identity is restored and reconciled; the bridge never adopts or

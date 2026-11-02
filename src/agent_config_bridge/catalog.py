@@ -16,8 +16,10 @@ from agent_config_bridge.instruction_profiles import (
     InstructionProfileError,
     check_instruction_profile_bundle,
 )
+from agent_config_bridge.mcp import McpError, validate_mcp_bundle
 from agent_config_bridge.models import BridgeConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point
+from agent_config_bridge.settings import CODEX_MCP_SERVERS_IN_SETTINGS
 
 __all__ = [
     "Artifact",
@@ -83,6 +85,7 @@ class CatalogInventory:
     schedules: tuple[Artifact, ...]
     hook_version: str | None
     instructions: tuple[Artifact, ...] = ()
+    mcp: tuple[Artifact, ...] = ()
 
 
 def discover_catalog(config: BridgeConfig) -> CatalogInventory:
@@ -109,6 +112,7 @@ def discover_catalog(config: BridgeConfig) -> CatalogInventory:
     schedules = _discover_group(root / "schedules", root, _validate_schedule)
     instructions = _discover_group(root / "instructions", root, _validate_instructions)
     _validate_instruction_collisions(instructions)
+    mcp = _discover_group(root / "mcp", root, _validate_mcp)
     hook_version = _read_hook_version(root / "hooks", root, required=bool(hooks))
     return CatalogInventory(
         root=root,
@@ -119,6 +123,7 @@ def discover_catalog(config: BridgeConfig) -> CatalogInventory:
         schedules=schedules,
         hook_version=hook_version,
         instructions=instructions,
+        mcp=mcp,
     )
 
 
@@ -367,11 +372,22 @@ def _validate_settings(path: Path) -> None:
             raise CatalogError(f"invalid Codex settings fragment: {codex_fragment}: {exc}") from exc
         if not payload:
             raise CatalogError(f"Codex settings fragment must contain at least one setting: {codex_fragment}")
+        if "mcp_servers" in payload:
+            raise CatalogError(f"{CODEX_MCP_SERVERS_IN_SETTINGS}: {codex_fragment}")
 
     if claude_fragment.is_file():
         payload = _load_json(claude_fragment)
         if not isinstance(payload, dict) or not payload:
             raise CatalogError(f"Claude Code settings fragment must contain a non-empty object: {claude_fragment}")
+
+
+def _validate_mcp(path: Path) -> None:
+    """Validate an MCP bundle layout; the manifest schema is checked by ``mcp.discover_mcp_servers``."""
+
+    try:
+        validate_mcp_bundle(path)
+    except McpError as exc:
+        raise CatalogError(str(exc)) from exc
 
 
 def _validate_schedule(path: Path) -> None:

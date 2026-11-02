@@ -17,18 +17,30 @@ from agent_config_bridge.governance import (
     GovernanceError,
     GovernanceMode,
     GovernanceSeverity,
+    resolve_inventory,
     run_governance,
 )
 from agent_config_bridge.marketplace_registry import MarketplaceRegistryError, probe_marketplace_source
+from agent_config_bridge.mcp import McpError, McpServer, discover_mcp_servers
 from agent_config_bridge.models import BridgeConfig, Component, Platform, Product, Surface, TargetConfig
 from agent_config_bridge.path_safety import is_directory_reparse_point, path_comparison_key
-from agent_config_bridge.planner import CommandHint, Disposition, SyncPlan
+from agent_config_bridge.planner import (
+    CommandHint,
+    Disposition,
+    SyncPlan,
+    codex_mcp_unowned_keys,
+    desired_mcp_servers,
+    plan_claude_mcp,
+    plan_codex_mcp,
+)
 from agent_config_bridge.platforms import current_platform, scope_product_home_environment
 from agent_config_bridge.provenance import ROOT_MARKER_FILENAME, read_skill_root_marker
 from agent_config_bridge.scheduler_registration import SchedulerRegistrationError, validate_vendor_executable
+from agent_config_bridge.settings import SettingDisposition, SettingIssue, SettingsError, safe_key
 from agent_config_bridge.state import (
     BridgeStateError,
     find_orphaned_target_states,
+    read_mcp_state,
     read_registration_state,
     registration_marketplace_source,
     skill_root_for_target,
@@ -66,7 +78,8 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
             (
                 f"catalog contains {len(inventory.skills)} skills, {len(inventory.plugins)} plugins, "
                 f"{len(inventory.hooks)} hook bundles, {len(inventory.settings)} settings bundles, "
-                f"{len(inventory.schedules)} schedules, and {len(inventory.instructions)} instruction bundles"
+                f"{len(inventory.schedules)} schedules, {len(inventory.instructions)} instruction bundles, "
+                f"and {len(inventory.mcp)} MCP servers"
             ),
         )
     ]
@@ -126,7 +139,13 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                 checks.append(provenance)
 
         same_platform = target.platform is host_platform
-        target_commands = tuple(command for command in plan.commands if command.target == target.name)
+        # Only marketplace and Plugin/Hook commands need the marketplace
+        # preflight; Claude MCP registration hints have their own checks.
+        target_commands = tuple(
+            command
+            for command in plan.commands
+            if command.target == target.name and command.component is Component.PLUGINS
+        )
         marketplace_relevant = _marketplace_preflight_relevant(target, inventory, target_commands)
         if not same_platform:
             checks.append(
@@ -226,7 +245,167 @@ def run_doctor(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                 )
             )
 
+    checks.extend(_mcp_checks(config, inventory))
     return tuple(checks)
+
+
+_MCP_ISSUE_CHECKS = {
+    SettingIssue.DRIFT: (
+        "mcp.drift",
+        "owned MCP entries changed outside the Bridge: {names}; restore the declared values, or run "
+        "`agentbridge mcp release --target {target} --name <server>` to forget ownership",
+    ),
+    SettingIssue.MISSING: (
+        "mcp.missing",
+        "owned MCP entries are missing from {destination}: {names}; run "
+        "`agentbridge mcp release --target {target} --name <server>` so the next plan re-creates them",
+    ),
+    SettingIssue.UNOWNED: (
+        "mcp.unowned-conflict",
+        "unowned MCP entries already use catalog server names: {names}; run `agentbridge mcp adopt` for exact "
+        "matches or remove them",
+    ),
+    SettingIssue.LEFTOVER: (
+        "mcp.removal-blocked",
+        "removing owned MCP servers would leave server tables without a transport: {names}; remove the listed "
+        "keys or restore the server declaration",
+    ),
+}
+
+
+def _mcp_checks(config: BridgeConfig, inventory: CatalogInventory) -> list[DoctorCheck]:
+    """Report MCP manifest validity and owned-entry health without writing anything.
+
+    Messages name catalog-declared or Bridge-owned servers, files, and key
+    names only; they never include entry values or product configuration
+    content.
+    """
+
+    enabled = tuple(target for target in config.targets if target.enabled)
+    if not inventory.mcp and not any(Component.MCP in target.components for target in enabled):
+        try:
+            if all(read_mcp_state(config, target).is_empty for target in enabled):
+                return []
+        except BridgeStateError:
+            pass
+    try:
+        servers = discover_mcp_servers(inventory.root)
+    except McpError as exc:
+        return [DoctorCheck(CheckLevel.ERROR, "mcp.manifests", f"invalid MCP server manifest: {exc}")]
+    checks = [DoctorCheck(CheckLevel.OK, "mcp.manifests", f"catalog declares {len(servers)} valid MCP servers")]
+    try:
+        resolved = resolve_inventory(inventory)
+    except GovernanceError:
+        # The governance.mode check already reports the blocking findings.
+        return checks
+    host_platform = current_platform()
+    for target in enabled:
+        try:
+            desired = desired_mcp_servers(target, resolved, servers)
+            checks.extend(_target_mcp_checks(config, target, desired, host_platform))
+        except (BridgeStateError, McpError, SettingsError) as exc:
+            checks.append(
+                DoctorCheck(CheckLevel.ERROR, "mcp.state", f"cannot evaluate MCP entries: {exc}", target.name)
+            )
+    return checks
+
+
+def _target_mcp_checks(
+    config: BridgeConfig,
+    target: TargetConfig,
+    servers: tuple[McpServer, ...],
+    host_platform: Platform,
+) -> list[DoctorCheck]:
+    issues: dict[SettingIssue, set[str]] = {}
+    checks: list[DoctorCheck] = []
+    state = read_mcp_state(config, target)
+    if target.product is Product.CODEX:
+        if not servers and not state.leaves.entries:
+            return []
+        codex_plan = plan_codex_mcp(config, target, servers)
+        destination = codex_plan.destination
+        for change in codex_plan.changes:
+            if change.disposition is SettingDisposition.CONFLICT:
+                name = change.path[1]
+                if change.issue is SettingIssue.LEFTOVER:
+                    name = f"{name} ({', '.join(safe_key(key) for key in change.keys)})"
+                issues.setdefault(change.issue or SettingIssue.DRIFT, set()).add(name)
+        extra_keys = codex_mcp_unowned_keys(codex_plan)
+        if extra_keys:
+            listed = "; ".join(
+                f"{name} ({', '.join(safe_key(key) for key in keys)})" for name, keys in sorted(extra_keys.items())
+            )
+            checks.append(
+                DoctorCheck(
+                    CheckLevel.WARNING,
+                    "mcp.unowned-keys",
+                    f"owned Codex MCP server tables carry keys the Bridge does not manage: {listed}",
+                    target.name,
+                )
+            )
+    elif target.platform is not host_platform:
+        if not servers and not state.claude_servers:
+            return []
+        return [
+            DoctorCheck(
+                CheckLevel.INFO,
+                "mcp.platform-skipped",
+                f"Claude Code MCP entries are checked from the configured {target.platform.value} platform",
+                target.name,
+            )
+        ]
+    else:
+        claude_plan = plan_claude_mcp(config, target, servers)
+        if claude_plan is None:
+            return []
+        destination = claude_plan.config_path
+        if claude_plan.error is not None:
+            return [
+                DoctorCheck(
+                    CheckLevel.ERROR,
+                    "mcp.claude-config",
+                    f"cannot read the Claude user config: {claude_plan.error}",
+                    target.name,
+                )
+            ]
+        pending: set[str] = set()
+        for claude_change in claude_plan.changes:
+            if claude_change.issue is not None:
+                issues.setdefault(claude_change.issue, set()).add(claude_change.name)
+            elif claude_change.disposition in {
+                SettingDisposition.CREATE,
+                SettingDisposition.UPDATE,
+                SettingDisposition.REMOVE,
+            }:
+                pending.add(claude_change.name)
+        if pending:
+            checks.append(
+                DoctorCheck(
+                    CheckLevel.WARNING,
+                    "mcp.pending-registration",
+                    (
+                        f"Claude Code MCP registration is pending for: {', '.join(sorted(pending))}; "
+                        f"run `agentbridge register --target {target.name}`"
+                    ),
+                    target.name,
+                )
+            )
+    for issue, (code, template) in _MCP_ISSUE_CHECKS.items():
+        names = issues.get(issue)
+        if names:
+            message = template.format(names=", ".join(sorted(names)), destination=destination, target=target.name)
+            checks.append(DoctorCheck(CheckLevel.ERROR, code, message, target.name))
+    if not issues:
+        checks.insert(
+            0,
+            DoctorCheck(
+                CheckLevel.OK,
+                "mcp.entries",
+                f"MCP entries in {destination} have no ownership conflicts",
+                target.name,
+            ),
+        )
+    return checks
 
 
 def _executable_check(target: TargetConfig) -> DoctorCheck:

@@ -1,5 +1,5 @@
 # Agent Config Bridge Onboarding
-**Development documentation** · Agent Config Bridge · updated 2026-07-23 · Windows, Linux, WSL
+**Development documentation** · Agent Config Bridge · updated 2026-11-02 · Windows, Linux, WSL
 
 ---
 
@@ -16,7 +16,7 @@ unresolved.
 
 **[SPEC]**
 - Share only selected Skills, Plugins, Hooks, public Settings, host-managed
-  Schedules, and allowlisted Instructions.
+  Schedules, allowlisted Instructions, and user-scope MCP server declarations.
 - Keep authentication, sessions, caches, logs, databases, trust decisions, and whole product homes local.
 - Keep one canonical catalog accessible to every host, but use one host-local `state_dir` per Windows, Linux, or WSL runtime.
 - Run `register` on the target operating system. Do not register a Windows target from WSL or a WSL target from PowerShell.
@@ -118,7 +118,7 @@ schema_version = 1
 catalog = "/mnt/c/Users/USER/AgentConfig/catalog"
 state_dir = "/home/USER/.local/state/agent-config-bridge/wsl"
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions", "mcp"]
 
 [[targets]]
 name = "wsl-codex-launcher"
@@ -127,7 +127,7 @@ platform = "linux"
 user_home = "/home/USER"
 config_home = "/absolute/launcher/injected/CODEX_HOME"
 executable = "/absolute/path/to/codex"
-components = ["skills", "plugins", "hooks", "settings", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "instructions", "mcp"]
 surfaces = ["cli", "desktop"]
 enabled = true
 
@@ -138,7 +138,7 @@ platform = "linux"
 user_home = "/home/USER"
 config_home = "/home/USER/.codex"
 executable = "/absolute/path/to/codex"
-components = ["plugins", "hooks", "settings", "schedules", "instructions"]
+components = ["plugins", "hooks", "settings", "schedules", "instructions", "mcp"]
 surfaces = ["cli"]
 enabled = true
 
@@ -149,7 +149,7 @@ platform = "linux"
 user_home = "/home/USER"
 config_home = "/home/USER/.claude"
 executable = "/absolute/path/to/claude"
-components = ["skills", "plugins", "hooks", "settings", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "instructions", "mcp"]
 surfaces = ["cli"]
 enabled = true
 ```
@@ -165,7 +165,7 @@ schema_version = 1
 catalog = 'C:\Users\USER\AgentConfig\catalog'
 state_dir = 'C:\Users\USER\AppData\Local\AgentConfigBridge\state'
 link_mode = "auto"
-components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "schedules", "instructions", "mcp"]
 
 [[targets]]
 name = "windows-codex"
@@ -184,7 +184,7 @@ platform = "windows"
 user_home = 'C:\Users\USER'
 config_home = 'C:\Users\USER\.claude'
 executable = 'C:\absolute\path\to\claude.exe'
-components = ["skills", "plugins", "hooks", "settings", "instructions"]
+components = ["skills", "plugins", "hooks", "settings", "instructions", "mcp"]
 surfaces = ["cli", "desktop"]
 enabled = true
 ```
@@ -193,7 +193,10 @@ Target-level `components` replaces the bridge-level list. Use it to prevent
 duplicate Schedule execution and to assign one writer for a shared Skill root.
 The WSL Claude target above covers the WSL CLI only. Register Plugins for Claude
 Code Desktop from the native Windows target and product home; a WSL registration
-does not configure the Windows Desktop process.
+does not configure the Windows Desktop process. MCP servers are written into
+each Codex target's own `<config_home>/config.toml` and each Claude target's own
+user config, so select `mcp` on every target that should receive the catalog
+servers.
 
 **[BUG] Default Claude profile redirected**
 - Symptom: Claude creates or reads `<user_home>/.claude/.claude.json` instead of the normal `<user_home>/.claude.json`.
@@ -262,6 +265,44 @@ forensic directory, then restore the held pre-transition roots. Never delete
 partial output or ownership state before preserving it. `register` is not
 needed for a Skill-only catalog.
 
+**[SPEC] Hand over existing MCP servers**
+
+MCP servers configured by hand or by a launcher script are unowned conflicts in
+the first plan. Hand them over without recreating them, independently on each
+host:
+
+1. Declare every server in `catalog/mcp/<name>/server.toml` with its governance
+   manifest, matching the live command, arguments or URL, and
+   environment-variable names exactly. Run `validate`.
+2. Run `agentbridge mcp adopt -c /path/to/host.toml --json`. This is a
+   read-only preview. Every entry should be `adoptable`; fix each `mismatch` in
+   the catalog or the live entry until it is. A Codex table may hold only the
+   declared keys and a `tools` approval table; an empty `args` or `env_vars`
+   array counts as absent.
+3. Run `agentbridge mcp adopt -c /path/to/host.toml --yes`. It records
+   ownership only and does not change Codex `config.toml` or the Claude user
+   config.
+4. Run `doctor` and `plan`. Require no `mcp.*` errors and no MCP conflicts,
+   then continue with section 6. Retire the old script or hand-edit procedure.
+
+**[BUG] MCP entry reported as unowned or drifted**
+- Symptom: `plan` or `doctor` reports `mcp.unowned-conflict`, `mcp.drift`, or `mcp.missing`.
+- Cause: an entry with a catalog server name was created or edited outside the Bridge, or an owned entry was removed.
+- Fix: for an unowned entry, make it equal the declaration and run `mcp adopt`, or remove it so `apply`/`register` can create it. For drift, restore the declared value. For a missing or drifted owned entry you want to keep as it is, run `agentbridge mcp release -c /path/to/host.toml --name <name> --yes`; it forgets ownership only, after which the entry can be adopted or recreated. Never edit `~/.claude.json` to force a match while Claude Code is running; use `claude mcp remove --scope user <name>` and let `register` recreate it.
+
+**[BUG] Codex MCP server removal blocked**
+- Symptom: `plan` or `doctor` reports `mcp.removal-blocked` after deselecting a server.
+- Cause: the owned server table holds unowned keys other than `tools` approvals. The Bridge removes a deselected server's whole table (Codex cannot load a table without a transport), but never deletes keys it cannot account for.
+- Fix: remove the listed keys by hand, or run `mcp release --name <name>` and remove the table yourself. `doctor` warns earlier with `mcp.unowned-keys` while the server is still declared.
+
+**[SPEC] Pending Claude MCP registration**
+`doctor` reports `mcp.pending-registration` (a warning) until `register` has run the reviewed `claude mcp` commands for a Claude Code target. It never blocks `apply` or `sync-skills`; MCP conflicts do.
+
+**[BUG] Claude user config unreadable**
+- Symptom: `doctor` reports `mcp.claude-config`.
+- Cause: the Claude user config is not a regular file or not valid JSON; the message gives only the line and column.
+- Fix: repair or restore the file with Claude Code closed, then rerun `doctor`. The Bridge never rewrites it.
+
 ## 6. Validate, Apply, and Register
 
 **[SPEC]**
@@ -281,15 +322,19 @@ Proceed only when:
 - no plan action is `conflict`;
 - every discovery-root redirect warning is understood and intentionally resolved;
 - every Hook command and Plugin MCP command/URL review item is approved;
+- every catalog MCP server review item (command or URL, access mode and paths,
+  package pin, environment-variable names) is approved;
 - `doctor` reports the intended configured or PATH-selected host-native
   executable and its expected `--version` output;
 - each recurring Schedule is assigned to exactly the intended target.
 
 `apply` writes standalone Skills, allowlisted Instruction files, selected
-Settings, rendered marketplace state, and Schedule snapshots. Instruction
+Settings, Codex MCP server leaves, rendered marketplace state, and Schedule
+snapshots. Instruction
 destinations are single-owner files; managed-copy updates/removals retain
 verified backups under `state_dir/backups/<target>/instructions/`. `register`
-performs product CLI registration and host scheduler reconciliation. Product
+performs product CLI registration, Claude Code MCP registration, and host
+scheduler reconciliation. Product
 permission and trust prompts remain product-owned.
 
 After registration, rerun `doctor` and `plan`, inspect the product's Plugin list,
@@ -303,7 +348,10 @@ installed, and only the intended Schedule target owns a heartbeat.
 - Edit only the canonical catalog, then rerun `validate → doctor → plan → apply → register` on each host.
 - Bump Plugin manifest versions and `hooks/.version` when rendered content changes.
 - Before moving or deleting a target, restore its old identity, set `components = []`, and reconcile `apply` plus `register`.
-- Never delete ownership state to force adoption.
+- Never delete ownership state to force adoption. Existing MCP entries are the
+  one adoptable case, and only through `agentbridge mcp adopt` with exact value
+  matches; `agentbridge mcp release` is the supported way to forget MCP
+  ownership.
 - Keep conflict variants and migration reports until every target has converged and a backup has been verified.
 - Keep an external backup of every pre-existing destination. Bridge retains
   backups for selected managed Skill copy and Instruction file updates, but it
@@ -321,3 +369,5 @@ installed, and only the intended Schedule target owns a heartbeat.
 - 1.0.0: Added end-to-end Windows, Linux, WSL onboarding; private Skill migration; shared-root single-writer configuration; Plugin executable selection; and failure recovery.
 - 1.1.0: Added backed-up unmanaged-root adoption, redirect-recreation handling,
   zero-conflict convergence, and root-based rollback.
+- 1.2.0: Added the `mcp` component, MCP server handover with `mcp adopt` and
+  `mcp release`, and MCP doctor findings.

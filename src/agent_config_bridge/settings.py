@@ -24,13 +24,17 @@ from typing import Any, TypeAlias, cast
 
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
+from tomlkit.items import AoT, Comment, InlineTable, Null, Table, Whitespace
 
 from agent_config_bridge.models import Product
 
 __all__ = [
+    "CODEX_MCP_SERVERS_IN_SETTINGS",
     "OwnedSettingLeaf",
+    "OwnedTableRule",
     "SettingChange",
     "SettingDisposition",
+    "SettingIssue",
     "SettingLeafSpec",
     "SettingsApplyResult",
     "SettingsError",
@@ -41,6 +45,8 @@ __all__ = [
     "discover_settings_fragments",
     "merge_settings_fragments",
     "plan_settings_patch",
+    "read_settings_document",
+    "safe_key",
     "settings_patch_digest",
     "setting_value_digest",
 ]
@@ -61,6 +67,10 @@ _PRODUCT_FRAGMENT = {
     Product.CLAUDE_CODE: ("claude-code", "settings.json"),
 }
 _MISSING = object()
+CODEX_MCP_SERVERS_IN_SETTINGS = (
+    "Codex settings fragment must not declare mcp_servers; declare MCP servers under catalog/mcp"
+)
+"""Shared validation message: MCP servers have their own component and ownership (ADR-0009)."""
 
 
 class SettingsError(RuntimeError):
@@ -75,6 +85,37 @@ class SettingDisposition(StrEnum):
     REMOVE = "remove"
     NOOP = "noop"
     CONFLICT = "conflict"
+
+
+class SettingIssue(StrEnum):
+    """Why a setting change is a conflict."""
+
+    UNOWNED = "unowned"
+    """An existing or blocking value is not Bridge-owned."""
+    MISSING = "missing"
+    """A Bridge-owned value is absent or now blocked by a non-table ancestor."""
+    DRIFT = "drift"
+    """A Bridge-owned value changed after installation."""
+    LEFTOVER = "leftover"
+    """Removing owned leaves would leave an unremovable remainder of an owned table."""
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedTableRule:
+    """Remove a whole table together with its last owned leaves.
+
+    When a plan removes every remaining owned leaf below ``path`` and no
+    desired leaf stays there, the table is deleted as a unit if its other
+    children are only ``removable_children`` or ``removable_when_empty``
+    children holding an empty array or table. Any other unowned child makes
+    the removal a :attr:`SettingIssue.LEFTOVER` conflict. Codex rejects an
+    ``mcp_servers.<name>`` table without a transport, so its tool approvals are
+    removed with the server instead of left behind (ADR-0009).
+    """
+
+    path: SettingPath
+    removable_children: tuple[str, ...] = ()
+    removable_when_empty: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,11 +161,20 @@ class SettingChange:
     path: SettingPath
     source_id: str
     detail: str
+    issue: SettingIssue | None = None
+    keys: tuple[str, ...] = ()
+    """Raw key names behind a :attr:`SettingIssue.LEFTOVER` conflict; escape them with :func:`safe_key`."""
 
 
 @dataclass(frozen=True, slots=True)
 class SettingsPatchPlan:
-    """A stale-checkable settings plan that does not contain prior values."""
+    """A stale-checkable settings plan that does not contain prior values.
+
+    ``owned_tables`` are the table rules the plan was computed with, and
+    ``removed_tables`` the tables that applying it deletes as a unit.
+    ``claimed_tables`` are the tables desired leaves may create only while no
+    unowned table exists at that path.
+    """
 
     product: Product
     destination: Path
@@ -134,6 +184,9 @@ class SettingsPatchPlan:
     resulting_ownership: tuple[OwnedSettingLeaf, ...]
     destination_existed: bool
     destination_digest: str | None
+    owned_tables: tuple[OwnedTableRule, ...] = ()
+    removed_tables: tuple[SettingPath, ...] = ()
+    claimed_tables: tuple[SettingPath, ...] = ()
 
     @property
     def has_conflicts(self) -> bool:
@@ -228,6 +281,8 @@ def discover_settings_fragments(catalog_root: Path) -> tuple[SettingsFragment, .
             if not os.path.lexists(fragment_path):
                 raise SettingsError(f"{product.value} settings fragment is missing {filename}: {product_root}")
             document = _read_fragment_document(product, fragment_path)
+            if product is Product.CODEX and "mcp_servers" in document:
+                raise SettingsError(f"{CODEX_MCP_SERVERS_IN_SETTINGS}: {fragment_path}")
             leaves = _flatten_document(document, source_prefix=f"settings/{bundle_path.name}/{product.value}")
             if not leaves:
                 raise SettingsError(f"settings fragment has no setting leaves: {fragment_path}")
@@ -292,13 +347,24 @@ def plan_settings_patch(
     destination: Path,
     desired: Sequence[SettingLeafSpec],
     previous: Sequence[OwnedSettingLeaf] = (),
+    *,
+    owned_tables: Sequence[OwnedTableRule] = (),
+    claimed_tables: Sequence[SettingPath] = (),
 ) -> SettingsPatchPlan:
     """Plan owned-leaf changes against the current product settings document.
 
     New leaves may claim only absent paths.  Existing unowned paths are always
     conflicts, even when their values happen to equal the desired value.  A
     previously owned current value must match its recorded digest before it can
-    be updated or removed.
+    be updated or removed.  ``owned_tables`` lists tables that must disappear
+    as a unit with their last owned leaves; see :class:`OwnedTableRule`.
+
+    ``claimed_tables`` lists tables that desired leaves may only create, never
+    merge into: when no previously owned leaf lies below a claimed table and
+    the table already exists with any child, the table is a
+    :attr:`SettingIssue.UNOWNED` conflict and its desired leaves are not
+    planned. An MCP server table that already holds credentials, approvals, or
+    another transport must be adopted explicitly instead (ADR-0009).
     """
 
     _validate_destination_name(product, destination)
@@ -315,7 +381,12 @@ def plan_settings_patch(
     changes: list[SettingChange] = []
     resulting_ownership: list[OwnedSettingLeaf] = []
 
+    claims = tuple(sorted(set(claimed_tables)))
+    blocked_claims = _plan_claimed_tables(current, desired_leaves, previous_leaves, claims, changes)
+
     for leaf in desired_leaves:
+        if any(_is_strict_prefix(table, leaf.path) for table in blocked_claims):
+            continue
         owned = previous_by_path.get(leaf.path)
         current_value, blocked_at = _lookup_leaf(current, leaf.path)
         if owned is not None:
@@ -325,17 +396,27 @@ def plan_settings_patch(
                     if blocked_at is not None
                     else "previously owned setting is missing"
                 )
-                changes.append(_change(SettingDisposition.CONFLICT, leaf, detail))
+                changes.append(_change(SettingDisposition.CONFLICT, leaf, detail, SettingIssue.MISSING))
                 continue
             if isinstance(current_value, Mapping):
                 changes.append(
-                    _change(SettingDisposition.CONFLICT, leaf, "owned leaf was replaced by a settings table")
+                    _change(
+                        SettingDisposition.CONFLICT,
+                        leaf,
+                        "owned leaf was replaced by a settings table",
+                        SettingIssue.DRIFT,
+                    )
                 )
                 continue
             current_digest = setting_value_digest(cast(SettingValue, current_value))
             if current_digest != owned.digest:
                 changes.append(
-                    _change(SettingDisposition.CONFLICT, leaf, "current value no longer matches ownership digest")
+                    _change(
+                        SettingDisposition.CONFLICT,
+                        leaf,
+                        "current value no longer matches ownership digest",
+                        SettingIssue.DRIFT,
+                    )
                 )
                 continue
             disposition = SettingDisposition.NOOP if current_digest == leaf.digest else SettingDisposition.UPDATE
@@ -352,7 +433,9 @@ def plan_settings_patch(
             continue
 
         if current_value is not _MISSING:
-            changes.append(_change(SettingDisposition.CONFLICT, leaf, "existing setting is not bridge-owned"))
+            changes.append(
+                _change(SettingDisposition.CONFLICT, leaf, "existing setting is not bridge-owned", SettingIssue.UNOWNED)
+            )
             continue
         if blocked_at is not None:
             changes.append(
@@ -360,6 +443,7 @@ def plan_settings_patch(
                     SettingDisposition.CONFLICT,
                     leaf,
                     f"desired path is blocked by existing non-table ancestor {_format_path(blocked_at)}",
+                    SettingIssue.UNOWNED,
                 )
             )
             continue
@@ -406,6 +490,7 @@ def plan_settings_patch(
                     path=owned.path,
                     source_id=owned.source_id,
                     detail="formerly owned leaf was replaced by a settings table",
+                    issue=SettingIssue.DRIFT,
                 )
             )
             continue
@@ -416,6 +501,7 @@ def plan_settings_patch(
                     path=owned.path,
                     source_id=owned.source_id,
                     detail="formerly owned setting changed after installation",
+                    issue=SettingIssue.DRIFT,
                 )
             )
             continue
@@ -428,6 +514,8 @@ def plan_settings_patch(
             )
         )
 
+    rules = tuple(owned_tables)
+    removed_tables = _plan_owned_table_removals(current, desired_leaves, previous_leaves, rules, changes)
     return SettingsPatchPlan(
         product=product,
         destination=destination,
@@ -437,7 +525,102 @@ def plan_settings_patch(
         resulting_ownership=tuple(sorted(resulting_ownership, key=lambda leaf: leaf.path)),
         destination_existed=existed,
         destination_digest=snapshot_digest,
+        owned_tables=rules,
+        removed_tables=removed_tables,
+        claimed_tables=claims,
     )
+
+
+def _plan_claimed_tables(
+    current: Mapping[str, object],
+    desired: Sequence[SettingLeafSpec],
+    previous: Sequence[OwnedSettingLeaf],
+    claims: Sequence[SettingPath],
+    changes: list[SettingChange],
+) -> frozenset[SettingPath]:
+    """Return claimed tables that already exist unowned, appending their conflicts in place."""
+
+    blocked: set[SettingPath] = set()
+    for table_path in claims:
+        _validate_setting_path(table_path)
+        if any(_is_strict_prefix(table_path, leaf.path) for leaf in previous):
+            continue
+        claimants = [leaf for leaf in desired if _is_strict_prefix(table_path, leaf.path)]
+        existing, _ = _lookup_leaf(current, table_path)
+        if not claimants or not isinstance(existing, Mapping) or not existing:
+            continue
+        blocked.add(table_path)
+        changes.append(
+            SettingChange(
+                disposition=SettingDisposition.CONFLICT,
+                path=table_path,
+                source_id=claimants[0].source_id,
+                detail="existing table is not bridge-owned; desired leaves are not merged into it",
+                issue=SettingIssue.UNOWNED,
+            )
+        )
+    return frozenset(blocked)
+
+
+def _plan_owned_table_removals(
+    current: Mapping[str, object],
+    desired: Sequence[SettingLeafSpec],
+    previous: Sequence[OwnedSettingLeaf],
+    rules: Sequence[OwnedTableRule],
+    changes: list[SettingChange],
+) -> tuple[SettingPath, ...]:
+    """Apply :class:`OwnedTableRule` removals, appending their changes in place."""
+
+    removed: list[SettingPath] = []
+    changes_by_path = {change.path: change for change in changes}
+    for rule in rules:
+        _validate_setting_path(rule.path)
+        owned = [leaf for leaf in previous if _is_strict_prefix(rule.path, leaf.path)]
+        if not owned or any(_is_strict_prefix(rule.path, leaf.path) for leaf in desired):
+            continue
+        owned_changes = [changes_by_path[leaf.path] for leaf in owned if leaf.path in changes_by_path]
+        if any(change.disposition is SettingDisposition.CONFLICT for change in owned_changes):
+            continue
+        removed_paths = {change.path for change in owned_changes if change.disposition is SettingDisposition.REMOVE}
+        if not removed_paths:
+            continue
+        table, _ = _lookup_leaf(current, rule.path)
+        if not isinstance(table, Mapping):
+            continue
+        removed_keys = {path[len(rule.path)] for path in removed_paths if len(path) == len(rule.path) + 1}
+        remainder = sorted(key for key in table if key not in removed_keys)
+        blocking = [
+            key
+            for key in remainder
+            if key not in rule.removable_children and not (key in rule.removable_when_empty and table[key] in ([], {}))
+        ]
+        source_id = owned[0].source_id
+        if blocking:
+            changes.append(
+                SettingChange(
+                    disposition=SettingDisposition.CONFLICT,
+                    path=rule.path,
+                    source_id=source_id,
+                    detail=(
+                        "removing the owned leaves would leave unowned keys in the table: "
+                        + ", ".join(safe_key(key) for key in blocking)
+                    ),
+                    issue=SettingIssue.LEFTOVER,
+                    keys=tuple(blocking),
+                )
+            )
+            continue
+        removed.append(rule.path)
+        changes.extend(
+            SettingChange(
+                disposition=SettingDisposition.REMOVE,
+                path=(*rule.path, key),
+                source_id=source_id,
+                detail="remove unowned child together with its removed table",
+            )
+            for key in remainder
+        )
+    return tuple(sorted(removed))
 
 
 def apply_settings_patch(plan: SettingsPatchPlan) -> SettingsApplyResult:
@@ -456,7 +639,14 @@ def apply_settings_patch(plan: SettingsPatchPlan) -> SettingsApplyResult:
         raise SettingsError(f"refusing to apply settings plan with conflicts: {conflicts}")
 
     _validate_destination_name(plan.product, plan.destination)
-    fresh_plan = plan_settings_patch(plan.product, plan.destination, plan.desired, plan.previous)
+    fresh_plan = plan_settings_patch(
+        plan.product,
+        plan.destination,
+        plan.desired,
+        plan.previous,
+        owned_tables=plan.owned_tables,
+        claimed_tables=plan.claimed_tables,
+    )
     if fresh_plan != plan:
         raise SettingsError("settings plan or destination changed after planning; review a fresh plan")
     desired = fresh_plan.desired
@@ -471,9 +661,19 @@ def apply_settings_patch(plan: SettingsPatchPlan) -> SettingsApplyResult:
     desired_by_path = {leaf.path: leaf for leaf in desired}
     previous_by_path = {leaf.path: leaf for leaf in previous}
 
-    removal_paths = [change.path for change in plan.changes if change.disposition is SettingDisposition.REMOVE]
+    removal_paths = [
+        change.path
+        for change in plan.changes
+        if change.disposition is SettingDisposition.REMOVE and change.path in previous_by_path
+    ]
     for path in sorted(removal_paths, key=lambda candidate: (-len(candidate), candidate)):
         _delete_path(mutable_document, path)
+    trailing_comments: list[tuple[list[tuple[Any, Any]], str]] = []
+    for table_path in sorted(plan.removed_tables, key=lambda candidate: (-len(candidate), candidate)):
+        if plan.product is Product.CODEX:
+            trailing_comments.extend(_delete_toml_table_keeping_comments(mutable_document, table_path))
+        else:
+            _delete_path(mutable_document, table_path)
 
     parent_paths = {parent for path in removal_paths for parent in previous_by_path[path].created_parents}
     for parent_path in sorted(parent_paths, key=lambda candidate: (-len(candidate), candidate)):
@@ -484,10 +684,26 @@ def apply_settings_patch(plan: SettingsPatchPlan) -> SettingsApplyResult:
             continue
         leaf = desired_by_path[change.path]
         _set_path(mutable_document, leaf.path, copy.deepcopy(leaf.value), plan.product)
+    # Comments that ended the last table of a container go back after any
+    # table added to that container, so they stay above what follows it.
+    for body, text in trailing_comments:
+        body.append((None, Whitespace(text)))
 
     output = _serialize_document(plan.product, mutable_document)
     _atomic_replace(plan.destination, output, expected_existed=existed, expected_digest=digest)
     return SettingsApplyResult(changed=True, ownership=plan.resulting_ownership)
+
+
+def read_settings_document(product: Product, destination: Path) -> dict[str, SettingValue]:
+    """Read and validate one product settings document without changing it.
+
+    An absent destination is an empty document. The same strict parsing and
+    real-file checks used before an owned-leaf patch apply here.
+    """
+
+    _validate_destination_name(product, destination)
+    _, document = _read_destination(product, destination)
+    return document
 
 
 def setting_value_digest(value: SettingValue) -> str:
@@ -513,10 +729,24 @@ def settings_patch_digest(desired: Sequence[SettingLeafSpec]) -> str:
 
 def _read_fragment_document(product: Product, path: Path) -> dict[str, SettingValue]:
     raw = _read_real_regular_file(path, f"{product.value} settings fragment")
-    return _parse_plain_document(product, raw, path)
+    return _parse_plain_document(product, raw, path, name_keys=True)
 
 
-def _parse_plain_document(product: Product, raw: bytes, path: Path) -> dict[str, SettingValue]:
+def _parse_plain_document(
+    product: Product,
+    raw: bytes,
+    path: Path,
+    *,
+    name_keys: bool = False,
+) -> dict[str, SettingValue]:
+    """Parse one settings document strictly.
+
+    Errors carry the file path and a line/column position only, never parser
+    text that could quote content. ``name_keys`` adds escaped key paths to
+    value errors; it is used only for reviewed catalog fragments, not for
+    product-owned destinations.
+    """
+
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -531,10 +761,25 @@ def _parse_plain_document(product: Product, raw: bytes, path: Path) -> dict[str,
                 parse_constant=_reject_json_constant,
             )
     except (TOMLKitError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise SettingsError(f"invalid {product.value} settings document: {path}: {exc}") from exc
+        raise SettingsError(f"invalid {product.value} settings document: {path}{_parse_error_detail(exc)}") from None
     if not isinstance(parsed, dict):
         raise SettingsError(f"{product.value} settings document must contain a top-level table/object: {path}")
-    return cast(dict[str, SettingValue], _validate_setting_value(parsed, str(path), require_mapping=True))
+    return cast(
+        dict[str, SettingValue],
+        _validate_setting_value(parsed, str(path), require_mapping=True, name_keys=name_keys),
+    )
+
+
+def _parse_error_detail(exc: Exception) -> str:
+    """Describe a parse failure by position only, never by quoted content."""
+
+    if isinstance(exc, _ContentFreeJsonError):
+        return f": {exc}"
+    line = getattr(exc, "lineno", getattr(exc, "line", None))
+    column = getattr(exc, "colno", getattr(exc, "col", None))
+    if type(line) is int and type(column) is int:
+        return f" (at line {line}, column {column})"
+    return ""
 
 
 def _parse_mutable_destination(product: Product, raw: bytes | None) -> MutableMapping[str, Any]:
@@ -553,7 +798,7 @@ def _parse_mutable_destination(product: Product, raw: bytes | None) -> MutableMa
             parse_constant=_reject_json_constant,
         )
     except (TOMLKitError, ValueError, TypeError, json.JSONDecodeError) as exc:
-        raise SettingsError(f"settings destination became invalid during apply: {exc}") from exc
+        raise SettingsError(f"settings destination became invalid during apply{_parse_error_detail(exc)}") from None
     if not isinstance(parsed, dict):
         raise SettingsError("settings destination must contain a top-level table/object")
     return cast(MutableMapping[str, Any], parsed)
@@ -649,7 +894,7 @@ def _validate_setting_path(path: SettingPath) -> None:
 
 
 def _validate_source_id(source_id: str) -> None:
-    if not isinstance(source_id, str) or not source_id.startswith("settings/") or "\x00" in source_id:
+    if not isinstance(source_id, str) or not source_id.startswith(("settings/", "mcp/")) or "\x00" in source_id:
         raise SettingsError(f"invalid settings source identity: {source_id!r}")
 
 
@@ -658,7 +903,13 @@ def _validate_digest(digest: str, description: str) -> None:
         raise SettingsError(f"invalid {description}")
 
 
-def _validate_setting_value(value: object, context: str, *, require_mapping: bool = False) -> SettingValue:
+def _validate_setting_value(
+    value: object,
+    context: str,
+    *,
+    require_mapping: bool = False,
+    name_keys: bool = True,
+) -> SettingValue:
     if value is None or isinstance(value, str) or type(value) in {bool, int}:
         if require_mapping:
             raise SettingsError(f"{context} must be a table/object")
@@ -672,13 +923,20 @@ def _validate_setting_value(value: object, context: str, *, require_mapping: boo
     if isinstance(value, list):
         if require_mapping:
             raise SettingsError(f"{context} must be a table/object")
-        return [_validate_setting_value(item, f"{context}[]") for item in value]
+        return [
+            _validate_setting_value(item, f"{context}[]" if name_keys else context, name_keys=name_keys)
+            for item in value
+        ]
     if isinstance(value, Mapping):
         result: dict[str, SettingValue] = {}
         for key, item in value.items():
             if not isinstance(key, str) or not key:
                 raise SettingsError(f"{context} contains an empty or non-string key")
-            result[key] = _validate_setting_value(item, f"{context}.{key}")
+            result[key] = _validate_setting_value(
+                item,
+                f"{context}.{safe_key(key)}" if name_keys else context,
+                name_keys=name_keys,
+            )
         return result
     raise SettingsError(f"{context} contains unsupported value type {type(value).__name__}")
 
@@ -773,6 +1031,112 @@ def _delete_path(document: MutableMapping[str, Any], path: SettingPath) -> None:
     if path[-1] not in current:
         raise SettingsError(f"owned setting disappeared during apply: {_format_path(path)}")
     del current[path[-1]]
+
+
+def _delete_toml_table_keeping_comments(
+    document: MutableMapping[str, Any],
+    path: SettingPath,
+) -> list[tuple[list[tuple[Any, Any]], str]]:
+    """Delete one TOML table while keeping the comment block that ends it.
+
+    tomlkit stores the comment lines above the next table header as trailing
+    items of the preceding table, so deleting a table as a unit would also
+    delete a note written for whatever follows it. Comment lines at the end of
+    each removed table body (including its last nested table) are therefore
+    put back verbatim: at the table's former position when a sibling follows
+    it, so they stay above that sibling. When the table was the last item of
+    its container, the comments are returned as ``(body, text)`` for the
+    caller to append after any table it adds, so they stay above whatever
+    follows the container, or at the end of the file. Comments between the
+    table's own keys are removed with it.
+    """
+
+    # Each owner is the document or a real (possibly out-of-order) table
+    # holding a part of the path; tables split across the file have several.
+    owners: list[Any] = [document]
+    for part in path[:-1]:
+        owners = [
+            item
+            for owner in owners
+            for key, item in _toml_body(owner)
+            if key is not None and key.key == part and isinstance(item, (Table, InlineTable))
+        ]
+    removed = False
+    deferred: list[tuple[list[tuple[Any, Any]], str]] = []
+    for owner in owners:
+        body = _toml_body(owner)
+        slots = [
+            (index, _trailing_toml_comments(item))
+            for index, (key, item) in enumerate(body)
+            if key is not None and key.key == path[-1]
+        ]
+        if not slots:
+            continue
+        owner.remove(path[-1])
+        for index, text in slots:
+            if not text:
+                continue
+            if all(isinstance(item, (Null, Whitespace)) for _, item in body[index + 1 :]):
+                deferred.append((body, text))
+            else:
+                # The removed slot holds a Null placeholder; a non-fixed
+                # Whitespace item renders verbatim and never adds a header.
+                body[index] = (None, Whitespace(text))
+        removed = True
+    if not removed:
+        raise SettingsError(f"owned setting disappeared during apply: {_format_path(path)}")
+    return deferred
+
+
+def _toml_body(owner: Any) -> list[tuple[Any, Any]]:
+    container = owner.value if isinstance(owner, (Table, InlineTable)) else owner
+    return cast(list[tuple[Any, Any]], container.body)
+
+
+def _trailing_toml_comments(item: object) -> str:
+    """Return the trailing comment block of a table body, from its first comment line on."""
+
+    if isinstance(item, AoT):
+        tables = item.body
+        return _trailing_toml_comments(tables[-1]) if tables else ""
+    if not isinstance(item, Table):
+        return ""
+    parts: list[str] = []
+    for key, child in reversed([entry for entry in item.value.body if not isinstance(entry[1], Null)]):
+        if key is None and isinstance(child, (Comment, Whitespace)):
+            parts.append(child.as_string())
+            continue
+        if key is not None and not key.is_dotted() and isinstance(child, (Table, AoT)):
+            parts.append(_trailing_toml_comments(child))
+        break
+    text = "".join(reversed(parts))
+    lines = text.splitlines(keepends=True)
+    while lines and not lines[0].lstrip().startswith("#"):
+        lines.pop(0)
+    return "".join(lines)
+
+
+def safe_key(key: str) -> str:
+    """Return a key name with control and other non-printable characters escaped.
+
+    Key names read from product files reach terminals in plans, warnings, and
+    doctor output; escaping keeps an embedded escape sequence inert.
+    """
+
+    if key.isprintable():
+        return key
+    return "".join(
+        character
+        if character.isprintable()
+        else (
+            f"\\x{ord(character):02x}"
+            if ord(character) < 0x100
+            else f"\\u{ord(character):04x}"
+            if ord(character) < 0x10000
+            else f"\\U{ord(character):08x}"
+        )
+        for character in key
+    )
 
 
 def _prune_empty_owned_parent(
@@ -924,12 +1288,18 @@ def _is_strict_prefix(prefix: SettingPath, path: SettingPath) -> bool:
     return len(prefix) < len(path) and path[: len(prefix)] == prefix
 
 
-def _change(disposition: SettingDisposition, leaf: SettingLeafSpec, detail: str) -> SettingChange:
+def _change(
+    disposition: SettingDisposition,
+    leaf: SettingLeafSpec,
+    detail: str,
+    issue: SettingIssue | None = None,
+) -> SettingChange:
     return SettingChange(
         disposition=disposition,
         path=leaf.path,
         source_id=leaf.source_id,
         detail=detail,
+        issue=issue,
     )
 
 
@@ -947,14 +1317,18 @@ def _bytes_digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+class _ContentFreeJsonError(ValueError):
+    """A strict-JSON rejection whose message quotes no document content."""
+
+
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate JSON object key {key!r}")
+            raise _ContentFreeJsonError("duplicate JSON object key")
         result[key] = value
     return result
 
 
 def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON number {value!r} is not supported")
+    raise _ContentFreeJsonError("non-finite JSON number is not supported")

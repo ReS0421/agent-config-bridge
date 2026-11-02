@@ -22,8 +22,17 @@ from agent_config_bridge.instructions import (
     instruction_files,
     instruction_source_id,
 )
+from agent_config_bridge.mcp import discover_mcp_servers, mcp_leaves_digest
 from agent_config_bridge.models import BridgeConfig, Component, LinkMode, Platform, TargetConfig
-from agent_config_bridge.planner import Action, Disposition, Operation, SyncPlan, build_plan
+from agent_config_bridge.planner import (
+    Action,
+    Disposition,
+    Operation,
+    SyncPlan,
+    build_plan,
+    desired_mcp_servers,
+    plan_codex_mcp,
+)
 from agent_config_bridge.platforms import current_platform
 from agent_config_bridge.provenance import write_instruction_dir_markers, write_skill_root_marker
 from agent_config_bridge.renderer import RenderedMarketplace, render_marketplace
@@ -46,9 +55,11 @@ from agent_config_bridge.state import (
     effective_link_mode,
     find_orphaned_target_states,
     read_instruction_state,
+    read_mcp_leaf_state,
     read_settings_state,
     read_skill_state,
     write_instruction_state,
+    write_mcp_leaf_state,
     write_settings_state,
     write_skill_state,
     write_skill_state_entries,
@@ -281,6 +292,9 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
         else None
     )
     for action in plan.actions:
+        if action.operation is Operation.REGISTER:
+            # Product-CLI registrations are executed by `register`, never by apply.
+            continue
         if action.disposition is Disposition.NOOP:
             if action.operation is Operation.PATCH and action.component is Component.SETTINGS:
                 target = targets_by_name.get(action.target)
@@ -289,6 +303,8 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                 if action.source_digest is None:
                     raise ApplyError(f"settings action has no source digest: {action.target}")
                 _apply_target_settings(config, inventory, target, action.source_digest)
+            elif action.operation is Operation.PATCH and action.component is Component.MCP:
+                _apply_target_mcp(config, inventory, resolved, _patch_target(targets_by_name, action), action)
             elif action.operation is Operation.RENDER:
                 if action.component is Component.SCHEDULES:
                     target = targets_by_name.get(action.target)
@@ -341,6 +357,8 @@ def apply_plan(config: BridgeConfig, inventory: CatalogInventory, plan: SyncPlan
                     resolved=resolved,
                     expected_digest=action.source_digest,
                 )
+        elif action.operation is Operation.PATCH and action.component is Component.MCP:
+            _apply_target_mcp(config, inventory, resolved, _patch_target(targets_by_name, action), action)
         elif action.operation is Operation.PATCH:
             if action.component is not Component.SETTINGS:
                 raise ApplyError(f"unsupported patch component: {action.component.value}")
@@ -554,3 +572,47 @@ def _apply_target_settings(
     )
     if next_state != previous_state:
         write_settings_state(config, target, next_state)
+
+
+def _patch_target(targets_by_name: dict[str, TargetConfig], action: Action) -> TargetConfig:
+    target = targets_by_name.get(action.target)
+    if target is None:
+        raise ApplyError(f"{action.component.value} action has no enabled target: {action.target}")
+    return target
+
+
+def _apply_target_mcp(
+    config: BridgeConfig,
+    inventory: CatalogInventory,
+    resolved: ResolvedInventory,
+    target: TargetConfig,
+    action: Action,
+) -> None:
+    """Apply owned Codex ``mcp_servers`` leaves and record their separate ownership."""
+
+    if action.source_digest is None:
+        raise ApplyError(f"MCP action has no source digest: {action.target}")
+    previous_state = read_mcp_leaf_state(config, target)
+    servers = desired_mcp_servers(target, resolved, discover_mcp_servers(inventory.root))
+    mcp_plan = plan_codex_mcp(config, target, servers)
+    if mcp_leaves_digest(mcp_plan.desired) != action.source_digest:
+        raise ApplyError(f"MCP server sources changed after planning: {target.name}")
+    result = apply_settings_patch(mcp_plan)
+
+    containers = tuple(
+        sorted(
+            {parent for leaf in result.ownership for parent in leaf.created_parents},
+            key=lambda path: (len(path), path),
+        )
+    )
+    entries = tuple(
+        SettingStateEntry(source_id=leaf.source_id, path=leaf.path, value_digest=leaf.digest)
+        for leaf in result.ownership
+    )
+    next_state = SettingsState(
+        file_created=bool(entries) and (previous_state.file_created or not mcp_plan.destination_existed),
+        created_containers=containers,
+        entries=entries,
+    )
+    if next_state != previous_state:
+        write_mcp_leaf_state(config, target, next_state)

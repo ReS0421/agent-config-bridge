@@ -73,9 +73,9 @@ _LEGAL_KIND_DELIVERY = frozenset(
         ("tool", "mcp-registration"),
     }
 )
-# No "tools" component exists yet, so kind=tool (ADR-6) manifests cannot carry
-# resolvable artifact refs today.
-_ARTIFACT_COMPONENTS = ("hooks", "instructions", "plugins", "schedules", "settings", "skills")
+# kind=tool capabilities (ADR-6) deliver catalog/mcp/<name> servers by
+# mcp-registration; the mcp component holds their artifact refs.
+_ARTIFACT_COMPONENTS = ("hooks", "instructions", "mcp", "plugins", "schedules", "settings", "skills")
 # Agent Skills spec: conservative allowed top-level frontmatter keys.
 _ALLOWED_SKILL_FRONTMATTER = frozenset(
     {"name", "description", "license", "metadata", "allowed-tools", "argument-hint", "model"}
@@ -180,6 +180,17 @@ class ResolvedInventory:
         """
 
         return self._artifacts_for_target("hooks", self.inventory.hooks, target)
+
+    def mcp_for_target(self, target: TargetConfig) -> tuple[Artifact, ...]:
+        """Return the MCP server bundles this target should register (ADR-6).
+
+        The gate is the hook mechanism: in ``required`` mode a server is
+        delivered only when a deployable ``tool``/``mcp-registration`` manifest
+        names it and one of its ``[[targets]]`` matches this target's product,
+        platform, and any surface.
+        """
+
+        return self._artifacts_for_target("mcp", self.inventory.mcp, target)
 
     def hooks_for_product(self, config: BridgeConfig, product: Product) -> tuple[Artifact, ...]:
         """Return the hooks actually delivered to every target of ``product``.
@@ -523,6 +534,16 @@ def validate_governance(
                 # enforced by inventory membership, but only if the ref actually
                 # points at the schedules component.
                 ref = artifact.get("ref", "")
+                if isinstance(ref, str) and (kind == "tool") != ref.startswith("mcp/"):
+                    findings.append(
+                        GovernanceFinding(
+                            "GOV038",
+                            GovernanceSeverity.ERROR,
+                            manifest.id,
+                            ref or None,
+                            detail="tool capabilities deliver only mcp/ artifacts, and mcp/ artifacts only tools",
+                        )
+                    )
                 if kind == "agent-schedule" and isinstance(ref, str) and not ref.startswith("schedules/"):
                     findings.append(
                         GovernanceFinding(
@@ -843,6 +864,7 @@ def _inventory_refs(inventory: CatalogInventory) -> set[str]:
         for component, artifacts in (
             ("hooks", inventory.hooks),
             ("instructions", inventory.instructions),
+            ("mcp", inventory.mcp),
             ("plugins", inventory.plugins),
             ("schedules", inventory.schedules),
             ("settings", inventory.settings),

@@ -27,6 +27,7 @@ class Component(StrEnum):
     SETTINGS = "settings"
     SCHEDULES = "schedules"
     INSTRUCTIONS = "instructions"
+    MCP = "mcp"
 
 
 class Product(StrEnum):

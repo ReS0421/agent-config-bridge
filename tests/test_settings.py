@@ -10,10 +10,13 @@ from pathlib import Path
 import pytest
 import tomlkit
 
+from agent_config_bridge import settings as settings_module
 from agent_config_bridge.models import Product
 from agent_config_bridge.settings import (
     OwnedSettingLeaf,
+    OwnedTableRule,
     SettingDisposition,
+    SettingIssue,
     SettingLeafSpec,
     SettingsError,
     apply_settings_patch,
@@ -486,3 +489,259 @@ def test_apply_creates_private_settings_file(tmp_path: Path) -> None:
 
     if os.name != "nt":
         assert destination.stat().st_mode & 0o777 == 0o600
+
+
+# --- Owned tables, claimed tables, and content-free errors (ADR-0009) ------------------------------------------
+
+_SERVER_RULE = OwnedTableRule(
+    path=("mcp_servers", "x"),
+    removable_children=("tools",),
+    removable_when_empty=("args", "env_vars"),
+)
+
+
+def _server_leaf(key: str, value: object, name: str = "x") -> SettingLeafSpec:
+    return SettingLeafSpec(
+        source_id=f"mcp/{name}",
+        path=("mcp_servers", name, key),
+        value=value,  # type: ignore[arg-type]
+        digest=setting_value_digest(value),  # type: ignore[arg-type]
+    )
+
+
+def _plan_server_removal(destination: Path, *owned: SettingLeafSpec) -> object:
+    return plan_settings_patch(
+        Product.CODEX,
+        destination,
+        (),
+        tuple(_owned(leaf) for leaf in owned),
+        owned_tables=(_SERVER_RULE,),
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        pytest.param(
+            'model = "o3"\n\n[mcp_servers.x]\ncommand = "a"\n\n# NOTE about y\n[mcp_servers.y]\ncommand = "b"\n',
+            'model = "o3"\n\n# NOTE about y\n[mcp_servers.y]\ncommand = "b"\n',
+            id="implicit-super-table-middle",
+        ),
+        pytest.param(
+            '[mcp_servers]\n# servers below\n\n[mcp_servers.x]\ncommand = "a"\n\n'
+            '[mcp_servers.x.tools.t]\napproval_mode = "approve"\n\n# NOTE about y\n[mcp_servers.y]\ncommand = "b"\n',
+            '[mcp_servers]\n# servers below\n\n# NOTE about y\n[mcp_servers.y]\ncommand = "b"\n',
+            id="explicit-super-table-with-nested-tools",
+        ),
+        pytest.param(
+            '[mcp_servers.y]\ncommand = "b"\n\n[mcp_servers.x]\ncommand = "a"\n\n# NOTE at the end of the file\n',
+            '[mcp_servers.y]\ncommand = "b"\n\n# NOTE at the end of the file\n',
+            id="last-table-in-file",
+        ),
+        pytest.param(
+            '[mcp_servers.x]\ncommand = "a"\n\n# NOTE about features\n[features]\nfoo = true\n',
+            "# NOTE about features\n[features]\nfoo = true\n",
+            id="next-table-outside-the-super-table",
+        ),
+    ],
+)
+def test_owned_table_removal_keeps_the_comment_block_of_what_follows(
+    tmp_path: Path,
+    original: str,
+    expected: str,
+) -> None:
+    """tomlkit stores the next table's comments in the removed table; they must survive byte-for-byte."""
+
+    destination = tmp_path / "config.toml"
+    destination.write_text(original, encoding="utf-8")
+    plan = _plan_server_removal(destination, _server_leaf("command", "a"))
+
+    assert plan.removed_tables == (("mcp_servers", "x"),)  # type: ignore[attr-defined]
+    apply_settings_patch(plan)  # type: ignore[arg-type]
+
+    assert destination.read_text(encoding="utf-8") == expected
+
+
+def test_owned_table_removal_keeps_trailing_comments_above_a_table_added_in_the_same_apply(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text(
+        '[mcp_servers.x]\ncommand = "a"\n\n# NOTE about features\n[features]\nfoo = true\n', encoding="utf-8"
+    )
+    plan = plan_settings_patch(
+        Product.CODEX,
+        destination,
+        (_server_leaf("command", "z", name="z"),),
+        (_owned(_server_leaf("command", "a")),),
+        owned_tables=(_SERVER_RULE,),
+    )
+
+    apply_settings_patch(plan)
+
+    text = destination.read_text(encoding="utf-8")
+    assert "# NOTE about features\n[features]\n" in text
+    assert tomlkit.parse(text).unwrap() == {"mcp_servers": {"z": {"command": "z"}}, "features": {"foo": True}}
+
+
+def test_owned_table_rule_skips_removal_when_an_owned_leaf_drifted(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text('[mcp_servers.x]\ncommand = "edited"\n[mcp_servers.x.tools.t]\nk = 1\n', encoding="utf-8")
+
+    plan = _plan_server_removal(destination, _server_leaf("command", "a"))
+
+    assert plan.removed_tables == ()  # type: ignore[attr-defined]
+    assert [(change.disposition, change.issue) for change in plan.changes] == [  # type: ignore[attr-defined]
+        (SettingDisposition.CONFLICT, SettingIssue.DRIFT)
+    ]
+
+
+def test_owned_table_rule_removes_the_table_when_another_owned_leaf_is_already_absent(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text('[mcp_servers.x]\ncommand = "a"\n[mcp_servers.x.tools.t]\nk = 1\n', encoding="utf-8")
+
+    plan = _plan_server_removal(destination, _server_leaf("command", "a"), _server_leaf("args", ["-y"]))
+
+    assert plan.removed_tables == (("mcp_servers", "x"),)  # type: ignore[attr-defined]
+    result = apply_settings_patch(plan)  # type: ignore[arg-type]
+    assert result.ownership == ()
+    assert tomlkit.parse(destination.read_text(encoding="utf-8")).unwrap() == {}
+
+
+def test_owned_table_rule_leaves_a_table_whose_owned_leaves_are_all_absent(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    original = "[mcp_servers.x.tools.t]\nk = 1\n"
+    destination.write_text(original, encoding="utf-8")
+
+    plan = _plan_server_removal(destination, _server_leaf("command", "a"))
+
+    assert plan.removed_tables == ()  # type: ignore[attr-defined]
+    assert not plan.has_changes  # type: ignore[attr-defined]
+    apply_settings_patch(plan)  # type: ignore[arg-type]
+    assert destination.read_text(encoding="utf-8") == original
+
+
+def test_apply_deletes_unowned_children_only_through_their_removed_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text(
+        '[mcp_servers.x]\ncommand = "a"\nargs = []\n[mcp_servers.x.tools.t]\nk = 1\n', encoding="utf-8"
+    )
+    plan = _plan_server_removal(destination, _server_leaf("command", "a"))
+    removals = {
+        change.path: change.detail
+        for change in plan.changes  # type: ignore[attr-defined]
+        if change.disposition is SettingDisposition.REMOVE
+    }
+    assert set(removals) == {
+        ("mcp_servers", "x", "command"),
+        ("mcp_servers", "x", "args"),
+        ("mcp_servers", "x", "tools"),
+    }
+    deleted: list[tuple[str, ...]] = []
+    original_delete = settings_module._delete_path
+
+    def recording_delete(document: object, path: tuple[str, ...]) -> None:
+        deleted.append(path)
+        original_delete(document, path)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(settings_module, "_delete_path", recording_delete)
+
+    apply_settings_patch(plan)  # type: ignore[arg-type]
+
+    # Only the owned leaf is deleted by path; unowned children go with the table.
+    assert deleted == [("mcp_servers", "x", "command")]
+    assert tomlkit.parse(destination.read_text(encoding="utf-8")).unwrap() == {}
+
+
+def test_leftover_conflict_carries_raw_keys_and_an_escaped_detail(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text('[mcp_servers.x]\ncommand = "a"\n"\\u001b[2J" = 1\n', encoding="utf-8")
+
+    plan = _plan_server_removal(destination, _server_leaf("command", "a"))
+
+    leftover = [change for change in plan.changes if change.issue is SettingIssue.LEFTOVER]  # type: ignore[attr-defined]
+    assert [change.keys for change in leftover] == [("\x1b[2J",)]
+    assert "\\x1b[2J" in leftover[0].detail
+    assert "\x1b" not in leftover[0].detail
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        '[mcp_servers.x]\nenv = { TOKEN = "SECRET" }\n',
+        '[mcp_servers.x]\nbearer_token = "SECRET"\n',
+        '[mcp_servers.x]\nurl = "https://example.com/mcp"\n',
+        '[mcp_servers.x.tools.t]\napproval_mode = "approve"\n',
+    ],
+)
+def test_claimed_table_that_already_exists_is_an_unowned_conflict(tmp_path: Path, existing: str) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text(existing, encoding="utf-8")
+    desired = (_server_leaf("command", "npx"), _server_leaf("args", ["-y"]))
+
+    plan = plan_settings_patch(Product.CODEX, destination, desired, claimed_tables=(("mcp_servers", "x"),))
+
+    assert [(change.path, change.issue) for change in plan.changes] == [(("mcp_servers", "x"), SettingIssue.UNOWNED)]
+    assert plan.resulting_ownership == ()
+    assert "SECRET" not in plan.changes[0].detail
+    with pytest.raises(SettingsError, match="conflicts"):
+        apply_settings_patch(plan)
+    assert destination.read_text(encoding="utf-8") == existing
+
+
+def test_claimed_table_may_be_created_absent_or_empty_and_kept_once_owned(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text("[mcp_servers.x]\n", encoding="utf-8")
+    leaf = _server_leaf("command", "npx")
+    claims = (("mcp_servers", "x"),)
+
+    created = plan_settings_patch(Product.CODEX, destination, (leaf,), claimed_tables=claims)
+    assert [change.disposition for change in created.changes] == [SettingDisposition.CREATE]
+    apply_settings_patch(created)
+
+    with destination.open("a", encoding="utf-8") as stream:
+        stream.write('[mcp_servers.x.tools.t]\napproval_mode = "approve"\n')
+    owned = plan_settings_patch(Product.CODEX, destination, (leaf,), (_owned(leaf),), claimed_tables=claims)
+    assert [change.disposition for change in owned.changes] == [SettingDisposition.NOOP]
+
+
+def test_codex_destination_parse_errors_report_only_a_position(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text('model = "o3"\ntoken = "ghp_SECRETVALUE\n', encoding="utf-8")
+
+    with pytest.raises(SettingsError, match=r"\(at line 2, column \d+\)") as raised:
+        plan_settings_patch(Product.CODEX, destination, ())
+
+    assert "SECRET" not in str(raised.value)
+
+
+def test_destination_value_errors_do_not_name_product_keys(tmp_path: Path) -> None:
+    destination = tmp_path / "config.toml"
+    destination.write_text("[profiles.SECRETNAME]\nlimit = nan\n", encoding="utf-8")
+
+    with pytest.raises(SettingsError, match="non-finite") as raised:
+        plan_settings_patch(Product.CODEX, destination, ())
+
+    assert "SECRETNAME" not in str(raised.value)
+
+
+def test_fragment_value_errors_name_escaped_keys(tmp_path: Path) -> None:
+    catalog = tmp_path / "catalog"
+    _write_fragment(catalog, "preferences", Product.CODEX, '[profiles."x\\u001by"]\nlimit = nan\n')
+
+    with pytest.raises(SettingsError, match="non-finite") as raised:
+        discover_settings_fragments(catalog)
+
+    assert "profiles.x\\x1by.limit" in str(raised.value)
+    assert "\x1b" not in str(raised.value)
+
+
+def test_json_destination_duplicate_keys_are_not_echoed(tmp_path: Path) -> None:
+    destination = tmp_path / "settings.json"
+    destination.write_text('{"SECRETKEY": 1, "SECRETKEY": 2}', encoding="utf-8")
+
+    with pytest.raises(SettingsError, match="duplicate JSON object key") as raised:
+        plan_settings_patch(Product.CLAUDE_CODE, destination, ())
+
+    assert "SECRETKEY" not in str(raised.value)
